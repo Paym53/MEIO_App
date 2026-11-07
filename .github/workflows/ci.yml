@@ -1,0 +1,39 @@
+# Every pull request and every push to main runs all checks. A red check blocks the merge.
+name: checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  tests:
+    name: lint + tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]   # windows = same platform as the license PC
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - name: Lint (ruff)
+        run: python -m ruff check .
+      - name: Tests (engine incl. fingerprint)
+        run: python -m pytest
+
+  secrets:
+    name: secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0                       # scan the whole history, not just the last commit
+      - name: Gitleaks (fails if a token, key or password was committed)
+        run: |
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.29.1/gitleaks_8.29.1_linux_x64.tar.gz | tar xz gitleaks
+          ./gitleaks git --redact --exit-code 1 .

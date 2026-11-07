@@ -1,0 +1,26 @@
+# Settings for the two checks. Run both before every push (CI runs them too):
+#   python -m ruff check .
+#   python -m pytest
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+extend-exclude = ["engine"]          # engine files are read-only (maintained in the engine session)
+
+[tool.ruff.lint]
+select = [
+    "E", "W",      # style errors
+    "F",           # real mistakes: unused names, undefined variables
+    "B",           # likely bugs
+    "I",           # sorted imports
+    "UP",          # modern Python syntax
+    "SIM",         # simpler equivalent code
+    "C90",         # complexity limit per function (below)
+]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10                  # a function with more branches than this fails the build
+
+[tool.pytest.ini_options]
+testpaths = ["engine"]               # the app's tests (api/) are added in PR 2
+addopts = "-q -p no:cacheprovider"
