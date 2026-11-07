@@ -819,7 +819,7 @@ def test_locked_output_file_gets_alternative_name(tmp_path, monkeypatch):
 
 def test_no_simulator_left_in_production_file():
     """The rules live only in section 3: no NumPy dynamics in the file the user runs."""
-    src = (ROOT / "meio_seeker_stochastic.py").read_text()
+    src = (ROOT / "meio_seeker_stochastic.py").read_text(encoding="utf-8")
     for banned in ("class MEIOSimulator", "def make_scenarios", "class Scenarios", "def run(self, policy",
                    "def fefo_take", "def cost(self, q)", "get_values("):
         assert banned not in src, banned
