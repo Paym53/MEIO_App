@@ -22,5 +22,11 @@ select = [
 max-complexity = 10                  # a function with more branches than this fails the build
 
 [tool.pytest.ini_options]
-testpaths = ["engine"]               # the app's tests (api/) are added in PR 2
-addopts = "-q -p no:cacheprovider"
+testpaths = ["engine", "api"]
+pythonpath = ["engine", "api"]
+# coverage gate: the app's code (api/) must be at least 90 % covered by tests, or the run fails
+addopts = "-q -p no:cacheprovider --cov=api --cov-report=term-missing:skip-covered --cov-fail-under=90"
+
+[tool.coverage.run]
+patch = ["subprocess"]               # also measure the worker processes the server starts
+omit = ["api/test_api.py"]

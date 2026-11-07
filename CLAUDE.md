@@ -170,11 +170,13 @@ When the app needs something from the engine (a rule, an output, a setting, a bu
 
 ## 8. Status, decisions, known facts
 
-**Latest numbers (user's PC, 250 s):**
-- start policy €119,981
-- Seeker in-sample €112,858 with 90/90 rules
-- fresh scenarios €112,886 with 88/90 rules (the misses are usually the week-36 Amazon/B2B rules at the end of the horizon; this is accepted, because the end weeks are indicative)
+**Latest numbers (user's PC, 250 s, F5 from the repo copy, 07.11.):**
+- start policy €119,981 (identical to earlier runs: the start evaluation does not depend on the search)
+- Seeker in-sample €111,784 with 90/90 rules (earlier run: €112,858; the search varies from run to run)
+- fresh scenarios €112,128 with 88/90 rules (the misses are usually the week-36 Amazon/B2B rules at the end of the horizon; this is accepted, because the end weeks are indicative)
 - Week-1 decision: no production; a 1,000 kg strawberry order arriving in week 9.
+- Timings: feasibility 21 s, build 8.8 s, start evaluation 3.3 s, search 266.6 s, reading 3.3 s, out-of-sample 66.4 s; total 382 s.
+  Fixed part ≈ 115 s, so time left ≈ 115 s + 1.07 × time limit − elapsed (`api/server.py` ETA constants).
 
 **Decisions and why:**
 - **Rules written once in Seeker; no second simulator in the engine** (the reference exists only for tests). This avoids errors from duplicate logic.
@@ -190,7 +192,9 @@ When the app needs something from the engine (a rule, an output, a setting, a bu
 - Reading single numbers (aggregates) is instant; per-scenario lists cost 0.5–3 s each, so the engine never reads them.
 - Seeker reshuffles the demand samples across its scenarios, so its scenarios exist only inside Seeker.
 - From an infeasible start Seeker often makes no progress.
-- It overruns the time limit by about 15%.
+- It overruns the time limit by about 7–15% (266.6 s for 250 s on 07.11.).
+- Its progress line `At time 134.5: Objective = 112013.35; Status = Feasible; Evaluations = 5126` appears only when the
+  search improves (3 lines in 267 s on 07.11.), not every 30 s: show progress from elapsed time, not from these lines.
 - If the results file is open in Excel, the engine writes a time-stamped name.
 
 **Stress tests (06.11.):**
@@ -219,8 +223,12 @@ Browser → Lovable web app (own repo, made by Lovable; shows only API numbers, 
   an engine change.
 - **Python UTF-8 mode (`PYTHONUTF8=1`) everywhere:** CI sets it, the user set it with `setx`, and the worker must set it
   in its subprocess env. Without it Windows uses cp1252: `engine/test_engine.py:822` `read_text()` cannot decode the
-  engine source (CI failure 07.11.), and piped `print` of `→` (bound NOTE) raises UnicodeEncodeError. Engine change
-  request sent: `read_text(encoding="utf-8")` there.
+  engine source (CI failure 07.11.), and piped `print` of `→` (bound NOTE) raises UnicodeEncodeError. The user applied the
+  engine change request (`read_text(encoding="utf-8")` at line 822) on main on 07.11.; `test_engine.py` is not
+  fingerprinted. The engine session must carry this line into the next engine version.
+- **Test double in the app:** `MEIO_TEST_DOUBLE=1` makes `api/worker.py` use the Seeker stand-in from `test_engine.py`
+  (tests only). Results then carry `test_double: true` and `seeker_version` "FAKE …", and `/health` reports it.
+- **Windows:** replacing a file another process is reading fails, so both `write_json` functions retry for up to 1 s.
 - Users: the user only, one token. Run history = folders in `runs/`, no database.
 - FillRates column names contain the scenario counts: match columns by prefix. Read the feasibility line from
   `res.ins["feasibility"]` and the bound NOTE from `engine.bound_note(res.layout, res.x)`, not from Summary labels.
