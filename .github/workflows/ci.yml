@@ -6,6 +6,11 @@ on:
   push:
     branches: [main]
 
+env:
+  # Python UTF-8 mode, as on the license PC (README setup step 2). Without it, Windows reads text files as cp1252
+  # and engine/test_engine.py:822 cannot read the engine source (engine change request pending).
+  PYTHONUTF8: "1"
+
 jobs:
   tests:
     name: lint + tests (${{ matrix.os }})

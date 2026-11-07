@@ -217,6 +217,10 @@ Browser → Lovable web app (own repo, made by Lovable; shows only API numbers, 
 - No editing of data in the browser yet: a workbook re-saved by openpyxl loses Excel's cached formula values, so
   `Checks` OVERALL reads `nan` and `validate()` rejects it (reproduced 06.11.). Revisit with a recalculation step or
   an engine change.
+- **Python UTF-8 mode (`PYTHONUTF8=1`) everywhere:** CI sets it, the user set it with `setx`, and the worker must set it
+  in its subprocess env. Without it Windows uses cp1252: `engine/test_engine.py:822` `read_text()` cannot decode the
+  engine source (CI failure 07.11.), and piped `print` of `→` (bound NOTE) raises UnicodeEncodeError. Engine change
+  request sent: `read_text(encoding="utf-8")` there.
 - Users: the user only, one token. Run history = folders in `runs/`, no database.
 - FillRates column names contain the scenario counts: match columns by prefix. Read the feasibility line from
   `res.ins["feasibility"]` and the bound NOTE from `engine.bound_note(res.layout, res.x)`, not from Summary labels.

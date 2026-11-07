@@ -40,13 +40,19 @@ Coming next: `api/` (PR 2), then `start_worker.bat` and `local_settings.example.
 ## Setup on your PC (once)
 
 1. **Clone:** in GitHub Desktop choose *File → Clone repository → Paym53/MEIO_App*, local path for example `C:\dev\MEIO_App`.
-2. **Install packages:** open Command Prompt and run:
+2. **UTF-8 mode:** open Command Prompt and run the line below once, then **close it, open a new one and restart Spyder**.
+   Windows otherwise reads text files as cp1252, which breaks one engine test and the engine's `→` output in the app.
+   (UTF-8 is the default from Python 3.15, so this is harmless for other programs.)
+   ```bat
+   setx PYTHONUTF8 1
+   ```
+3. **Install packages:** in the new Command Prompt run:
    ```bat
    cd C:\dev\MEIO_App
    C:\Users\ruben\seeker_env\Scripts\python.exe -m pip install -r requirements.txt
    ```
-3. **License:** copy your `license.sio` into `C:\dev\MEIO_App\engine\` (it is gitignored).
-4. **Check:** run the tests. The expected result is `58 passed`.
+4. **License:** copy your `license.sio` into `C:\dev\MEIO_App\engine\` (it is gitignored).
+5. **Check:** run the tests. The expected result is `58 passed`.
    ```bat
    C:\Users\ruben\seeker_env\Scripts\python.exe -m pytest
    ```
