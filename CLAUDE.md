@@ -260,6 +260,27 @@ GitHub PR #4 = start script + ngrok (the "PR 3" step of the file list; #3 was th
 `ngrok http 127.0.0.1:8000 --url=https://<domain>` (127.0.0.1, not localhost: Windows may resolve localhost to IPv6)
 in a second window; its settings checks are tested on Windows CI (`MEIO_NO_PAUSE=1` skips `pause`).
 
+**Status 07.11. (evening):** PR #4 merged; ngrok set up; phone check and the three dashboard connection checks passed
+(green badge, wrong token → message, API closed → red within 15 s).
+
+**The dashboard (Lovable):** repo `Paym53/meio-planning-dashboard` (TanStack Start + React + Tailwind/shadcn, bun;
+Lovable-managed: its AGENTS.md forbids force-push/history rewrites; push only working states). Lovable read
+`api/openapi.json` + `api/server.py` read-only and built `src/lib/api.ts` against them. Claude writes the prompts;
+the user pastes them into Lovable; Claude reviews the repo against the 7 Knowledge rules (rules block given 07.11.:
+never compute numbers, token/address only in localStorage, both headers, plain English, honesty rules, TEST MODE
+banner, one API client and no backend/Supabase/GitHub). Review 07.11.: all 7 rules hold; API calls happen in the
+browser only (SSR gets no token). Open: fonts load from fonts.googleapis.com (GDPR) → self-host (asked in Prompt 2).
+This session cannot install the dashboard's packages (blocked), so its tests are verified only by CI.
+
+**Deferred to the end (user decision 07.11.):** dashboard CI (`.github/workflows/ci.yml`: bun install, vitest, tsc,
+lint, build) **and** the full UI test suite, added together once all screens exist. Collect the tests per screen here:
+- Connect: badge green/amber/red; wrong token → "Missing or wrong token."; offline message; TEST MODE banner. (14 tests exist)
+- New run: validation errors shown word for word and complete; Start disabled when invalid; 409 → message + link;
+  progress steps from `phase`; time left from `seconds_left` only; cancel; end states done/invalid/failed/cancelled.
+- Results (next): headline = out-of-sample cost + "N of M rules met"; feasibility line and bound NOTE above the fold;
+  missed rules listed; every table cell = API value (no computed numbers); workbook download.
+- Runs/compare (AC4): costs compared only when rules_met_out_of_sample is equal; otherwise a warning, no difference.
+
 **Plan:** PR 1 foundation → user runs tests + one real F5 run from the repo → PR 2 local API → one real run via
 `localhost:8000/docs` → PR 3 ngrok → test from the phone → Lovable UI (prompt pack from Claude, one screen at a time)
 → hardening. Claude works on its branch and opens a PR; the user merges and pulls with GitHub Desktop.
