@@ -61,6 +61,7 @@ VALIDATE_TIMEOUT_SECONDS = 120
 # Time left = fixed phases + search (Seeker overruns its limit by ~7 %); user's PC, 07.11.: 115 s + 266.6 s at 250 s
 ETA_FIXED_SECONDS, ETA_SEARCH_FACTOR = 115.0, 1.07
 WATCHDOG_FACTOR = 3.0                                                      # a run taking 3 × its estimate is stopped
+EXIT_WAIT_SECONDS = 30.0                                                   # a finished worker gets this to exit
 LOG_TAIL_LINES = 40
 RUN_ID = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{4}$")
 PHASE_START = re.compile(r"^\[\d\d:\d\d:\d\d\] (.+) \.\.\.$")              # engine phase lines: "[19:52:44] 5. … ..."
@@ -163,7 +164,24 @@ def worker_env():
 
 
 def busy():
-    return CURRENT["proc"] is not None and CURRENT["proc"].poll() is None
+    """A run is in progress while its worker is alive AND its state is still 'running'. A finished worker can take a
+    moment to exit after writing its final state (Python shutdown; on Windows noticeably), and is not busy then."""
+    proc, run_id = CURRENT["proc"], CURRENT["id"]
+    return proc is not None and run_id is not None and proc.poll() is None and \
+        read_status(RUNS_DIR / run_id)["state"] == "running"
+
+
+def let_finished_worker_exit():
+    """Before a new run starts: wait for the previous, finished worker to exit; stop it if it hangs (its results
+    are already written)."""
+    proc = CURRENT["proc"]
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        proc.wait(timeout=EXIT_WAIT_SECONDS)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
 
 
 def watch(run_id, proc, folder, time_limit):
@@ -189,6 +207,7 @@ def start_run(data, time_limit):
     with LOCK:
         if busy():
             raise HTTPException(409, f"A run is already in progress ({CURRENT['id']}).")
+        let_finished_worker_exit()
         run_id = new_run_id()
         folder = RUNS_DIR / run_id
         folder.mkdir(parents=True)
