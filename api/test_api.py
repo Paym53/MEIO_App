@@ -323,6 +323,32 @@ def test_a_second_run_is_refused_and_cancel_stops_the_first(api):
     assert api.post(f"/runs/{run_id}/cancel").status_code == 409
 
 
+SLOW_EXIT_WORKER = """
+import json, sys, time
+from pathlib import Path
+status = Path(sys.argv[2]) / "status.json"
+s = json.loads(status.read_text(encoding="utf-8"))
+s.update(state="done", message="Finished.")
+status.write_text(json.dumps(s), encoding="utf-8")
+time.sleep(3)                                    # the process is still exiting after its final state is written
+"""
+
+
+@pytest.mark.parametrize("exit_wait", [30.0, 0.2])                 # normal exit / hanging exit (is stopped)
+def test_a_new_run_can_start_as_soon_as_the_last_one_is_finished(api, monkeypatch, tmp_path, exit_wait):
+    monkeypatch.setattr(server, "EXIT_WAIT_SECONDS", exit_wait)
+    slow = tmp_path / "slow_exit_worker.py"
+    slow.write_text(SLOW_EXIT_WORKER, encoding="utf-8")
+    monkeypatch.setattr(server, "WORKER", slow)
+    first = start(api)
+    assert wait(api, first)["state"] == "done"
+    assert api.get("/health").json()["busy"] is False             # finished = not busy, even while still exiting
+    second = start(api)                                           # 202, not "already in progress"
+    assert server.read_status(server.RUNS_DIR / first)["state"] == "done"
+    assert wait(api, second)["state"] == "done"
+    server.CURRENT["proc"].wait(timeout=30)
+
+
 def test_a_run_far_over_its_expected_time_is_stopped(api, monkeypatch):
     monkeypatch.setattr(server, "ETA_FIXED_SECONDS", 0.5)
     monkeypatch.setattr(server, "ETA_SEARCH_FACTOR", 0.0)
