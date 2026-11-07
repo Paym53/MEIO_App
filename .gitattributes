@@ -1,0 +1,7 @@
+# Keep files byte-exact: no line-ending conversion when Git for Windows checks them out.
+# Why: engine/test_engine.py (section 6) checks the SHA-256 of the raw engine files; converting
+# LF to CRLF on checkout would change them and fail the test on the Windows PC.
+* -text
+
+# Windows batch files need CRLF line endings.
+*.bat text eol=crlf

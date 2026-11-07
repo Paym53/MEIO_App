@@ -1,0 +1,26 @@
+# --- Secrets and machine settings: never in git
+*.sio
+local_settings.bat
+.env
+
+# --- Real data, runs and results: stay on the PC
+data/
+runs/
+MEIO_Results*.xlsx
+MEIO_Stress_Tests*.xlsx
+~$*
+
+# --- Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# --- Editors
+.spyproject/
+.vscode/
+.idea/
