@@ -8,7 +8,7 @@ shows the results: what to commit now, the (s,S) policy, fill rates, stock, wast
 Browser → Lovable web app → ngrok tunnel → local API on your PC → engine + Seeker license
 ```
 
-**Status:** PR 1 (foundation) is merged. PR 2 adds the local API. Next: PR 3 ngrok, then the Lovable UI.
+**Status:** foundation, local API and start script are in place. Next: the Lovable UI.
 
 ## What the app must do
 
@@ -37,8 +37,8 @@ These scenarios are the contract. Each one becomes an automated test.
 | `api/worker.py` | runs the engine once (validate or optimize) and writes the results; the only file that uses the engine |
 | `api/test_api.py` | the app's tests: the six scenarios above, end to end |
 | `api/openapi.json` | the frozen API contract (what the Lovable UI is built against) |
-
-Coming next: `start_worker.bat` and `local_settings.example.bat` (PR 3).
+| `start_worker.bat` | double-click: starts the API and the ngrok tunnel |
+| `local_settings.example.bat` | template for your settings (token, ngrok domain); your copy `local_settings.bat` stays private |
 **Never in git:** `license.sio`, `local_settings.bat`, real data (`data/`), runs (`runs/`), results workbooks.
 
 ## Setup on your PC (once)
@@ -69,25 +69,39 @@ in `engine\MEIO_Data_Template.xlsx` and writes `engine\MEIO_Results_stochastic.x
 **Your data:** keep real workbooks in `C:\dev\MEIO_App\data\` (gitignored) and run them through the app. Leave the template in
 `engine\` as it is: the tests depend on its example data, and GitHub Desktop would show any edit as a change.
 
-## Try the local API
+## Put the app online (once)
 
-Until PR 3 adds a start script, start the API by hand in Command Prompt, in the repo folder:
+The API runs on your PC; ngrok gives it a fixed internet address so the web app can reach it.
 
-1. **Make a token** (a long random password for the API). Run this once and keep the output somewhere safe:
+1. **ngrok account:** sign up for free at https://ngrok.com.
+2. **Install ngrok:** in Command Prompt run the line below, then close Command Prompt and open a new one. `ngrok version` should now print a version.
    ```bat
-   C:\Users\ruben\seeker_env\Scripts\python.exe -c "import secrets; print(secrets.token_urlsafe(32))"
+   winget install ngrok.ngrok
    ```
-2. **Start the API** (replace `<token>` with your token; the window must stay open while you use the API):
+3. **Connect ngrok to your account:** in the ngrok dashboard open *Your Authtoken*, copy it, and run:
    ```bat
-   set MEIO_TOKEN=<token>
-   C:\Users\ruben\seeker_env\Scripts\python.exe api\server.py
+   ngrok config add-authtoken <your ngrok authtoken>
    ```
-3. **Open** http://127.0.0.1:8000/docs in your browser, click **Authorize**, and paste the token.
-4. **Run:** open `POST /runs` → *Try it out* → choose `engine\MEIO_Data_Template.xlsx` → *Execute*. Copy the `id` from the answer.
-5. **Watch:** `GET /runs/{run_id}` shows the phase, the seconds left and the log. When `state` is `done`:
-   `GET /runs/{run_id}/result` returns all numbers, and `GET /runs/{run_id}/workbook` returns the results workbook.
+4. **Your address:** in the ngrok dashboard open *Domains* and note your free domain, e.g. `something.ngrok-free.app`.
+5. **Your settings:** in the repo folder, copy `local_settings.example.bat` and rename the copy to `local_settings.bat`.
+   Open it in Notepad (right-click → *Edit*) and fill in:
+   - `MEIO_TOKEN`: your API token (the file explains how to make one)
+   - `NGROK_DOMAIN`: your domain from step 4, without `https://`
 
-Each run is kept in `runs\<id>\` (input, log, results; gitignored). Stop the API with Ctrl+C.
+   `local_settings.bat` holds your secret token. It is gitignored: GitHub Desktop never shows or uploads it.
+
+## Start and stop the app
+
+- **Start:** double-click `start_worker.bat`. The API runs in that window (its log scrolls there), and the tunnel runs in a
+  second, minimised window "MEIO tunnel". Leave both open while the app is in use.
+- **Check from outside:** on your phone (Wi-Fi off), open `https://<your domain>/health`. After ngrok's warning page
+  (*Visit Site*) you should see `{"detail":"Missing or wrong token."}`: the PC is reachable **and** protected.
+  `https://<your domain>/docs` → *Authorize* with your token → `GET /health` → *Execute* shows `"status": "ok"`.
+- **Use on this PC only:** leave `NGROK_DOMAIN` empty; the API is then at http://127.0.0.1:8000/docs.
+- **Stop:** press Ctrl+C in the API window (answer `Y`), then close the "MEIO tunnel" window.
+
+The `/docs` page is visible to anyone who knows the address, but it only describes the API: every action needs the token.
+Each run is kept in `runs\<id>\` (input, log, results; gitignored).
 
 ## Updating
 

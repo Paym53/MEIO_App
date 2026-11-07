@@ -13,10 +13,15 @@ are real model numbers, the search is trivial.
   5. PROTECTED PC (AC5) ......... no token, no answer, no action
   6. ONE RUN AT A TIME (AC6) .... second run refused; cancel; watchdog; crash and restart recovery
   7. ARCHITECTURE & CONTRACT .... server never imports the engine; frozen API contract; result model = worker output
+  8. START SCRIPT .............. settings template complete, secrets gitignored; the .bat checks (Windows)
 ================================================================================
 """
 import ast
 import json
+import os
+import re
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -436,3 +441,54 @@ def test_result_model_matches_what_the_worker_writes(done):
     assert set(result) == set(server.Result.model_fields)
     assert set(result["headline"]) == set(server.Headline.model_fields)
     assert result["contract_version"] == worker.RESULT_CONTRACT_VERSION
+
+
+# ============================================================================
+# 8. START SCRIPT (start_worker.bat, local_settings.example.bat)
+# ============================================================================
+def bat_vars_used(path):
+    return set(re.findall(r"%([A-Z_][A-Z0-9_]*)%", Path(path).read_text(encoding="utf-8")))
+
+
+def test_the_settings_template_defines_every_setting_the_script_and_server_read():
+    defined = set(re.findall(r"^set ([A-Z_]+)=", (ROOT / "local_settings.example.bat").read_text(encoding="utf-8"),
+                             re.M))
+    assert bat_vars_used(ROOT / "start_worker.bat") - {"PYTHONUTF8"} <= defined
+    server_reads = set(re.findall(r'os\.environ\.get\("(MEIO_[A-Z_]+)"', (ROOT / "api" / "server.py").read_text(
+        encoding="utf-8"))) - {"MEIO_PORT", "MEIO_RUNS_DIR", "MEIO_ALLOWED_ORIGINS", "MEIO_TEST_DOUBLE"}
+    assert server_reads <= defined                                  # token and license path come from the settings
+
+
+def test_the_real_settings_file_is_never_committed():
+    ignored = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert "local_settings.bat" in ignored and "*.sio" in ignored
+    assert "paste-your-token-here" in (ROOT / "local_settings.example.bat").read_text(encoding="utf-8")
+
+
+def settings_bat(**values):
+    return "\r\n".join(f"set {k}={v}" for k, v in values.items()) + "\r\n"
+
+
+GUARD_CASES = {
+    "missing settings": (None, "local_settings.bat is missing", 1),
+    "placeholder token": ({"MEIO_TOKEN": "paste-your-token-here"}, "Set MEIO_TOKEN", 1),
+    "wrong python": ({"MEIO_TOKEN": TOKEN, "MEIO_PYTHON": r"C:\nowhere\python.exe"}, "Python not found", 1),
+    "no ngrok": ({"MEIO_TOKEN": TOKEN, "MEIO_PYTHON": sys.executable, "NGROK_DOMAIN": "x.ngrok-free.app",
+                  "NGROK_EXE": "ngrok-missing-xyz"}, "ngrok not found", 1),
+    "local only": ({"MEIO_TOKEN": TOKEN, "MEIO_PYTHON": sys.executable, "NGROK_DOMAIN": ""}, "runs on this PC only", 0),
+}
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows batch file (runs on Windows CI and the license PC)")
+@pytest.mark.parametrize("case", GUARD_CASES)
+def test_start_script_checks_its_settings_before_starting_anything(case, tmp_path):
+    settings, message, code = GUARD_CASES[case]
+    (tmp_path / "start_worker.bat").write_bytes((ROOT / "start_worker.bat").read_bytes())
+    if settings is not None:
+        (tmp_path / "local_settings.bat").write_text(settings_bat(**settings), encoding="utf-8")
+    done = subprocess.run(["cmd", "/c", "start_worker.bat"], cwd=tmp_path, capture_output=True, timeout=60,
+                          env=dict(os.environ, MEIO_NO_PAUSE="1"))
+    out = done.stdout.decode("utf-8", "replace") + done.stderr.decode("utf-8", "replace")
+    assert message in out and done.returncode == code, out
+    if case == "local only":                                       # reached the API step (no api\server.py here)
+        assert "The API has stopped" in out

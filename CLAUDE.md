@@ -172,11 +172,13 @@ When the app needs something from the engine (a rule, an output, a setting, a bu
 
 **Latest numbers (user's PC, 250 s, F5 from the repo copy, 07.11.):**
 - start policy €119,981 (identical to earlier runs: the start evaluation does not depend on the search)
-- Seeker in-sample €111,784 with 90/90 rules (earlier run: €112,858; the search varies from run to run)
+- Seeker in-sample €111,784 with 90/90 rules
 - fresh scenarios €112,128 with 88/90 rules (the misses are usually the week-36 Amazon/B2B rules at the end of the horizon; this is accepted, because the end weeks are indicative)
 - Week-1 decision: no production; a 1,000 kg strawberry order arriving in week 9.
 - Timings: feasibility 21 s, build 8.8 s, start evaluation 3.3 s, search 266.6 s, reading 3.3 s, out-of-sample 66.4 s; total 382 s.
   Fixed part ≈ 115 s, so time left ≈ 115 s + 1.07 × time limit − elapsed (`api/server.py` ETA constants).
+- **Same run through the local API (07.11., real Seeker):** €112,128.16 and 88/90 on fresh scenarios, identical to F5;
+  377 s in total (estimate 382 s). The API reproduces the engine exactly.
 
 **Decisions and why:**
 - **Rules written once in Seeker; no second simulator in the engine** (the reference exists only for tests). This avoids errors from duplicate logic.
@@ -189,6 +191,9 @@ When the app needs something from the engine (a rule, an output, a setting, a bu
 - **The engine session also has a solver-free NumPy optimizer** that was about 3.6% cheaper in benchmarks. It isn't part of this bundle; ask the user if you need it.
 
 **Seeker facts (2.1.0):**
+- **The search is reproducible:** two runs on 07.11. found the same improvements after the same numbers of
+  evaluations (5,126 → 112,013.35; 6,282 → 111,783.95). Results differ only when a different number of evaluations
+  fits into the time limit (machine load). The earlier €112,858 run was an older state.
 - Reading single numbers (aggregates) is instant; per-scenario lists cost 0.5–3 s each, so the engine never reads them.
 - Seeker reshuffles the demand samples across its scenarios, so its scenarios exist only inside Seeker.
 - From an infeasible start Seeker often makes no progress.
@@ -249,6 +254,11 @@ Browser → Lovable web app (own repo, made by Lovable; shows only API numbers, 
 | `api/test_api.py` | the acceptance scenarios, with the Seeker test double; coverage gate ≥ 90 % on `api/` | 2 |
 | `api/openapi.json` | frozen API contract (snapshot test); what Lovable builds against | 2 |
 | `start_worker.bat`, `local_settings.example.bat` | start API + ngrok; template for token, license path, ngrok domain | 3 |
+
+**Status 07.11.:** PR 1 (foundation), PR 2 (local API) and its Windows fix merged; real Seeker run via the API OK.
+GitHub PR #4 = start script + ngrok (the "PR 3" step of the file list; #3 was the Windows fix). `start_worker.bat` runs ngrok as
+`ngrok http 127.0.0.1:8000 --url=https://<domain>` (127.0.0.1, not localhost: Windows may resolve localhost to IPv6)
+in a second window; its settings checks are tested on Windows CI (`MEIO_NO_PAUSE=1` skips `pause`).
 
 **Plan:** PR 1 foundation → user runs tests + one real F5 run from the repo → PR 2 local API → one real run via
 `localhost:8000/docs` → PR 3 ngrok → test from the phone → Lovable UI (prompt pack from Claude, one screen at a time)
