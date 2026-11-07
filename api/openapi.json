@@ -1,0 +1,836 @@
+{
+ "openapi": "3.1.0",
+ "info": {
+  "title": "MEIO local API",
+  "version": "1"
+ },
+ "paths": {
+  "/health": {
+   "get": {
+    "summary": "Health",
+    "operationId": "health_health_get",
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Health"
+        }
+       }
+      }
+     }
+    },
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ]
+   }
+  },
+  "/validate": {
+   "post": {
+    "summary": "Validate",
+    "description": "Checks a workbook with the engine's own data checks. Nothing is stored.",
+    "operationId": "validate_validate_post",
+    "requestBody": {
+     "content": {
+      "multipart/form-data": {
+       "schema": {
+        "$ref": "#/components/schemas/Body_validate_validate_post"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Validation"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Validation Error",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      }
+     }
+    },
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ]
+   }
+  },
+  "/runs": {
+   "get": {
+    "summary": "List Runs",
+    "description": "Run history, newest first.",
+    "operationId": "list_runs_runs_get",
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "items": {
+          "$ref": "#/components/schemas/RunSummary"
+         },
+         "type": "array",
+         "title": "Response List Runs Runs Get"
+        }
+       }
+      }
+     }
+    },
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ]
+   },
+   "post": {
+    "summary": "Create Run",
+    "description": "Starts an optimization run in the background (refused while another run is in progress).",
+    "operationId": "create_run_runs_post",
+    "requestBody": {
+     "content": {
+      "multipart/form-data": {
+       "schema": {
+        "$ref": "#/components/schemas/Body_create_run_runs_post"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "202": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/RunStatus"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Validation Error",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      }
+     }
+    },
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ]
+   }
+  },
+  "/runs/{run_id}": {
+   "get": {
+    "summary": "Get Run",
+    "description": "Status of one run, with the current phase, estimated seconds left and the last log lines.",
+    "operationId": "get_run_runs__run_id__get",
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ],
+    "parameters": [
+     {
+      "name": "run_id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "title": "Run Id"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/RunStatus"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Validation Error",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/runs/{run_id}/result": {
+   "get": {
+    "summary": "Get Result",
+    "description": "Everything the engine reported, as JSON: the headline and the six result tables.",
+    "operationId": "get_result_runs__run_id__result_get",
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ],
+    "parameters": [
+     {
+      "name": "run_id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "title": "Run Id"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Result"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Validation Error",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/runs/{run_id}/workbook": {
+   "get": {
+    "summary": "Get Workbook",
+    "description": "The engine's formatted results workbook.",
+    "operationId": "get_workbook_runs__run_id__workbook_get",
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ],
+    "parameters": [
+     {
+      "name": "run_id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "title": "Run Id"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Successful Response"
+     },
+     "422": {
+      "description": "Validation Error",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/runs/{run_id}/cancel": {
+   "post": {
+    "summary": "Cancel Run",
+    "operationId": "cancel_run_runs__run_id__cancel_post",
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ],
+    "parameters": [
+     {
+      "name": "run_id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "title": "Run Id"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/RunStatus"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Validation Error",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      }
+     }
+    }
+   }
+  }
+ },
+ "components": {
+  "schemas": {
+   "Body_create_run_runs_post": {
+    "properties": {
+     "file": {
+      "type": "string",
+      "contentMediaType": "application/octet-stream",
+      "title": "File"
+     },
+     "time_limit": {
+      "type": "integer",
+      "maximum": 3600.0,
+      "minimum": 1.0,
+      "title": "Time Limit",
+      "default": 250
+     }
+    },
+    "type": "object",
+    "required": [
+     "file"
+    ],
+    "title": "Body_create_run_runs_post"
+   },
+   "Body_validate_validate_post": {
+    "properties": {
+     "file": {
+      "type": "string",
+      "contentMediaType": "application/octet-stream",
+      "title": "File"
+     }
+    },
+    "type": "object",
+    "required": [
+     "file"
+    ],
+    "title": "Body_validate_validate_post"
+   },
+   "HTTPValidationError": {
+    "properties": {
+     "detail": {
+      "items": {
+       "$ref": "#/components/schemas/ValidationError"
+      },
+      "type": "array",
+      "title": "Detail"
+     }
+    },
+    "type": "object",
+    "title": "HTTPValidationError"
+   },
+   "Headline": {
+    "properties": {
+     "cost_out_of_sample": {
+      "type": "number",
+      "title": "Cost Out Of Sample"
+     },
+     "rules_total": {
+      "type": "integer",
+      "title": "Rules Total"
+     },
+     "rules_met_out_of_sample": {
+      "type": "integer",
+      "title": "Rules Met Out Of Sample"
+     },
+     "rules_missed_out_of_sample": {
+      "items": {
+       "$ref": "#/components/schemas/MissedRule"
+      },
+      "type": "array",
+      "title": "Rules Missed Out Of Sample"
+     },
+     "feasibility": {
+      "type": "string",
+      "title": "Feasibility"
+     },
+     "bound_note": {
+      "type": "string",
+      "title": "Bound Note"
+     },
+     "cost_in_sample": {
+      "type": "number",
+      "title": "Cost In Sample"
+     },
+     "rules_met_in_sample": {
+      "type": "integer",
+      "title": "Rules Met In Sample"
+     },
+     "start_policy_cost": {
+      "type": "number",
+      "title": "Start Policy Cost"
+     },
+     "scenarios_in_sample": {
+      "type": "integer",
+      "title": "Scenarios In Sample"
+     },
+     "scenarios_out_of_sample": {
+      "type": "integer",
+      "title": "Scenarios Out Of Sample"
+     },
+     "seeker_status": {
+      "type": "string",
+      "title": "Seeker Status"
+     }
+    },
+    "type": "object",
+    "required": [
+     "cost_out_of_sample",
+     "rules_total",
+     "rules_met_out_of_sample",
+     "rules_missed_out_of_sample",
+     "feasibility",
+     "bound_note",
+     "cost_in_sample",
+     "rules_met_in_sample",
+     "start_policy_cost",
+     "scenarios_in_sample",
+     "scenarios_out_of_sample",
+     "seeker_status"
+    ],
+    "title": "Headline"
+   },
+   "Health": {
+    "properties": {
+     "status": {
+      "type": "string",
+      "title": "Status"
+     },
+     "engine_version": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Engine Version"
+     },
+     "license_found": {
+      "type": "boolean",
+      "title": "License Found"
+     },
+     "busy": {
+      "type": "boolean",
+      "title": "Busy"
+     },
+     "current_run": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Current Run"
+     },
+     "test_double": {
+      "type": "boolean",
+      "title": "Test Double"
+     }
+    },
+    "type": "object",
+    "required": [
+     "status",
+     "engine_version",
+     "license_found",
+     "busy",
+     "current_run",
+     "test_double"
+    ],
+    "title": "Health"
+   },
+   "MissedRule": {
+    "properties": {
+     "channel": {
+      "type": "string",
+      "title": "Channel"
+     },
+     "week": {
+      "type": "integer",
+      "title": "Week"
+     },
+     "target": {
+      "type": "number",
+      "title": "Target"
+     },
+     "share": {
+      "type": "number",
+      "title": "Share"
+     }
+    },
+    "type": "object",
+    "required": [
+     "channel",
+     "week",
+     "target",
+     "share"
+    ],
+    "title": "MissedRule"
+   },
+   "Result": {
+    "properties": {
+     "contract_version": {
+      "type": "integer",
+      "title": "Contract Version"
+     },
+     "engine_version": {
+      "type": "string",
+      "title": "Engine Version"
+     },
+     "seeker_version": {
+      "type": "string",
+      "title": "Seeker Version"
+     },
+     "test_double": {
+      "type": "boolean",
+      "title": "Test Double"
+     },
+     "headline": {
+      "$ref": "#/components/schemas/Headline"
+     },
+     "sheets": {
+      "additionalProperties": {
+       "$ref": "#/components/schemas/Table"
+      },
+      "type": "object",
+      "title": "Sheets"
+     },
+     "timings": {
+      "items": {
+       "prefixItems": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "number"
+        }
+       ],
+       "type": "array",
+       "maxItems": 2,
+       "minItems": 2
+      },
+      "type": "array",
+      "title": "Timings"
+     }
+    },
+    "type": "object",
+    "required": [
+     "contract_version",
+     "engine_version",
+     "seeker_version",
+     "test_double",
+     "headline",
+     "sheets",
+     "timings"
+    ],
+    "title": "Result"
+   },
+   "RunStatus": {
+    "properties": {
+     "id": {
+      "type": "string",
+      "title": "Id"
+     },
+     "state": {
+      "type": "string",
+      "title": "State"
+     },
+     "created": {
+      "type": "string",
+      "title": "Created"
+     },
+     "finished": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Finished"
+     },
+     "time_limit": {
+      "type": "number",
+      "title": "Time Limit"
+     },
+     "message": {
+      "type": "string",
+      "title": "Message"
+     },
+     "summary": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Summary"
+     },
+     "test_double": {
+      "type": "boolean",
+      "title": "Test Double",
+      "default": false
+     },
+     "errors": {
+      "items": {
+       "type": "string"
+      },
+      "type": "array",
+      "title": "Errors"
+     },
+     "phase": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Phase"
+     },
+     "seconds_left": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Seconds Left"
+     },
+     "log_tail": {
+      "items": {
+       "type": "string"
+      },
+      "type": "array",
+      "title": "Log Tail"
+     }
+    },
+    "type": "object",
+    "required": [
+     "id",
+     "state",
+     "created",
+     "finished",
+     "time_limit",
+     "message",
+     "errors",
+     "phase",
+     "seconds_left",
+     "log_tail"
+    ],
+    "title": "RunStatus"
+   },
+   "RunSummary": {
+    "properties": {
+     "id": {
+      "type": "string",
+      "title": "Id"
+     },
+     "state": {
+      "type": "string",
+      "title": "State"
+     },
+     "created": {
+      "type": "string",
+      "title": "Created"
+     },
+     "finished": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Finished"
+     },
+     "time_limit": {
+      "type": "number",
+      "title": "Time Limit"
+     },
+     "message": {
+      "type": "string",
+      "title": "Message"
+     },
+     "summary": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Summary"
+     },
+     "test_double": {
+      "type": "boolean",
+      "title": "Test Double",
+      "default": false
+     }
+    },
+    "type": "object",
+    "required": [
+     "id",
+     "state",
+     "created",
+     "finished",
+     "time_limit",
+     "message"
+    ],
+    "title": "RunSummary"
+   },
+   "Table": {
+    "properties": {
+     "columns": {
+      "items": {
+       "type": "string"
+      },
+      "type": "array",
+      "title": "Columns"
+     },
+     "rows": {
+      "items": {
+       "items": {},
+       "type": "array"
+      },
+      "type": "array",
+      "title": "Rows"
+     }
+    },
+    "type": "object",
+    "required": [
+     "columns",
+     "rows"
+    ],
+    "title": "Table"
+   },
+   "Validation": {
+    "properties": {
+     "valid": {
+      "type": "boolean",
+      "title": "Valid"
+     },
+     "errors": {
+      "items": {
+       "type": "string"
+      },
+      "type": "array",
+      "title": "Errors"
+     }
+    },
+    "type": "object",
+    "required": [
+     "valid",
+     "errors"
+    ],
+    "title": "Validation"
+   },
+   "ValidationError": {
+    "properties": {
+     "loc": {
+      "items": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "integer"
+        }
+       ]
+      },
+      "type": "array",
+      "title": "Location"
+     },
+     "msg": {
+      "type": "string",
+      "title": "Message"
+     },
+     "type": {
+      "type": "string",
+      "title": "Error Type"
+     },
+     "input": {
+      "title": "Input"
+     },
+     "ctx": {
+      "type": "object",
+      "title": "Context"
+     }
+    },
+    "type": "object",
+    "required": [
+     "loc",
+     "msg",
+     "type"
+    ],
+    "title": "ValidationError"
+   }
+  },
+  "securitySchemes": {
+   "HTTPBearer": {
+    "type": "http",
+    "description": "The MEIO_TOKEN from local_settings.bat",
+    "scheme": "bearer"
+   }
+  }
+ }
+}
