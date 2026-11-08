@@ -362,6 +362,12 @@ ignores NumScenarios (feasibility and build scale with it): fine for now. For de
 **Restart after a pull:** the API loads its code once; a pull while it runs left the old server calling the new worker
 with old arguments (08.11.). Now `/health` returns `restart_needed` (mtimes of server.py, worker.py and the engine
 changed since start) and the worker answers an old-style call with "restart start_worker.bat".
+**Lovable build pack v3 (08.11., given to the user):** Knowledge rules A–K (v2 rules + F: s/S only on "position"
+charts; J: restart_needed banner) and prompts in this order: 1 design shell · 2 Run optimization dialog + progress
+(send optional form fields only when set) · 3 Overview · 4 Decisions · 5 Inventory dynamics · 6 Orders · 7a Master
+data read-only (7b editing after API update 2) · 8 Solver settings · 9 Scenario comparison + Run history ·
+10 How to use + Explainability (static texts from Claude). After each prompt: the user checks, Claude reviews the
+dashboard repo against the Knowledge rules and adds the screen's tests to the list above.
 **API update 2 (next, before the Master data / scenario screens):** what-if edits written into a copy of the
 uploaded workbook (openpyxl, values only; engine K19 checks it), with an original-vs-changed list per run.
 
