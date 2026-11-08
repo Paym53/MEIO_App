@@ -281,6 +281,28 @@ lint, build) **and** the full UI test suite, added together once all screens exi
   missed rules listed; every table cell = API value (no computed numbers); workbook download.
 - Runs/compare (AC4): costs compared only when rules_met_out_of_sample is equal; otherwise a warning, no difference.
 
+**Decisions 08.11. (user):** single user (one token, no per-user login); no floating assistant; order of work:
+**engine v17 first → API update → Lovable prompts** (build pack v2: Knowledge rules A–J, design-shell Prompt A, page
+specs with data sources ✅ now / 🔧 API / 🧩 engine v17; left sidebar, right side = 480 px drill-down panel).
+UI rules from the review of the user's app concept: never draw s/S on on-hand stock without the "stock position" note
+(s,S act on IP_FG / echelon IP); no invented "why" texts (explain decisions with s, S, P(order) and arrival weeks only);
+no "transport decision" (transfers/transport follow production, B02/I04); forecast has no median (Q45–Q55 centre band);
+weeks before the first constrained week are "Fixed weeks", not "warm-up"; KPI totals/averages come from the engine.
+Comparing scenarios: same seed (common random numbers) and same rules met; different seeds = robustness test.
+
+**Engine change request v17 (sent 08.11., contract version 2):** weekly bands (mean, P05–P95) on fresh scenarios for
+FG/RM end stock, FG stock position, RM echelon position, waste, order quantities, receipts, served and lost per channel,
+stock eligible per channel, mean remaining shelf life; arrival weeks (P05/P50/P95) for every order week; KPI block;
+optional START_POLICY_OUT_OF_SAMPLE; `run(..., overrides={"NumScenarios", "RandomSeed"})` applied before validate();
+edited (openpyxl-saved) workbooks pass validate() when the cached OVERALL is missing; new sheets `Bands`, `KPIs`;
+new aggregates only in the out-of-sample model; acceptance incl. conservation tests and an unchanged Seeker
+improvement path (5,126 → 112,013.35; 6,282 → 111,783.95). Already in v16, so done in the API: cost parts
+(`ins["parts"]`, `oos[("part", n)]`).
+**API update 1 (after v17 lands):** `GET /runs/{id}/input` (engine-parsed master data + Locations, Lanes,
+Model_Assumptions, Checks); result: cost parts, saving, horizon, review period, first constrained week, product; run
+settings (fresh scenarios, feasibility check, chance level ≥ Excel, overrides) recorded with file name + sha256; run
+label/note; pass Bands/KPIs through; scenario edits on a copy with original-vs-changed list.
+
 **Plan:** PR 1 foundation → user runs tests + one real F5 run from the repo → PR 2 local API → one real run via
 `localhost:8000/docs` → PR 3 ngrok → test from the phone → Lovable UI (prompt pack from Claude, one screen at a time)
 → hardening. Claude works on its branch and opens a PR; the user merges and pulls with GitHub Desktop.
