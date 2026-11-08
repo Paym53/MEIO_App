@@ -14,9 +14,12 @@ are real model numbers, the search is trivial.
   6. ONE RUN AT A TIME (AC6) .... second run refused; cancel; watchdog; crash and restart recovery
   7. ARCHITECTURE & CONTRACT .... server never imports the engine; frozen API contract; result model = worker output
   8. START SCRIPT .............. settings template complete, secrets gitignored; the .bat checks (Windows)
+  9. SETTINGS, MASTER DATA ..... run settings reach the engine; chance-level guard; overrides; master data = engine's
+                                 reading; label/note; time estimate = measured run
 ================================================================================
 """
 import ast
+import hashlib
 import json
 import math
 import os
@@ -118,11 +121,13 @@ def test_validate_shows_every_engine_error_word_for_word(api, invalid_workbook):
     expected = engine_errors(invalid_workbook)
     assert len(expected) >= 2
     r = api.post("/validate", files=upload(invalid_workbook)).json()
-    assert r == {"valid": False, "errors": expected}
+    assert r == {"valid": False, "errors": expected, "warnings": [], "input": None}
 
 
 def test_validate_accepts_the_template(api):
-    assert api.post("/validate", files=upload(TEMPLATE)).json() == {"valid": True, "errors": []}
+    r = api.post("/validate", files=upload(TEMPLATE)).json()
+    assert r["valid"] is True and r["errors"] == [] and r["input"] is not None
+    assert r["warnings"] == te.ms.load_data(str(TEMPLATE)).warnings and len(r["warnings"]) == 2   # RM1/RM2 max order
 
 
 def test_invalid_data_starts_no_optimization(api, invalid_workbook):
@@ -132,18 +137,20 @@ def test_invalid_data_starts_no_optimization(api, invalid_workbook):
     assert not any("Seeker optimization" in ln for ln in st["log_tail"])
     assert api.get(f"/runs/{run_id}/result").status_code == 409
     assert api.get(f"/runs/{run_id}/workbook").status_code == 409
+    assert api.get(f"/runs/{run_id}/input").status_code == 409                # the engine could not read it
 
 
 def test_a_workbook_that_is_not_the_template_is_a_data_error(api, tmp_path):
     empty = tmp_path / "empty.xlsx"
     openpyxl.Workbook().save(empty)
-    assert api.post("/validate", files=upload(empty)).json() == {"valid": False,
-                                                                 "errors": ["Worksheet named 'Settings' not found"]}
+    assert api.post("/validate", files=upload(empty)).json() == {
+        "valid": False, "errors": ["Worksheet named 'Settings' not found"], "warnings": [], "input": None}
     wb = openpyxl.load_workbook(TEMPLATE)
     wb["Production"]["A4"].value = "Item"                        # a renamed column: the engine names the problem
     renamed = tmp_path / "renamed.xlsx"
     wb.save(renamed)
-    assert api.post("/validate", files=upload(renamed)).json() == {"valid": False, "errors": engine_errors(renamed)}
+    assert api.post("/validate", files=upload(renamed)).json() == {
+        "valid": False, "errors": engine_errors(renamed), "warnings": [], "input": None}
     broken = tmp_path / "broken.xlsx"                            # a zip file without a workbook inside
     with zipfile.ZipFile(broken, "w") as z:
         z.writestr("hello.txt", "not a workbook")
@@ -200,9 +207,10 @@ def test_seconds_left_counts_down_while_running(tmp_path):
     folder = tmp_path / "20261107-000000-abcd"
     folder.mkdir()
     started = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(seconds=100)).isoformat()
-    status = {"state": "running", "started": started, "time_limit": 250}
+    status = {"state": "running", "started": started, "time_limit": 250}            # a run from before settings
     left = server.progress(folder, status)["seconds_left"]
-    assert server.expected_seconds(250) - 100 - 5 < left < server.expected_seconds(250) - 100 + 5
+    full = server.expected_seconds({"time_limit": 250})
+    assert full - 100 - 5 < left < full - 100 + 5
 
 
 # ============================================================================
@@ -210,7 +218,7 @@ def test_seconds_left_counts_down_while_running(tmp_path):
 # ============================================================================
 def test_result_json_is_an_exact_copy_of_the_run_result(tmp_path, monkeypatch):
     res = te.headless(tmp_path, monkeypatch)                        # engine run in this process (test double)
-    out = json.loads(json.dumps(worker.build_result(te.ms, res, True), allow_nan=False))
+    out = json.loads(json.dumps(worker.build_result(te.ms, res, True, {"time_limit": 1}), allow_nan=False))
     for name, df in res.sheets.items():
         assert out["sheets"][name]["columns"] == list(map(str, df.columns))
         assert out["sheets"][name]["rows"] == [[worker.cell(v) for v in row] for row in df.itertuples(index=False)]
@@ -219,6 +227,12 @@ def test_result_json_is_an_exact_copy_of_the_run_result(tmp_path, monkeypatch):
     assert h["cost_out_of_sample"] == res.oos["cost"] and h["cost_in_sample"] == res.ins["cost"]
     assert h["rules_met_in_sample"] == res.ins["met"] and h["feasibility"] == res.ins["feasibility"]
     assert h["bound_note"] == te.ms.bound_note(res.layout, res.x) and h["start_policy_cost"] == res.ins["start"]["cost"]
+    assert h["cost_parts_in_sample"] == res.ins["parts"] and len(h["cost_parts_in_sample"]) == 5
+    assert h["cost_parts_out_of_sample"] == {n: res.oos[("part", n)] for n in res.ins["parts"]}
+    assert h["saving_vs_start_in_sample"] == dict(res.sheets["Summary"].values)["Saving vs. start policy (in-sample)"]
+    info = out["run_info"]
+    assert (info["horizon_weeks"], info["review_period_weeks"], info["first_rule_week"]) == (36, 2, 7)
+    assert info["warnings"] == res.data.warnings and info["product_id"] == "FG1" and info["overrides"] is None
 
 
 def same(a, b):
@@ -283,7 +297,7 @@ def test_history_lists_cost_next_to_the_rules_met_newest_first(done, api):
 def test_every_endpoint_refuses_requests_without_the_token(api, auth):
     headers = {"Authorization": auth} if auth else {}
     routes = [r for r in server.app.routes if isinstance(r, APIRoute)]
-    assert len(routes) == 8
+    assert len(routes) == 10
     before = sorted(p.name for p in server.RUNS_DIR.iterdir())
     for route in routes:
         path = route.path.replace("{run_id}", "20261107-000000-abcd")
@@ -363,8 +377,7 @@ def test_a_new_run_can_start_as_soon_as_the_last_one_is_finished(api, monkeypatc
 
 
 def test_a_run_far_over_its_expected_time_is_stopped(api, monkeypatch):
-    monkeypatch.setattr(server, "ETA_FIXED_SECONDS", 0.5)
-    monkeypatch.setattr(server, "ETA_SEARCH_FACTOR", 0.0)
+    monkeypatch.setattr(server, "expected_seconds", lambda settings: 0.5)
     monkeypatch.setattr(server, "WATCHDOG_FACTOR", 1.0)
     st = wait(api, start(api, time_limit=60))
     assert st["state"] == "failed" and "far longer" in st["message"]
@@ -393,8 +406,9 @@ def test_worker_usage_and_unexpected_errors(tmp_path, monkeypatch, capsys):
     folder = tmp_path / "run"
     folder.mkdir()
     (folder / "input.xlsx").write_bytes(TEMPLATE.read_bytes())
+    (folder / "request.json").write_text(json.dumps({"time_limit": 1}), encoding="utf-8")
     monkeypatch.setattr(te.ms, "run", lambda *a, **k: 1 / 0)
-    assert worker.main(["run", str(folder), "lic", "1"], {worker.TEST_DOUBLE_ENV: "1"}) == worker.EXIT_FAILED
+    assert worker.main(["run", str(folder), "lic"], {worker.TEST_DOUBLE_ENV: "1"}) == worker.EXIT_FAILED
     assert "ZeroDivisionError" in json.loads((folder / "status.json").read_text(encoding="utf-8"))["message"]
 
 
@@ -500,3 +514,103 @@ def test_start_script_checks_its_settings_before_starting_anything(case, tmp_pat
     assert message in out and done.returncode == code, out
     if case == "local only":                                       # reached the API step (no api\server.py here)
         assert "The API has stopped" in out
+
+
+# ============================================================================
+# 9. SETTINGS, MASTER DATA, LABELS, TIME ESTIMATE
+# ============================================================================
+def test_master_data_is_exactly_what_the_engine_read(api, done):
+    inp = api.post("/validate", files=upload(TEMPLATE)).json()["input"]
+    d = te.ms.load_data(str(TEMPLATE))
+    st = inp["settings"]
+    assert (st["horizon_weeks"], st["review_period_weeks"], st["scenarios"], st["random_seed"]) == \
+        (d.horizon, d.review_period, d.n_scenarios, d.seed)
+    assert st["chance_level"] == d.chance_level and st["start_date"] == "2026-11-09"
+    assert [(c["id"], c["serving_order"], c["target_fill_rate"]) for c in inp["channels"]] == \
+        [(c.id, i + 1, c.target) for i, c in enumerate(d.channels)]
+    for ci, c in enumerate(d.channels):                                     # every quantile, every week
+        assert inp["demand"]["quantiles"][c.id] == d.demand_q[ci, 1:].tolist()
+    assert inp["demand"]["quantile_levels"] == d.levels.tolist()
+    assert [(r["id"], r["max_order"], r["lead_time"]["weeks"]) for r in inp["raw_materials"]] == \
+        [(k.id, k.max_order, k.lead_time.values.tolist()) for k in d.rms]
+    prod = inp["product"]["production"]
+    assert (prod["moq"], prod["batch"], prod["max"]) == (d.prod_moq, d.prod_batch, d.prod_max)
+    assert prod["cost_tiers"]["tiers"][-1]["to"] is None                       # last tier: no upper limit
+    assert inp["initial_stock"]["FG1"] == [{"remaining_shelf_life": a, "quantity": q} for a, q in d.init_fg]
+    assert len(inp["open_orders"]["production"]) == len(d.open_prod) and inp["warnings"] == d.warnings
+    assert len(inp["tables"]["Model_Assumptions"]["rows"]) == 82
+    assert "RowCheck" not in inp["tables"]["Locations"]["columns"]
+    assert api.get(f"/runs/{done[0]}/input").json() == inp                     # the run keeps the same master data
+
+
+def test_run_settings_reach_the_engine_and_are_recorded(api):
+    form = {"time_limit": "1", "out_of_sample_scenarios": "600", "feasibility_check": "false",
+            "start_policy_out_of_sample": "true", "optimization_chance_level": "0.995", "num_scenarios": "100",
+            "random_seed": "43", "label": "seed 43", "note": "robustness check"}
+    r = api.post("/runs", files=upload(TEMPLATE), data=form)
+    assert r.status_code == 202, r.text
+    st = wait(api, r.json()["id"])
+    assert st["state"] == "done", st
+    res = api.get(f"/runs/{st['id']}/result").json()
+    info = res["run_info"]
+    assert (info["scenarios_out_of_sample"], info["feasibility_check"], info["start_policy_out_of_sample"]) == \
+        (600, False, True)
+    assert (info["scenarios_in_sample"], info["random_seed"], info["optimization_chance_level"]) == (100, 43, 0.995)
+    assert info["overrides"] == {"NumScenarios": 100, "RandomSeed": 43}
+    assert res["headline"]["feasibility"] == "not run"
+    kpi_items = [row[0] for row in res["sheets"]["KPIs"]["rows"]]
+    assert any(str(i).startswith("Start policy") for i in kpi_items)            # start policy on fresh scenarios
+    assert st["settings"]["out_of_sample_scenarios"] == 600 and (st["label"], st["note"]) == ("seed 43",
+                                                                                              "robustness check")
+    assert st["file"] == {"name": TEMPLATE.name, "sha256": hashlib.sha256(TEMPLATE.read_bytes()).hexdigest(),
+                          "bytes": TEMPLATE.stat().st_size}
+
+
+def test_a_chance_level_below_the_excel_rule_is_refused(api):
+    st = wait(api, start_with(api, {"optimization_chance_level": "0.95"}))
+    assert st["state"] == "invalid"
+    assert st["errors"] == ["Optimization chance level 0.95 is below the Excel FillRateChanceLevel 0.99; "
+                            "it may only be equal or higher (stricter)."]
+    assert not any("Seeker optimization" in ln for ln in st["log_tail"])
+
+
+def test_an_invalid_override_is_rejected_with_the_engines_words(api):
+    d = te.ms.load_data(str(TEMPLATE))
+    te.ms.apply_overrides(d, {"NumScenarios": 50})
+    with pytest.raises(ValueError) as e:
+        te.ms.validate(d)
+    expected = [ln.strip()[2:] for ln in str(e.value).splitlines()[1:]]
+    st = wait(api, start_with(api, {"num_scenarios": "50"}))
+    assert st["state"] == "invalid" and st["errors"] == expected and expected
+
+
+@pytest.mark.parametrize("field, value", [("out_of_sample_scenarios", "100"), ("optimization_chance_level", "1.5"),
+                                          ("num_scenarios", "0"), ("random_seed", "-1"), ("label", "x" * 81)])
+def test_settings_outside_their_limits_are_refused(api, field, value):
+    r = api.post("/runs", files=upload(TEMPLATE), data={field: value})
+    assert r.status_code == 422
+
+
+def test_label_and_note_can_be_changed_later(api, done):
+    run_id = done[0]
+    assert api.patch(f"/runs/{run_id}", json={"label": "Baseline"}).json()["label"] == "Baseline"
+    r = api.patch(f"/runs/{run_id}", json={"note": "first v17 run"}).json()
+    assert (r["label"], r["note"]) == ("Baseline", "first v17 run")             # one field changes, the other stays
+    assert next(x for x in api.get("/runs").json() if x["id"] == run_id)["label"] == "Baseline"
+    assert api.patch(f"/runs/{run_id}", json={"label": "x" * 81}).status_code == 422
+    assert api.patch("/runs/20991231-235959-ffff", json={"label": "a"}).status_code == 404
+
+
+def test_the_time_estimate_matches_the_measured_run():
+    default = server.expected_seconds({})
+    assert default == pytest.approx(407, abs=3)            # user's PC, engine v17.1, 08.11.: 407 s at the defaults
+    assert server.expected_seconds({"time_limit": 30}) == pytest.approx(default - 220)       # 54 s search at 30 s
+    assert server.expected_seconds({"feasibility_check": False}) == pytest.approx(default - 21)
+    assert server.expected_seconds({"start_policy_out_of_sample": True}) == pytest.approx(default + 82.5)
+    assert server.expected_seconds({"out_of_sample_scenarios": 5000}) == pytest.approx(default + 82.5)
+
+
+def start_with(client, form):
+    r = client.post("/runs", files=upload(TEMPLATE), data={"time_limit": "1", **form})
+    assert r.status_code == 202, r.text
+    return r.json()["id"]

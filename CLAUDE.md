@@ -207,8 +207,9 @@ When the app needs something from the engine (a rule, an output, a setting, a bu
 - Phase times: feasibility check 20 s, model build 8 s, search 268 s (limit 250), out-of-sample check 78 s, about 6.5 min in total.
   Short time limits overrun more: a 30 s search took 54 s, so plan short what-if runs with about 25 s fixed overhead.
 - **Through the local API (07.11., v16, real Seeker):** €112,128.16 and 88/90 on fresh scenarios, identical to F5; 377 s in
-  total. The API's time-left estimate is `ETA_FIXED_SECONDS + ETA_SEARCH_FACTOR × time limit − elapsed` (115 s, 1.07,
-  measured on v16); v17's out-of-sample check is ~12 s longer and short searches overrun more: re-fit in API update 1.
+  total. **Same run on v17.1 through the API (08.11.):** €112,128.16, 88/90, 407 s; search 273.4 s for 250 s
+  (= limit + 24 s, as the engine session's 30 s → 54 s), out-of-sample 82.5 s. The API's time estimate (`api/server.py`):
+  30 s + 21 s feasibility + 0.033 s per fresh scenario (twice with the start policy on fresh scenarios) + limit + 24 s.
 
 **v17 (08.11., change request "uncertainty, flows and what-ifs"):** report series, arrival weeks given an order, KPIs,
 run overrides, optional start policy on fresh scenarios, and every Excel check in Python. The search model is unchanged:
@@ -260,7 +261,8 @@ reading, so the app can overwrite or delete its copies on Windows.
 Browser → Lovable web app (own repo, made by Lovable; shows only API numbers, never computes)
         → ngrok tunnel (free fixed domain; requests send header ngrok-skip-browser-warning)
         → local API on the user's PC (FastAPI, localhost:8000, every request needs the token)
-        → one subprocess per engine call (validate or run) → runs/<id>/ input.xlsx, log.txt, result.json, results.xlsx
+        → one subprocess per engine call (validate or run) → runs/<id>/ input.xlsx, request.json (settings),
+          status.json, label.json (label/note), log.txt, input.json (master data), result.json, results.xlsx
 ```
 - Data source: the Excel upload only (the user edits in Excel). A database comes later, through the one data-source
   function in `api/worker.py` and an engine change request (§7) for a loader.
@@ -338,10 +340,22 @@ edited (openpyxl-saved) workbooks pass validate() when the cached OVERALL is mis
 new aggregates only in the out-of-sample model; acceptance incl. conservation tests and an unchanged Seeker
 improvement path (5,126 → 112,013.35; 6,282 → 111,783.95). Already in v16, so done in the API: cost parts
 (`ins["parts"]`, `oos[("part", n)]`).
-**API update 1 (after v17 lands):** `GET /runs/{id}/input` (engine-parsed master data + Locations, Lanes,
-Model_Assumptions, Checks); result: cost parts, saving, horizon, review period, first constrained week, product; run
-settings (fresh scenarios, feasibility check, chance level ≥ Excel, overrides) recorded with file name + sha256; run
-label/note; pass Bands/KPIs through; scenario edits on a copy with original-vs-changed list.
+**API update 1 (08.11., result contract 2, API version 2):**
+- `POST /validate` → `{valid, errors, warnings, input}`; `input` = the master data as `engine.load_data()` read it
+  (`worker.describe_input`: settings, product + production + tiers, raw materials, channels in serving order, demand
+  quantiles per channel and week, initial stock lots, open orders, warnings, and the template sheets Locations, Lanes,
+  Items, Model_Assumptions read with the engine's `_sheet`). Same JSON per run: `GET /runs/{id}/input` (409 if unreadable).
+- `POST /runs` form fields: `time_limit`, `out_of_sample_scenarios` (500–20,000), `feasibility_check`,
+  `start_policy_out_of_sample`, `optimization_chance_level` (the worker refuses a level below the Excel
+  FillRateChanceLevel as a data error), `num_scenarios` / `random_seed` (→ `run(overrides=…)`, checked by the engine),
+  `label`, `note`. Settings go to `request.json` → worker sets the engine constants (one run per process). status.json
+  records `settings` and `file` (name, sha256, bytes); `PATCH /runs/{id}` sets label/note in `label.json`.
+- Result contract 2: headline + `saving_vs_start_in_sample` (engine Summary), `cost_parts_in_sample` /
+  `cost_parts_out_of_sample` (`ins["parts"]`, `oos[("part", n)]`); new `run_info` (product, horizon, review period,
+  `first_rule_week`, start date, time limit, scenarios, seed, chance levels, fresh scenarios, switches, overrides,
+  warnings); sheets incl. `Bands` and `KPIs` passed through unchanged.
+**API update 2 (next, before the Master data / scenario screens):** what-if edits written into a copy of the
+uploaded workbook (openpyxl, values only; engine K19 checks it), with an original-vs-changed list per run.
 
 **Plan:** PR 1 foundation → user runs tests + one real F5 run from the repo → PR 2 local API → one real run via
 `localhost:8000/docs` → PR 3 ngrok → test from the phone → Lovable UI (prompt pack from Claude, one screen at a time)
