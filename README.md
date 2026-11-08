@@ -56,7 +56,7 @@ These scenarios are the contract. Each one becomes an automated test.
    C:\Users\ruben\seeker_env\Scripts\python.exe -m pip install -r requirements.txt
    ```
 4. **License:** copy your `license.sio` into `C:\dev\MEIO_App\engine\` (it is gitignored).
-5. **Check:** run the tests. The expected result is `58 passed`.
+5. **Check:** run the tests. Every test must pass (`… passed`, no `failed`); the engine alone has 117 tests.
    ```bat
    C:\Users\ruben\seeker_env\Scripts\python.exe -m pytest
    ```

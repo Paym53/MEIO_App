@@ -461,6 +461,9 @@ class MEIOSimulator:
                 for n in ("order", "arrival", "transfer", "ip", "end", "waste", "received"):
                     rec[f"{k.id}_{n}"] = np.zeros((N, H + 1))
             rec["served"] = np.zeros((N, C, H + 1))
+            rec["lost"] = np.zeros((N, C, H + 1))
+            rec["eligible_next_week"] = np.zeros((N, C, H + 1))     # end of week, still sellable to c next week
+            rec["rsl_num"] = np.zeros((N, H + 1))                   # Σ rest shelf life × quantity at week end
 
         for t in range(1, H + 1):
             # ---- E1: receipts (full shelf life, F01) ------------------------------------
@@ -483,6 +486,8 @@ class MEIOSimulator:
                 else:
                     R[who][:, rem] += hit
                     pipe_rm[who] -= hit
+                if detail:
+                    rec["fg_received" if who == "FG" else f"{who}_received"][:, t] += hit
 
             # ---- E2: FG review at DC → production order (C01, C06, D02, D03, E04) -------
             s_t, S_t = policy["FG"][0][t], policy["FG"][1][t]
@@ -542,6 +547,7 @@ class MEIOSimulator:
                 FR[:, ci, t] = np.where(dem > 0, served / np.maximum(dem, EPS), 1.0)
                 if detail:
                     rec["served"][:, ci, t] = served
+                    rec["lost"][:, ci, t] = dem - served
 
             # ---- E5: holding cost on end-of-week on-hand (I05) ---------------------------
             hold = d.fg_holding * X.sum(1) + sum(k.holding * R[k.id].sum(1) for k in d.rms)
@@ -551,6 +557,9 @@ class MEIOSimulator:
                 rec["fg_end"][:, t] = X.sum(1)
                 for k in d.rms:
                     rec[f"{k.id}_end"][:, t] = R[k.id].sum(1)
+                for ci, ch in enumerate(d.channels):
+                    rec["eligible_next_week"][:, ci, t] = X[:, ch.min_remaining + 1:].sum(1)
+                rec["rsl_num"][:, t] = X @ np.arange(SLf + 1)
 
             # ---- E6: ageing; lots no longer usable are wasted immediately (F05, C02, C04)
             w_fg = X[:, :rho_min + 1].sum(1)                   # rest shelf life ≤ ρ_min → unusable next week
