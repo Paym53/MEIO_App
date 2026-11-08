@@ -12,12 +12,12 @@ The engine bundle lives in `engine/`, byte-exact. A new engine version replaces 
 | File | What it is | You may edit? |
 |---|---|---|
 | `CLAUDE.md` | this file: everything you need to know | yes (keep it current) |
-| `engine/meio_seeker_stochastic.py` | **the engine** (v16): every rule, written once, as Seeker Terms | **no** |
+| `engine/meio_seeker_stochastic.py` | **the engine** (v17.1, contract version 2): every rule, written once, as Seeker Terms | **no** |
 | `engine/reference_simulator.py` | independent second implementation of the rules, used only by the tests | **no** |
 | `engine/meio_stress_tests.py` | 26 data-change scenarios run through the engine (needs Seeker) | **no** |
 | `engine/test_engine.py` | **the engine test suite**: input control, physics & dynamics, model functionality, output control, stress cases, engine fingerprint; includes a Seeker test double, so no license needed | **no** |
 | `engine/MEIO_Data_Template.xlsx` | the input file (template v1.1, **example data**; the tests depend on it) incl. sheet `Model_Assumptions` | **no** (real data goes in `data/`, gitignored) |
-| `engine/MEIO_model_spec.md` | the dynamics/assumptions list: all 74 rules (IDs like C03, H05, K17), same as the Excel sheet | **no** |
+| `engine/MEIO_model_spec.md` | the dynamics/assumptions list: all 82 rules (IDs like C03, H05, K17), same as the Excel sheet | **no** |
 | `MEIO_Results_stochastic.xlsx` | results of a real Seeker run (sheet layout = engine output); on the user's PC only, gitignored | no |
 
 The app's own files are listed in §9. Don't add files or docs beyond that list unless the user asks.
@@ -30,16 +30,17 @@ into CRLF on checkout and the engine fingerprint test would fail on the user's P
   change, follow §7. Never patch around an engine problem in the app.
 - **One copy of every rule.** Never re-implement dynamics, costs, fill rates or data validation in the app. Every number
   the app shows comes from the engine's `RunResult`. The app may format, sort and compare those numbers, but not recompute them.
-- **Input always goes through the Excel template and the engine's `validate()`.** UI editing produces the workbook, and the
-  app never builds the engine's data object itself.
+- **Input always goes through the Excel template and the engine's checks.** UI editing writes a **copy** of the workbook
+  (openpyxl, values only; the original stays untouched), and the app never builds the engine's data object itself.
+  The engine runs every Excel check in Python (rule K19), so an edited copy is checked as strictly as one checked by Excel.
 - **One engine run per process** (settings and timings are module globals). Use a job worker or a subprocess per run.
 - **Be honest with the numbers:**
   - Show the out-of-sample results as the headline.
   - Show the feasibility line and the bound NOTE prominently.
   - Show the rules missed on fresh scenarios.
   - Compare costs only between plans that meet the same number of rules (there is no lost-sales cost, so a plan that misses rules looks cheaper).
-- **Checks stay green:** `python -m ruff check .` and `python -m pytest` from the repo root (58 engine tests,
-  about 25 s, plus the app's own tests) on every change. CI runs both on Linux and Windows, plus a secret scan.
+- **Checks stay green:** `python -m ruff check .` and `python -m pytest` from the repo root (117 engine tests,
+  about 90 s, plus the app's own tests) on every change. CI runs both on Linux and Windows, plus a secret scan.
 
 ## 3. How to work (the user's method) and the user
 
@@ -109,7 +110,8 @@ The example data is generated; real data comes later.
 
 ```python
 import meio_seeker_stochastic as engine
-res = engine.run(data_file="MEIO_Data_Template.xlsx", license_file="license.sio", time_limit=250)
+res = engine.run(data_file="MEIO_Data_Template.xlsx", license_file="license.sio", time_limit=250,
+                 overrides=None)          # e.g. {"NumScenarios": 400, "RandomSeed": 7} for one run (K20)
 ```
 
 `run()` executes the whole pipeline and writes nothing. It returns a `RunResult`:
@@ -120,16 +122,41 @@ res = engine.run(data_file="MEIO_Data_Template.xlsx", license_file="license.sio"
 | `layout`, `x` | decision variables and the optimized values (`layout.index` = (stock point, week, "sigma"/"delta")) |
 | `policy` | `{"FG", "RM1".."RM4": (s, S)}`, arrays indexed by week 1..H (index 0 unused) |
 | `ins` | Seeker's own scenarios: `cost`, `parts`, `fr_share[(ci,t)]`, `met`, `start{cost, met}`, `status`, `feasibility` (one line) … |
-| `oos` | fresh scenarios: `cost`, `("fr_mean"/"fr_share", ci, t)`, `(item, "mean"/"p10"/"p90"/"p_order", t)`, stock, waste … |
-| `sheets` | report tables: `Summary`, `Commit_Now`, `Policy_sS`, `Decisions`, `FillRates`, `Stock_Waste` (columns frozen in `test_engine.py`) |
+| `oos` | fresh scenarios: `cost`, `("fr_mean"/"fr_share", ci, t)`, `(item, "mean"/"p10"/"p90"/"p_order", t)`, stock, waste; and `("band", series, item, week, stat)`, `("kpi", name, item, stat)` |
+| `sheets` | report tables: `Summary`, `Commit_Now`, `Policy_sS`, `Decisions`, `FillRates`, `Stock_Waste`, `Bands`, `KPIs` (columns frozen in `test_engine.py`) |
 | `timings` | (phase, seconds) |
+| `overrides` | the run overrides applied, or None |
+| `oos_start` | the start policy on the same fresh seeds (only with `START_POLICY_OUT_OF_SAMPLE = True`), else None |
+
+**Uncertainty and flows (sheet `Bands`, long format: Series, Item, Week, Mean, P05, P10, P25, P50, P75, P90, P95;
+all on the fresh scenarios; definitions in rules L05–L06):**
+
+| Series | Items | Meaning |
+|---|---|---|
+| `end_stock` | FG1, RM1–RM4 | stock at week end, before the end-of-week scrapping (a lot's last usable week still counts, F06) |
+| `position` | FG1, RM1–RM4 | the quantity s and S act on: FG stock position (C01), raw-material echelon position (C03). Draw s/S against this, not against end stock |
+| `waste` | FG1, RM3, RM4 | units scrapped that week |
+| `order_qty` | FG1 (production), RM1–RM4 | order quantity (0 when nothing is ordered) |
+| `arrival_week` | FG1, RM1–RM4 | arrival week of the order placed that week, **only over scenarios that place it**; empty if never placed |
+| `receipts` | FG1, RM1–RM4 | units arriving at the start of the week |
+| `served`, `lost` | channels | units sold, demand lost (served + lost = demand) |
+| `eligible_next_week` | channels | DC stock at week end the channel can still take next week |
+| `rsl_mean` | FG1 | stock-weighted mean remaining shelf life of DC stock (Mean = ratio of totals; quantiles count 0 when there is no stock) |
+| `no_stock_share` | FG1 | share of scenarios with no DC stock at week end (Mean column only) |
+
+**KPIs (sheet `KPIs`: Item, Unit, Mean, P10, P90; rule L07):** average end stock per item, total waste (FG1, RM3, RM4),
+lost sales per channel split into weeks 1–6 (initial state, no decision can change them) and weeks 7–36 (weeks with
+fill-rate rules), shares of scenarios with any waste or lost sales. For rare events the mean can lie outside P10–P90 (e.g.
+P10 = P90 = 0 and mean > 0); show the mean together with the share of scenarios. With `START_POLICY_OUT_OF_SAMPLE` also:
+start-policy cost and rules met on the same fresh seeds and the fresh-vs-fresh saving (rule L08).
 
 **Other entry points:**
 - `engine.write_report(res.sheets, path)` writes the formatted results workbook.
 - `engine.main()` = `run()` + workbook + console (the user's F5 workflow).
 
 **Errors are exceptions:**
-- `ValueError` "Data validation failed:" followed by every problem, one per line (show them to the user)
+- `ValueError` "Data validation failed:" followed by every problem, one per line, each naming sheet, row and field (show them to the user).
+  Warnings (e.g. a max order quantity that is not a multiple of the order step) don't stop the run: they are in `res.data.warnings` and the Summary.
 - `FileNotFoundError` for a missing data or license file
 - `ImportError` when Seeker is missing
 
@@ -140,6 +167,7 @@ res = engine.run(data_file="MEIO_Data_Template.xlsx", license_file="license.sio"
 | `TIME_LIMIT_SECONDS` | 250 | search time |
 | `OUT_OF_SAMPLE_SCENARIOS` | 2500 | fresh scenarios for the check |
 | `FEASIBILITY_CHECK` | True | about 25 s |
+| `START_POLICY_OUT_OF_SAMPLE` | False | also evaluate the start policy on the same fresh seeds (+~75 s) |
 | `OPTIMIZATION_CHANCE_LEVEL` | None | None = Excel level 0.99; never set it lower |
 | `EXTRA_COVER_WEEKS` | | upper bounds of the reorder points; raise the one named in a bound NOTE |
 
@@ -147,7 +175,8 @@ res = engine.run(data_file="MEIO_Data_Template.xlsx", license_file="license.sio"
 - **Feasibility check:** "OK", or "N rule(s) fail whatever we decide: …". These are weeks the supply physically cannot reach.
 - **Bound NOTE:** "none", or which setting to raise because a reorder point hit its upper bound.
 
-**Runtime:** a default run takes about 6.5 min on the user's PC (feasibility 25 s, build 11 s, search 250 s + ~15%, out-of-sample 75 s).
+**Runtime:** a default run takes about 6.5 min on the user's PC (feasibility 25 s, build 11 s, search 250 s + ~15%, out-of-sample 75 s in v16;
+v17 builds about 8,600 more single numbers in the out-of-sample check, the extra time on Seeker is measured on the user's PC).
 Run it as a background job and stream its stdout (phase lines `[hh:mm:ss] …` and Seeker's progress every 30 s) as progress.
 
 **License:** the Seeker license is bound to one machine, so the optimization worker must run there. Settle the deployment with the user first.
@@ -170,15 +199,25 @@ When the app needs something from the engine (a rule, an output, a setting, a bu
 
 ## 8. Status, decisions, known facts
 
-**Latest numbers (user's PC, 250 s, F5 from the repo copy, 07.11.):**
-- start policy €119,981 (identical to earlier runs: the start evaluation does not depend on the search)
-- Seeker in-sample €111,784 with 90/90 rules
-- fresh scenarios €112,128 with 88/90 rules (the misses are usually the week-36 Amazon/B2B rules at the end of the horizon; this is accepted, because the end weeks are indicative)
+**Latest numbers (user's PC, engine v17, 250 s, 08.11.):**
+- start policy €119,981
+- Seeker in-sample €111,784 with 90/90 rules (8,450 evaluations)
+- fresh scenarios (2,500) €112,128 with 88/90 rules (the misses are usually the week-36 Amazon/B2B rules at the end of the horizon; this is accepted, because the end weeks are indicative)
 - Week-1 decision: no production; a 1,000 kg strawberry order arriving in week 9.
-- Timings: feasibility 21 s, build 8.8 s, start evaluation 3.3 s, search 266.6 s, reading 3.3 s, out-of-sample 66.4 s; total 382 s.
-  Fixed part ≈ 115 s, so time left ≈ 115 s + 1.07 × time limit − elapsed (`api/server.py` ETA constants).
-- **Same run through the local API (07.11., real Seeker):** €112,128.16 and 88/90 on fresh scenarios, identical to F5;
-  377 s in total (estimate 382 s). The API reproduces the engine exactly.
+- Phase times: feasibility check 20 s, model build 8 s, search 268 s (limit 250), out-of-sample check 78 s, about 6.5 min in total.
+  Short time limits overrun more: a 30 s search took 54 s, so plan short what-if runs with about 25 s fixed overhead.
+- **Through the local API (07.11., v16, real Seeker):** €112,128.16 and 88/90 on fresh scenarios, identical to F5; 377 s in
+  total. The API's time-left estimate is `ETA_FIXED_SECONDS + ETA_SEARCH_FACTOR × time limit − elapsed` (115 s, 1.07,
+  measured on v16); v17's out-of-sample check is ~12 s longer and short searches overrun more: re-fit in API update 1.
+
+**v17 (08.11., change request "uncertainty, flows and what-ifs"):** report series, arrival weeks given an order, KPIs,
+run overrides, optional start policy on fresh scenarios, and every Excel check in Python. The search model is unchanged:
+the same Seeker calls as v16 (13,102 Terms on the template), so the search finds exactly the same plan. All v16 numbers are
+identical except the arrival week of orders that are never placed (v16 showed a made-up week, v17 leaves it empty).
+Confirmed on real Seeker 2.1 on the user's PC: the same improvement path as v16 (5,126 evaluations → €112,013.35;
+6,282 → €111,783.95); the out-of-sample check takes 78 s instead of ~75 s; all 1,346 band rows are ordered P05 ≤ … ≤ P95;
+the stock balances on the means close exactly. v17.1 fixes a file lock: the engine now closes the workbook after
+reading, so the app can overwrite or delete its copies on Windows.
 
 **Decisions and why:**
 - **Rules written once in Seeker; no second simulator in the engine** (the reference exists only for tests). This avoids errors from duplicate logic.
@@ -191,13 +230,13 @@ When the app needs something from the engine (a rule, an output, a setting, a bu
 - **The engine session also has a solver-free NumPy optimizer** that was about 3.6% cheaper in benchmarks. It isn't part of this bundle; ask the user if you need it.
 
 **Seeker facts (2.1.0):**
-- **The search is reproducible:** two runs on 07.11. found the same improvements after the same numbers of
-  evaluations (5,126 → 112,013.35; 6,282 → 111,783.95). Results differ only when a different number of evaluations
-  fits into the time limit (machine load). The earlier €112,858 run was an older state.
 - Reading single numbers (aggregates) is instant; per-scenario lists cost 0.5–3 s each, so the engine never reads them.
 - Seeker reshuffles the demand samples across its scenarios, so its scenarios exist only inside Seeker.
 - From an infeasible start Seeker often makes no progress.
-- It overruns the time limit by about 7–15% (266.6 s for 250 s on 07.11.).
+- It overruns the time limit by about 7–15% (266.6 s for 250 s on 07.11.; short limits relatively more).
+- **The search is reproducible:** runs on 07.11. and 08.11. (v16 and v17) found the same improvements after the same
+  numbers of evaluations (5,126 → 112,013.35; 6,282 → 111,783.95). Results differ only when a different number of
+  evaluations fits into the time limit (machine load).
 - Its progress line `At time 134.5: Objective = 112013.35; Status = Feasible; Evaluations = 5126` appears only when the
   search improves (3 lines in 267 s on 07.11.), not every 30 s: show progress from elapsed time, not from these lines.
 - If the results file is open in Excel, the engine writes a time-stamped name.
@@ -208,7 +247,9 @@ When the app needs something from the engine (a rule, an output, a setting, a bu
 - Earlier red verdicts came from running at chance level 0.95 while judging at 0.99, and from comparing costs of plans that met different numbers of rules.
 
 **Open:**
-- Rules still "Proposed": A03, A04, D05, F02, G02, G03, H03, H06, I07, J03 (see `MEIO_model_spec.md`).
+- Rules still "Proposed": A03, A04, D05, F02, G02, G03, H03, H06, I07, J03, K20, L05–L08 (see `MEIO_model_spec.md`).
+- Known limitation J04: a lot that is already unusable when it enters (initial stock or open order) shows up for one week in
+  end stock and holding before it is scrapped. It doesn't occur in practice.
 - Seeker 2.2 is untested.
 - The data is example data.
 
@@ -223,14 +264,13 @@ Browser → Lovable web app (own repo, made by Lovable; shows only API numbers, 
 ```
 - Data source: the Excel upload only (the user edits in Excel). A database comes later, through the one data-source
   function in `api/worker.py` and an engine change request (§7) for a loader.
-- No editing of data in the browser yet: a workbook re-saved by openpyxl loses Excel's cached formula values, so
-  `Checks` OVERALL reads `nan` and `validate()` rejects it (reproduced 06.11.). Revisit with a recalculation step or
-  an engine change.
+- Editing data: since v17 (rule K19) the engine runs every Excel check in Python and treats a missing cached OVERALL as
+  "unknown", so the API may write what-if edits into a **copy** of the uploaded workbook (openpyxl, values only).
+  The original upload is never changed. (v16 rejected such copies with "Checks shows OVERALL = nan".)
 - **Python UTF-8 mode (`PYTHONUTF8=1`) everywhere:** CI sets it, the user set it with `setx`, and the worker must set it
   in its subprocess env. Without it Windows uses cp1252: `engine/test_engine.py:822` `read_text()` cannot decode the
-  engine source (CI failure 07.11.), and piped `print` of `→` (bound NOTE) raises UnicodeEncodeError. The user applied the
-  engine change request (`read_text(encoding="utf-8")` at line 822) on main on 07.11.; `test_engine.py` is not
-  fingerprinted. The engine session must carry this line into the next engine version.
+  engine source (CI failure 07.11.), and piped `print` of `→` (bound NOTE) raises UnicodeEncodeError. The engine's
+  `read_text(encoding="utf-8")` fix is part of v17.1; UTF-8 mode stays for the worker's piped output.
 - **Test double in the app:** `MEIO_TEST_DOUBLE=1` makes `api/worker.py` use the Seeker stand-in from `test_engine.py`
   (tests only). Results then carry `test_double: true` and `seeker_version` "FAKE …", and `/health` reports it.
 - **Windows:** replacing a file another process is reading fails, so both `write_json` functions retry for up to 1 s.
@@ -290,7 +330,7 @@ no "transport decision" (transfers/transport follow production, B02/I04); foreca
 weeks before the first constrained week are "Fixed weeks", not "warm-up"; KPI totals/averages come from the engine.
 Comparing scenarios: same seed (common random numbers) and same rules met; different seeds = robustness test.
 
-**Engine change request v17 (sent 08.11., contract version 2):** weekly bands (mean, P05–P95) on fresh scenarios for
+**Engine change request v17 (sent 08.11., contract version 2; delivered as v17.1 on 08.11., see §6/§8):** weekly bands (mean, P05–P95) on fresh scenarios for
 FG/RM end stock, FG stock position, RM echelon position, waste, order quantities, receipts, served and lost per channel,
 stock eligible per channel, mean remaining shelf life; arrival weeks (P05/P50/P95) for every order week; KPI block;
 optional START_POLICY_OUT_OF_SAMPLE; `run(..., overrides={"NumScenarios", "RandomSeed"})` applied before validate();

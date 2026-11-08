@@ -7,11 +7,13 @@ section 0. The supply-chain rules are checked against reference_simulator.py, an
 implementation, scenario by scenario.
 
   0. SEEKER TEST DOUBLE ...... strict stand-in for Seeker's Python API (evaluates the same model Terms)
-  1. INPUT CONTROL ........... the Excel is read correctly; every invalid input is rejected with a message
+  1. INPUT CONTROL ........... the Excel is read correctly; every Excel check (C01–C14, X01–X07) also runs in
+                               Python, so edited copies are checked as strictly; every error has a message
   2. PHYSICS & DYNAMICS ...... engine = reference in every scenario: lots, FEFO, priority, (s,S), echelon,
                                lead times, no overtaking, tiers, waste, fill rates; edge cases
   3. MODEL FUNCTIONALITY ..... decision variables & bounds, start policy, chance constraints, priorities,
-                               feasibility check, single-number reading, out-of-sample batches
+                               feasibility check, search model unchanged by the report series, bands,
+                               arrival weeks, KPIs, run overrides, start policy on fresh scenarios
   4. OUTPUT CONTROL .......... whole run vs reference, run() result, frozen output schema, errors, files
   5. STRESS-TEST CASES ....... the 26 data changes of meio_stress_tests.py do what they say
   6. ENGINE FINGERPRINT ...... the engine files are unchanged (they are maintained in the engine session)
@@ -275,15 +277,15 @@ DATA = str(ROOT / "MEIO_Data_Template.xlsx")
 D0 = ref.load_data(DATA)
 ref.make_scenarios(D0, 10, 1)            # sorts open orders by placement (the engine's loader does the same)
 STRESS = {c[0]: c for c in st.CASES}
-CONTRACT_VERSION = 1
+CONTRACT_VERSION = 2
 
 
 # ---------------------------------------------------------------------------- shared helpers
-def build(d, x, R=60, seed=3):
+def build(d, x, R=60, seed=3, detail=False):
     env = fake.Env("lic", True)
     env.set_stochastic_parameters(R, 0.0)
     lay = ms.PolicyLayout(d)
-    model = ms.build_model(fake, env, d, lay, x, seed, R)
+    model = ms.build_model(fake, env, d, lay, x, seed, R, detail=detail)
     env.evaluate()
     return env, lay, model
 
@@ -315,8 +317,9 @@ def v(term, n):
 
 
 def check_equal(d, x, R=60, seed=3):
-    """Every quantity the model exposes equals the reference simulator in every scenario."""
-    env, lay, model = build(d, x, R, seed)
+    """Every quantity the model exposes equals the reference simulator in every scenario, including all
+    report series of the out-of-sample model (detail=True, L05–L07) and the conservation identities."""
+    env, lay, model = build(d, x, R, seed, detail=True)
     res = ref.MEIOSimulator(d, seeker_scenarios(model, d)).run(lay.decode(x), detail=True)
     rec = res.detail
     np.testing.assert_allclose(model.cost.get_values(), res.cost, rtol=1e-10, atol=1e-6)
@@ -341,7 +344,66 @@ def check_equal(d, x, R=60, seed=3):
             if k.perishable:
                 np.testing.assert_allclose(v(model.rm_waste[(k.id, t)], R), rec[f"{k.id}_waste"][:, t], atol=1e-9)
     assert model.objective.get_value() == pytest.approx(res.cost.mean(), rel=1e-12)
+    check_detail_equal(d, model, rec, R)
+    check_conservation(d, model, R)
     return env, lay, model, res
+
+
+def check_detail_equal(d, model, rec, R):
+    """The report series (L05–L07) equal the reference simulator in every scenario."""
+    det, fg, H = model.detail, d.fg_id, d.horizon
+    close = lambda a, b: np.testing.assert_allclose(a, b, rtol=1e-12, atol=1e-9)
+    t_first = 1 + d.prod_lead_time.min
+    for t in range(1, H + 1):
+        close(v(det[("position", fg, t)], R), rec["ip_fg"][:, t])
+        close(v(det[("receipts", fg, t)], R), rec["fg_received"][:, t])
+        close(v(det[("rsl_num", fg, t)], R), rec["rsl_num"][:, t])
+        end = rec["fg_end"][:, t]
+        close(v(det[("rsl_mean", fg, t)], R), np.where(end > 0.5, rec["rsl_num"][:, t] / np.maximum(end, 1.0), 0.0))
+        for k in d.rms:
+            close(v(det[("position", k.id, t)], R), rec[f"{k.id}_ip"][:, t])
+            close(v(det[("receipts", k.id, t)], R), rec[f"{k.id}_received"][:, t])
+        for ci, ch in enumerate(d.channels):
+            close(v(det[("served", ch.id, t)], R), rec["served"][:, ci, t])
+            close(v(det[("lost", ch.id, t)], R), rec["lost"][:, ci, t])
+            close(v(det[("eligible_next_week", ch.id, t)], R), rec["eligible_next_week"][:, ci, t])
+    close(v(det[("kpi", "avg_end_stock", fg)], R), rec["fg_end"][:, 1:].mean(1))
+    close(v(det[("kpi", "waste", fg)], R), rec["fg_waste"][:, 1:].sum(1))
+    for k in d.rms:
+        close(v(det[("kpi", "avg_end_stock", k.id)], R), rec[f"{k.id}_end"][:, 1:].mean(1))
+        if k.perishable:
+            close(v(det[("kpi", "waste", k.id)], R), rec[f"{k.id}_waste"][:, 1:].sum(1))
+    for ci, ch in enumerate(d.channels):
+        close(v(det[("kpi", "lost_initial_weeks", ch.id)], R), rec["lost"][:, ci, 1:t_first].sum(1))
+        close(v(det[("kpi", "lost_controllable_weeks", ch.id)], R), rec["lost"][:, ci, t_first:].sum(1))
+
+
+def check_conservation(d, model, R):
+    """Deterministic gate, per scenario and week: served + lost = demand; stock balances of the DC and the RMW
+    (end stock includes the leftover of a lot's last usable week, which is also that week's waste, F06)."""
+    det, fg, H = model.detail, d.fg_id, d.horizon
+    tol = dict(rtol=1e-12, atol=1e-6)
+    prev_fg = np.full(R, sum(q for _, q in d.init_fg))
+    prev_rm = {k.id: np.full(R, sum(q for _, q in d.init_rm[k.id])) for k in d.rms}
+    waste_prev = {k.id: np.zeros(R) for k in d.rms}
+    w_fg_prev = np.zeros(R)
+    for t in range(1, H + 1):
+        sold = np.zeros(R)
+        for ci, ch in enumerate(d.channels):
+            served, lost = v(det[("served", ch.id, t)], R), v(det[("lost", ch.id, t)], R)
+            np.testing.assert_allclose(served + lost, v(model.demand[(ci, t)], R), **tol)
+            assert (served >= -1e-9).all() and (lost >= -1e-9).all()
+            sold += served
+        end_fg = v(model.fg_end[t], R)
+        np.testing.assert_allclose(end_fg, prev_fg - w_fg_prev + v(det[("receipts", fg, t)], R) - sold, **tol)
+        prod = v(model.prod_qty.get(t, 0.0), R)
+        for k in d.rms:
+            end_k = v(model.rm_end[(k.id, t)], R)
+            np.testing.assert_allclose(end_k, prev_rm[k.id] - waste_prev[k.id] + v(det[("receipts", k.id, t)], R)
+                                       - k.bom * prod, **tol)
+            prev_rm[k.id] = end_k
+            waste_prev[k.id] = v(model.rm_waste[(k.id, t)], R) if k.perishable else np.zeros(R)
+        prev_fg, w_fg_prev = end_fg, v(model.fg_waste[t], R)
 
 
 def policies(d):
@@ -421,6 +483,162 @@ def test_every_problem_is_listed_at_once():
     assert all(m in str(e.value) for m in ("ReviewPeriod", "Production: MOQ", "target in (0,1]"))
 
 
+def _row(ws, col, val):
+    return next(r for r in range(5, ws.max_row + 1) if ws.cell(r, col).value == val)
+
+
+def _set(sheet, key, col, value, keycol=1):
+    def edit(wb):
+        ws = wb[sheet]
+        ws.cell(_row(ws, keycol, key), col).value = value
+    return edit
+
+
+def _demand(ch, week, col, value):
+    def edit(wb):
+        ws = wb["Demand"]
+        r = next(r for r in range(5, ws.max_row + 1) if ws.cell(r, 1).value == ch and ws.cell(r, 2).value == week)
+        if col is None:
+            for c in range(1, 14):
+                ws.cell(r, c).value = None
+        else:
+            ws.cell(r, col).value = value
+    return edit
+
+
+def _copy_row(sheet, key, last_col, new_key=None):
+    def edit(wb):
+        ws = wb[sheet]
+        src = _row(ws, 1, key)
+        last = max(r for r in range(5, ws.max_row + 1) if ws.cell(r, 1).value is not None)
+        for c in range(1, last_col + 1):
+            val = ws.cell(src, c).value
+            ws.cell(last + 1, c).value = None if isinstance(val, str) and val.startswith("=") else val
+        if new_key:
+            ws.cell(last + 1, 1).value = new_key
+    return edit
+
+
+def _tier(table, no, col, value):
+    def edit(wb):
+        ws = wb["CostTiers"]
+        r = next(r for r in range(5, ws.max_row + 1) if ws.cell(r, 1).value == table and ws.cell(r, 2).value == no)
+        ws.cell(r, col).value = value
+    return edit
+
+
+S = lambda name, value: _set("Settings", name, 2, value)
+EXCEL_CHECKS = {   # Excel check → edit of an openpyxl copy → message of the engine. Cross-checked once against
+    # Excel's own verdict (LibreOffice recalculation of every copy): all 43 rejected by both.
+    "C01 parameter blank": (S("RandomSeed", None), "parameter RandomSeed has no value"),
+    "X03 horizon 60": (S("HorizonPeriods", 60), "HorizonPeriods must be a whole number between 1 and 52"),
+    "X06 review period 40": (S("ReviewPeriod", 40), "ReviewPeriod must be a whole number"),
+    "X07 chance level 1.5": (S("FillRateChanceLevel", 1.5), "FillRateChanceLevel must be in (0, 1]"),
+    "X07 too few scenarios": (S("NumScenarios", 50), "NumScenarios too small"),
+    "C02 duplicate location": (_copy_row("Locations", "DC", 7), "duplicate LocationID DC"),
+    "C02 location type blank": (_set("Locations", "RMW", 3, None), "Name and Type must be filled"),
+    "C03 duplicate item": (_copy_row("Items", "RM2", 6), "duplicate ItemID RM2"),
+    "C03 shelf life 0": (_set("Items", "RM3", 5, 0), "ShelfLife of RM3 must be a whole number > 0"),
+    "C04 MOQ not a multiple": (_set("Sourcing", "RM1", 4, 725), "MOQ must be a multiple of OrderMultiple"),
+    "C04 max below MOQ": (_set("Sourcing", "RM4", 6, 500), "MaxOrderQty must be ≥ MOQ"),
+    "C04 unknown lead time": (_set("Sourcing", "RM2", 9, "LT_NOPE"), "lead-time distribution LT_NOPE unknown"),
+    "C04 supplier not a supplier": (_set("Sourcing", "RM3", 2, "RMW"), "supplier RMW is not a Supplier location"),
+    "X01 RM sourced twice": (_copy_row("Sourcing", "RM2", 9), "RM2 needs exactly one Sourcing row"),
+    "C05 production MOQ 6050": (_set("Production", "FG1", 4, 6050), "Production row 5: MOQ must be a multiple of BatchSize"),
+    "C05 production max below MOQ": (_set("Production", "FG1", 6, 5000), "MaxQtyPerOrder must be ≥ MOQ"),
+    "C05 no production orders": (_set("Production", "FG1", 7, 0), "MaxOrdersPerPeriod must be ≥ 1"),
+    "C05 capacity below demand": (lambda wb: (_set("Production", "FG1", 4, 1000)(wb), _set("Production", "FG1", 6, 1000)(wb)),
+                                  "exceeds the production capacity"),
+    "C06 freshness ≥ shelf life": (_set("BOM", "RM4", 4, 52, keycol=2), "freshness rule of RM4 must be"),
+    "C06 unknown component": (_set("BOM", "RM2", 2, "RM9", keycol=2), "component RM9 unknown"),
+    "C06 strawberry need > supply": (_set("BOM", "RM3", 3, 0.8, keycol=2), "exceeds its maximum weekly supply"),
+    "C07 lane end point unknown": (_set("Lanes", "L_DC_AMZ", 3, "XYZ"), "unknown end point"),
+    "C07 lane tier table unknown": (_set("Lanes", "L_KAJA_DC", 6, "CT_NOPE"), "unknown tier table CT_NOPE"),
+    "C08 lead time 6.6": (_set("LeadTimeDist", "LT_PROD_KAJA", 2, 6.6), "must be whole weeks ≥ 0"),
+    "C08 probability 1.2": (_set("LeadTimeDist", "LT_RM1", 3, 1.2), "probability of LT_RM1 must be in (0, 1]"),
+    "C09 target 1.2": (_set("Channels", "AMZ", 5, 1.2), "TargetFillRate must be in (0, 1]"),
+    "C09 shelf need 40": (_set("Channels", "B2B", 6, 40), "shelf-life need must be whole weeks"),
+    "C10 demand row twice": (_copy_row("Demand", "D2C", 13), "D2C week 1 appears twice"),
+    "X05 demand row missing": (_demand("B2B", 20, None, None), "channel B2B has no row for week(s) 20"),
+    "C10 quantiles decreasing": (_demand("AMZ", 5, 13, 1), "quantiles must be ≥ 0 and non-decreasing"),
+    "C10 negative quantile": (_demand("D2C", 8, 4, -3), "quantiles must be ≥ 0 and non-decreasing"),
+    "C10 unknown channel": (_copy_row("Demand", "AMZ", 13, new_key="EBAY"), "unknown channel EBAY"),
+    "C11 tier gap": (_tier("CT_FG1_PROD", 2, 3, 20000), "tier 2 must start where tier 1 ends"),
+    "C11 first tier not at 0": (_tier("CT_FG1_PROD", 1, 3, 5), "the first tier must start at 0"),
+    "C11 To ≤ From": (_tier("CT_FG1_TRANSPORT", 1, 4, 0), "ToQty must be greater than FromQty"),
+    "C12 holding cost blank": (_set("Costs", "RM3", 3, None), "HoldingCost of RM3 must be filled"),
+    "C12 negative cost": (_set("Costs", "RM1", 6, -0.1), "OrderVariableCost must be ≥ 0"),
+    "C12 FG tier table blank": (_set("Costs", "FG1", 8, None), "ProductionVarCostTierTableID of FG1 must be filled"),
+    "C12 FG waste cost blank": (_set("Costs", "FG1", 4, None), "WasteCost of FG1 must be filled"),
+    "C13 negative stock": (_set("Init_Inventory", "FG1", 3, -500, keycol=2), "Quantity must be ≥ 0"),
+    "C13 shelf life 40 > 36": (_set("Init_Inventory", "FG1", 4, 40, keycol=2), "RemainingShelfLife must be whole weeks"),
+    "C14 open order quantity 0": (_set("Open_Orders", "PO-RM1-01", 6, 0), "Quantity must be > 0"),
+    "C14 placed in week 1": (_set("Open_Orders", "PO-RM3-02", 7, 1), "PlacedInPeriod must be a whole week ≤ 0"),
+    "C14 arrival week 0": (_set("Open_Orders", "PRD-FG1-01", 8, 0), "ExpectedArrivalPeriod must be a whole week ≥ 1"),
+}
+VALID_EDITS = {
+    "price change": _set("Costs", "RM3", 6, 3.5),
+    "stochastic production lead time": _set("Production", "FG1", 8, "LT_PROD_KAJA_STOCH"),
+    "400 scenarios, seed 7": lambda wb: (S("NumScenarios", 400)(wb), S("RandomSeed", 7)(wb)),
+    "D2C target 97%": _set("Channels", "D2C", 5, 0.97),
+}
+
+
+def edited_copy(tmp_path, edit):
+    import openpyxl
+    wb = openpyxl.load_workbook(DATA)
+    edit(wb)
+    path = tmp_path / "edited.xlsx"
+    wb.save(path)                                    # no cached formula results, as an app would write it
+    return str(path)
+
+
+def test_openpyxl_copy_passes_and_an_explicit_excel_error_still_fails(tmp_path):
+    d = ms.load_data(edited_copy(tmp_path, lambda wb: None))
+    assert d.data_status == "unknown" and not ms.input_problems(pd.ExcelFile(edited_copy(tmp_path, lambda wb: None)))[0]
+    ms.validate(d)
+    assert len(d.warnings) == 2 and all("MaxOrderQty" in w for w in d.warnings)   # same 2 warnings as Excel
+    for status in ("ERROR", "INCOMPLETE"):
+        d.data_status = status
+        with pytest.raises(ValueError, match=f"OVERALL = {status}"):
+            ms.validate(d)
+
+
+def test_workbook_is_closed_after_reading_also_when_rejected(tmp_path, monkeypatch):
+    """The app writes, replaces and deletes edited copies; on Windows that fails while the file is still open."""
+    opened = []
+    real = pd.ExcelFile
+
+    class Tracked(real):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            opened.append(self)
+            self.closed_flag = False
+
+        def close(self):
+            self.closed_flag = True
+            super().close()
+    monkeypatch.setattr(ms.pd, "ExcelFile", Tracked)
+    ms.load_data(edited_copy(tmp_path, lambda wb: None))
+    with pytest.raises(ValueError):
+        ms.load_data(edited_copy(tmp_path, EXCEL_CHECKS["C05 production MOQ 6050"][0]))
+    assert len(opened) == 2 and all(x.closed_flag for x in opened)
+
+
+@pytest.mark.parametrize("case", list(EXCEL_CHECKS))
+def test_every_excel_check_runs_in_python(case, tmp_path):
+    edit, message = EXCEL_CHECKS[case]
+    with pytest.raises(ValueError, match="Data validation failed") as e:
+        ms.validate(ms.load_data(edited_copy(tmp_path, edit)))
+    assert message in str(e.value), str(e.value)
+
+
+@pytest.mark.parametrize("case", list(VALID_EDITS))
+def test_valid_edits_pass(case, tmp_path):
+    d = ms.load_data(edited_copy(tmp_path, VALID_EDITS[case]))
+    ms.validate(d)
+
+
 def test_errors_are_exceptions_not_exits(tmp_path, monkeypatch):
     lic = tmp_path / "license.sio"
     lic.write_text("x")
@@ -460,8 +678,19 @@ def test_model_equals_reference_stochastic_lead_times_and_uncertain_open_orders(
     for o in d.open_rm["RM3"]:
         o["certain"] = False
     d.open_prod[1]["remaining"] = 30
+    d.open_rm["RM3"][0]["remaining"] = 45                         # open orders arriving partly aged (J02)
     _, _, model, _ = check_equal(d, policies(d)[name], R=80)
     assert any(not isinstance(a, int) for a in model.open_rm_arrival["RM3"])
+
+
+def test_receipts_include_partly_aged_open_orders_in_the_same_week():
+    """Two open production orders arrive in the same week, one already partly aged (J02): both are receipts."""
+    d = copy.deepcopy(D0)
+    d.open_prod[0]["arrival"] = d.open_prod[1]["arrival"]
+    d.open_prod[1]["remaining"] = 30
+    _, _, model, res = check_equal(d, policies(d)["random_small"])
+    t = d.open_prod[1]["arrival"]
+    assert np.allclose(res.detail["fg_received"][:, t], d.open_prod[0]["qty"] + d.open_prod[1]["qty"])
 
 
 def test_general_arrival_path_with_fixed_lead_time():
@@ -497,6 +726,22 @@ def test_edge_zero_demand_weeks_have_fill_rate_one():
     for ci in range(len(d.channels)):
         for t in (10, 11, 12):
             assert np.all(np.asarray(model.fill_rate[(ci, t)].get_values()) == 1.0)
+
+
+def test_edge_stock_in_its_last_usable_week_and_stock_unusable_on_entry():
+    """F06: a lot in its last usable week counts as stock that week and its leftover is that week's waste.
+    J04 (known limitation, not handled): a lot that is already unusable when it enters is never sold and never
+    in a stock position, but appears for one week in end stock and holding before it is scrapped."""
+    d = copy.deepcopy(D0)
+    d.init_fg, d.open_prod = [(16, 300.0), (10, 500.0)], []          # 16 = last usable week; 10 = already unusable
+    d.demand_q[:, 1, :] = 0.0                                        # no demand in week 1
+    _, _, model, res = check_equal(d, policies(d)["zero"])
+    det = model.detail
+    R = model.env.R
+    assert np.allclose(v(det[("position", d.fg_id, 1)], R), 300)     # only the usable lot is in the position
+    assert np.allclose(v(model.fg_end[1], R), 800)                   # both in week-1 end stock (J04: the 500)
+    assert np.allclose(v(model.fg_waste[1], R), 800)                 # both scrapped at the end of week 1
+    assert np.allclose(v(model.fg_end[2], R), v(det[("receipts", d.fg_id, 2)], R) - res.detail["served"][:, :, 2].sum(1))
 
 
 @pytest.mark.parametrize("accept", [False, True])
@@ -686,6 +931,166 @@ def test_feasibility_note_needs_both_policies_to_fail_and_groups_weeks():
     assert note.startswith("4 rule(s)") and f"{c0} w15–16, 19" in note and f"{c2} w30" in note, note
 
 
+def test_search_model_has_no_report_series():
+    """The report series are built only for the out-of-sample check (L05). The search and feasibility models
+    are the v16 model: same Terms in the same order (13,102 Terms on the template; the full Seeker call
+    sequence was compared with v16 once: identical, also with stochastic lead times)."""
+    d = copy.deepcopy(D0)
+    x = policies(d)["start"]
+    env, _, model = build(d, x, R=20)
+    env_d, _, model_d = build(d, x, R=20, detail=True)
+    assert model.detail is None and env.n_terms() == 13102
+    assert model_d.detail and env_d.n_terms() > env.n_terms()
+    assert model.objective.get_value() == model_d.objective.get_value()
+
+
+def detail_oos(d, x, R=150, seed=7):
+    """One out-of-sample batch done by hand: the numbers section 6 reads, and the reference on the same scenarios."""
+    env, lay, model = build(d, x, R, seed, detail=True)
+    readers = ms.report_numbers(model, d)
+    env.evaluate()
+    oos = ms.derived_numbers({k: r() for k, r in readers.items()}, d)
+    oos["n"] = R
+    res = ref.MEIOSimulator(d, seeker_scenarios(model, d)).run(lay.decode(x), detail=True)
+    return model, oos, res
+
+
+def stat(a, kind):
+    """The statistic as the Seeker test double computes it ((⌊q·N⌋+1)-th smallest value for quantiles)."""
+    a = np.asarray(a, float)
+    return a.mean() if kind == "mean" else np.sort(a)[int(np.floor(int(kind[1:]) / 100 * len(a) + 1e-9))]
+
+
+def stochastic_data():
+    d = copy.deepcopy(D0)
+    d.prod_lead_time = ref.LeadTime(np.array([6, 8]), np.array([0.6, 0.4]))
+    for k in d.rms:
+        k.lead_time = ref.LeadTime(np.array([k.lead_time.min, k.lead_time.min + 4]), np.array([0.7, 0.3]))
+    for o in d.open_rm["RM3"]:
+        o["certain"] = False
+    return d
+
+
+@pytest.mark.parametrize("lead", ["fixed", "stochastic"])
+def test_bands_are_the_statistics_of_the_reference_series(lead):
+    d = copy.deepcopy(D0) if lead == "fixed" else stochastic_data()
+    _, oos, res = detail_oos(d, policies(d)["random_small"])
+    rec, fg, R = res.detail, d.fg_id, 150
+    src = {("end_stock", fg): rec["fg_end"], ("position", fg): rec["ip_fg"], ("waste", fg): rec["fg_waste"],
+           ("order_qty", fg): rec["prod_qty"], ("receipts", fg): rec["fg_received"]}
+    for k in d.rms:
+        src.update({("end_stock", k.id): rec[f"{k.id}_end"], ("position", k.id): rec[f"{k.id}_ip"],
+                    ("order_qty", k.id): rec[f"{k.id}_order"], ("receipts", k.id): rec[f"{k.id}_received"]})
+        if k.perishable:
+            src[("waste", k.id)] = rec[f"{k.id}_waste"]
+    for ci, ch in enumerate(d.channels):
+        for name in ("served", "lost", "eligible_next_week"):
+            src[(name, ch.id)] = rec[name][:, ci, :]
+    end = rec["fg_end"]
+    src[("rsl_mean", fg)] = np.where(end > 0.5, rec["rsl_num"] / np.maximum(end, 1.0), 0.0)
+    n_rows = 0
+    for (name, item), arr in src.items():
+        for t in range(1, d.horizon + 1):
+            got = [oos[("band", name, item, t, kind)] for kind in ms.BAND_STATS]
+            for kind, g in zip(ms.BAND_STATS, got):
+                if (name, kind) == ("rsl_mean", "mean"):          # stock-weighted: ratio of means, nan if no stock
+                    want = rec["rsl_num"][:, t].mean() / end[:, t].mean() if end[:, t].mean() > 1e-9 else float("nan")
+                else:
+                    want = stat(arr[:, t], kind)
+                assert (np.isnan(g) and np.isnan(want)) or g == pytest.approx(want, rel=1e-9, abs=1e-9), (name, item, t, kind)
+            assert all(a <= b + 1e-9 for a, b in zip(got[1:], got[2:])), (name, item, t)     # P05 ≤ … ≤ P95
+            assert arr[:, t].min() - 1e-9 <= got[0] <= arr[:, t].max() + 1e-9 or name == "rsl_mean"
+            n_rows += 1
+    for t in range(1, d.horizon + 1):
+        assert oos[("band", "no_stock_share", fg, t, "mean")] == pytest.approx((end[:, t] <= 0.5).mean())
+    assert n_rows == 33 * d.horizon
+
+
+def test_arrival_weeks_are_conditional_on_an_order():
+    """L06: arrival week of the order placed in week t, over the scenarios where it is placed (nan if never)."""
+    d = stochastic_data()
+    d.open_prod[1]["arrival"] = 9                                    # pushes some arrivals (no overtaking)
+    _, oos, res = detail_oos(d, policies(d)["random_wide"], R=200)
+    rec, checked = res.detail, 0
+    for item, q_key, a_key in [(d.fg_id, "prod_qty", "prod_arrival")] + [(k.id, f"{k.id}_order", f"{k.id}_arrival") for k in d.rms]:
+        for t in range(1, d.horizon + 1):
+            if ("band", "arrival_week", item, t, "p50") not in oos:
+                continue
+            placed = rec[q_key][:, t] > 0
+            arr = rec[a_key][placed, t]
+            for kind in ms.BAND_STATS:
+                got = oos[("band", "arrival_week", item, t, kind)]
+                if not placed.any():
+                    assert np.isnan(got)
+                    continue
+                want = arr.mean() if kind == "mean" else min(w for w in np.unique(arr)
+                                                             if (arr <= w).mean() >= int(kind[1:]) / 100 - 1e-9)
+                assert got == pytest.approx(want), (item, t, kind)
+            checked += placed.any()
+    assert checked > 20
+    for t in (1, 2):                                                 # commit-now notes use the conditional P50
+        assert oos[("prod", "arrival", t)] == oos[("band", "arrival_week", d.fg_id, t, "p50")] or \
+            np.isnan(oos[("prod", "arrival", t)])
+
+
+def test_kpis_match_the_reference_totals():
+    d = stochastic_data()
+    _, oos, res = detail_oos(d, policies(d)["random_small"], R=200)
+    rec, fg, t0 = res.detail, d.fg_id, 1 + d.prod_lead_time.min
+    totals = {("avg_end_stock", fg): rec["fg_end"][:, 1:].mean(1), ("waste", fg): rec["fg_waste"][:, 1:].sum(1)}
+    for k in d.rms:
+        totals[("avg_end_stock", k.id)] = rec[f"{k.id}_end"][:, 1:].mean(1)
+        if k.perishable:
+            totals[("waste", k.id)] = rec[f"{k.id}_waste"][:, 1:].sum(1)
+    for ci, ch in enumerate(d.channels):
+        totals[("lost_initial_weeks", ch.id)] = rec["lost"][:, ci, 1:t0].sum(1)
+        totals[("lost_controllable_weeks", ch.id)] = rec["lost"][:, ci, t0:].sum(1)
+    for key, arr in totals.items():
+        for kind in ("mean", "p10", "p90"):
+            assert oos[("kpi",) + key + (kind,)] == pytest.approx(stat(arr, kind), rel=1e-9, abs=1e-9), (key, kind)
+        if key[0] != "avg_end_stock":
+            assert oos[("kpi",) + key + ("share",)] == pytest.approx((arr >= 0.5).mean()), key
+    kpis = ms.band_and_kpi_tables(d, {"constrained": []}, oos)[1]
+    assert len(kpis) == 5 + 3 + 3 * 2 + 1 + 3 * 2 and list(kpis.columns) == ["Item", "Unit", "Mean", "P10", "P90"]
+
+
+def headless_run(tmp_path, monkeypatch, **kw):
+    lic = tmp_path / "license.sio"
+    lic.write_text("x")
+    monkeypatch.setattr(ms, "OUT_OF_SAMPLE_SCENARIOS", 60)
+    monkeypatch.setattr(ms, "OUT_OF_SAMPLE_BATCH", 60)
+    return ms.run(DATA, str(lic), time_limit=1, skr=fake, **kw)
+
+
+def test_run_overrides_change_the_in_sample_run_and_are_checked(tmp_path, monkeypatch):
+    seen = []
+    real = ms.build_model
+    monkeypatch.setattr(ms, "build_model", lambda *a, **k: seen.append((a[5], a[6], k.get("detail", False))) or real(*a, **k))
+    res = headless_run(tmp_path, monkeypatch, overrides={"NumScenarios": 100, "RandomSeed": 43})
+    assert res.overrides == {"NumScenarios": 100, "RandomSeed": 43} and res.ins["n"] == 100
+    assert seen[0] == (43, 100, False) and seen[1] == (43, 100, False)          # feasibility + search
+    assert seen[2] == (44, 60, True)                                             # fresh seeds never = 43
+    summ = dict(res.sheets["Summary"].values)
+    assert summ["Run overrides (K20)"] == "NumScenarios = 100, RandomSeed = 43"
+    for bad, msg in (({"NumScenarios": 50}, "NumScenarios too small"), ({"Speed": 1}, "unknown run override Speed"),
+                     ({"NumScenarios": 100.5}, "must be a whole number"), ({"RandomSeed": -1}, "must be a whole number")):
+        with pytest.raises(ValueError, match=msg):
+            headless_run(tmp_path, monkeypatch, overrides=bad)
+
+
+def test_start_policy_on_the_same_fresh_seeds(tmp_path, monkeypatch):
+    monkeypatch.setattr(ms, "START_POLICY_OUT_OF_SAMPLE", True)
+    res = headless_run(tmp_path, monkeypatch)
+    d = res.data
+    x0 = res.layout.encode(ms.start_policy(d))
+    _, _, model = build(copy.deepcopy(D0), x0, R=60, seed=d.seed + 1)
+    assert res.oos_start["cost"] == pytest.approx(model.objective.get_value(), rel=1e-12)
+    kpi = dict(zip(res.sheets["KPIs"]["Item"], res.sheets["KPIs"]["Mean"]))
+    assert kpi["Saving vs. start policy (fresh, same seeds)"] == pytest.approx(1 - res.oos["cost"] / res.oos_start["cost"])
+    monkeypatch.setattr(ms, "START_POLICY_OUT_OF_SAMPLE", False)
+    assert headless_run(tmp_path, monkeypatch).oos_start is None
+
+
 def test_single_number_reads_aggregates_and_constant_terms():
     d = copy.deepcopy(D0)
     env = fake.Env("lic", True)
@@ -747,7 +1152,7 @@ def test_whole_run_report_matches_reference(tmp_path, monkeypatch):
     monkeypatch.setattr(ms, "build_report", lambda *a: seen.update(args=a) or real_report(*a))
     ms.main()
     xl = pd.read_excel(out, sheet_name=None)
-    assert set(xl) == {"Summary", "Commit_Now", "Policy_sS", "Decisions", "FillRates", "Stock_Waste"}
+    assert set(xl) == {"Summary", "Commit_Now", "Policy_sS", "Decisions", "FillRates", "Stock_Waste", "Bands", "KPIs"}
     # recompute the out-of-sample figures with the reference simulator on the same fresh scenarios
     d = copy.deepcopy(D0)                                            # same data (equality tested above)
     x, lay = seen["x"], seen["layout"]
@@ -767,7 +1172,7 @@ def test_whole_run_report_matches_reference(tmp_path, monkeypatch):
     np.testing.assert_allclose(dec["P(production)"].values, (res.detail["prod_qty"][:, 1:] > 0).mean(0))
     np.testing.assert_allclose(dec["P(RM3 order)"].values, (res.detail["RM3_order"][:, 1:] > 0).mean(0))
     # commit-now rows must come from week 1 (make week 2 different to be sure)
-    d_, lay_, x_, ins_, oos_ = seen["args"]
+    d_, lay_, x_, ins_, oos_ = seen["args"][:5]
     oos2 = dict(oos_)
     for key in list(oos2):
         if isinstance(key, tuple) and len(key) == 3 and key[1] == "mean" and key[2] == 2:
@@ -860,9 +1265,9 @@ def test_output_schema_is_frozen(tmp_path, monkeypatch):
     assert got == OUTPUT_SCHEMA, "output schema changed: update OUTPUT_SCHEMA and CONTRACT_VERSION (engine session)"
 
 
-# frozen output schema (contract version 1): sheet → column names, template data
+# frozen output schema (contract version 2: v1 + Bands, KPIs): sheet → column names, template data
 OUTPUT_SCHEMA = {
- "contract_version": 1,
+ "contract_version": 2,
  "sheets": {
   "Summary": [
    "Item",
@@ -944,6 +1349,26 @@ OUTPUT_SCHEMA = {
    "RM4 end stock (mean)",
    "RM4 waste (mean)",
    "Holding cost (mean)"
+  ],
+  "Bands": [
+   "Series",
+   "Item",
+   "Week",
+   "Mean",
+   "P05",
+   "P10",
+   "P25",
+   "P50",
+   "P75",
+   "P90",
+   "P95"
+  ],
+  "KPIs": [
+   "Item",
+   "Unit",
+   "Mean",
+   "P10",
+   "P90"
   ]
  }
 }
@@ -1006,10 +1431,10 @@ def test_noise_and_direction_logic():
 # ============================================================================
 
 
-ENGINE_SHA256 = {   # engine v16 — set by the engine session (python test_engine.py --fingerprint)
-    "meio_seeker_stochastic.py": "a1991ac9627e75b5c48e1c2bbbfbac4fdceb6102540f5478696a1260edb9b257",
-    "reference_simulator.py": "7a60b7f66478b701842bbfad3ea9c17a3a7cc84520590d2535b06806050981b4",
-    "meio_stress_tests.py": "369089ad1f2691ae75f384ab86110d9af06d289c35f1dc5a4044db697f90c9cf",
+ENGINE_SHA256 = {   # engine v17.1 — set by the engine session (python test_engine.py --fingerprint)
+    "meio_seeker_stochastic.py": "ac458725d122b544f27f62315bc5ba3cb94e4be751a0cf96ccad1b780c16dba5",
+    "reference_simulator.py": "4033fc65563cfd0834b073870eef10dff06e90be49fc5b6734050382b615aab8",
+    "meio_stress_tests.py": "c64f9c6ba04117472b327ec603ff638df2030736e124a1ca58a62c76f417a93b",
 }
 
 

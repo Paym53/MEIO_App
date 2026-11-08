@@ -18,11 +18,13 @@ are real model numbers, the search is trivial.
 """
 import ast
 import json
+import math
 import os
 import re
 import subprocess
 import sys
 import time
+import zipfile
 from pathlib import Path
 
 import openpyxl
@@ -138,12 +140,16 @@ def test_a_workbook_that_is_not_the_template_is_a_data_error(api, tmp_path):
     assert api.post("/validate", files=upload(empty)).json() == {"valid": False,
                                                                  "errors": ["Worksheet named 'Settings' not found"]}
     wb = openpyxl.load_workbook(TEMPLATE)
-    wb["Production"]["A4"].value = "Item"                        # a renamed column: the engine cannot read the sheet
+    wb["Production"]["A4"].value = "Item"                        # a renamed column: the engine names the problem
     renamed = tmp_path / "renamed.xlsx"
     wb.save(renamed)
-    r = api.post("/validate", files=upload(renamed)).json()
+    assert api.post("/validate", files=upload(renamed)).json() == {"valid": False, "errors": engine_errors(renamed)}
+    broken = tmp_path / "broken.xlsx"                            # a zip file without a workbook inside
+    with zipfile.ZipFile(broken, "w") as z:
+        z.writestr("hello.txt", "not a workbook")
+    r = api.post("/validate", files=upload(broken)).json()
     assert r["valid"] is False and len(r["errors"]) == 1
-    assert r["errors"][0].startswith("The workbook could not be read as the MEIO template: KeyError")
+    assert r["errors"][0].startswith("The workbook could not be read as the MEIO template:")
 
 
 def test_only_xlsx_files_of_sensible_size_are_accepted(api, monkeypatch):
@@ -216,6 +222,8 @@ def test_result_json_is_an_exact_copy_of_the_run_result(tmp_path, monkeypatch):
 
 
 def same(a, b):
+    if a is None:                                     # empty cell, e.g. arrival week of an order never placed
+        return b is None or (isinstance(b, float) and math.isnan(b))
     if isinstance(a, float) or isinstance(b, float):
         return b == pytest.approx(a, rel=1e-12, abs=1e-9)
     if isinstance(b, pd.Timestamp):
@@ -230,7 +238,7 @@ def test_every_number_shown_equals_the_results_workbook(done, api, tmp_path):
     (tmp_path / "w.xlsx").write_bytes(r.content)
     book = pd.read_excel(tmp_path / "w.xlsx", sheet_name=None)
     assert list(book) == list(result["sheets"]) == ["Summary", "Commit_Now", "Policy_sS", "Decisions", "FillRates",
-                                                   "Stock_Waste"]
+                                                   "Stock_Waste", "Bands", "KPIs"]          # engine contract v2
     for name, df in book.items():
         t = result["sheets"][name]
         assert list(map(str, df.columns)) == t["columns"], name

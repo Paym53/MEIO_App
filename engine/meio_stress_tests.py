@@ -203,7 +203,7 @@ def run_case(ms, skr, base, case):
     ms.TIMINGS.clear()
     t0 = time.time()
     x, ins = ms.optimize(skr, d, layout, x0, ms.LICENSE_FILE, TIME_LIMIT_SECONDS)
-    oos = ms.out_of_sample(skr, d, layout, x, ms.LICENSE_FILE)
+    oos = ms.out_of_sample(skr, d, layout, x, ms.LICENSE_FILE, detail=False)   # stress checks need no report series
     return kpis(ms, d, layout, x, ins, oos, time.time() - t0)
 
 

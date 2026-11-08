@@ -13,7 +13,8 @@ ONE MODEL, ONE PLACE
 
 WHAT EACH SECTION DOES
   0. SETTINGS ............ everything you may want to change (time limit, scenarios, files, search)
-  1. DATA ................ reads MEIO_Data_Template.xlsx and checks it
+  1. DATA ................ reads MEIO_Data_Template.xlsx and checks it: every check of the Excel sheet
+                           'Checks' also runs in Python, so copies edited by a program are checked too
   2. DECISION VARIABLES .. maps (s,S) per stock point and week to Seeker integer variables; lower bound
                            0, upper bound from the forecast (raise via EXTRA_COVER_WEEKS in section 0)
   3. SEEKER MODEL ........ the model itself: random demand and lead times, week-by-week dynamics,
@@ -25,9 +26,11 @@ WHAT EACH SECTION DOES
   5. OPTIMIZATION ........ Seeker searches for the cheapest (s,S) policy within the time limit
                            ("in-sample": on Seeker's own NumScenarios scenarios)
   6. OUT-OF-SAMPLE CHECK . the same model (section 3) is built again with FRESH random demand
-                           (OUT_OF_SAMPLE_SCENARIOS), the decisions fixed, and evaluated once
-  7. REPORT .............. results workbook + console summary
-  8. RUN AND MAIN ........ run(): sections 1 → 7 in one call, returns all results (API for apps);
+                           (OUT_OF_SAMPLE_SCENARIOS), the decisions fixed, and evaluated once; only this
+                           model also builds the report series (stock, positions, flows, freshness, KPIs)
+  7. REPORT .............. results workbook (incl. Bands = uncertainty per week, KPIs) + console summary
+  8. RUN AND MAIN ........ run(): sections 1 → 7 in one call, returns all results (API for apps;
+                           optional overrides of NumScenarios / RandomSeed for one run);
                            main(): run() + results workbook + console summary; every phase timed
 
   Reading results from Seeker: after one evaluation the script reads only single numbers (means,
@@ -72,6 +75,7 @@ FILL_RATE_CONSTRAINT_FORM = "frequency"       # "frequency": share of scenarios 
                                               # "none"     : no fill-rate constraints (diagnostic only!)
 OPTIMIZATION_CHANCE_LEVEL = None              # None = Excel Settings!FillRateChanceLevel (0.99). E.g. 0.995 to
                                               # optimize with a safety margin; the report checks the Excel level.
+START_POLICY_OUT_OF_SAMPLE = False            # also evaluate the start policy on the fresh scenarios (+~75 s)
 FEASIBILITY_CHECK = True                      # section 4b: ~25 s (one extra model); False skips it
 REPORT_INTERVAL_SECONDS = 30                  # Seeker progress line every … seconds
 OVERSAMPLE_FACTOR = 5                         # Seeker 2.2+: maxSample = factor × scenarios (2.1: stratified)
@@ -89,7 +93,7 @@ START_EXTRA_WEEKS_FG = 2       # FG cover window = max production lead time + 1 
 START_EXTRA_WEEKS_RM = 4       # RM cover window = max RM lead time + max production lead time + 1 + this many
 START_LOT_WEEKS = 4            # order-up-to S = reorder point s + this many weeks of average demand (≥ MOQ)
 
-SCRIPT_VERSION = "2026-11-06 v16 (Seeker-only)"
+SCRIPT_VERSION = "2026-11-08 v17.1 (Seeker-only)"
 EPS = 1e-9
 TIMINGS = []                                  # (phase, seconds) — printed at the end and written to the report
 
@@ -213,6 +217,9 @@ class ModelData:
     open_prod: list          # dicts: qty, placed, arrival, certain, remaining
     open_rm: dict            # rm id -> list of such dicts
     data_status: str = "unknown"
+    warnings: list = None    # input-check warnings (K19)
+    overrides: dict = None   # run overrides (K20)
+    uom: dict = None         # item id -> unit of measure (report)
 
     @property
     def rho_min(self):
@@ -238,9 +245,401 @@ def _num(v, default=None):
     return default if (v is None or (isinstance(v, float) and math.isnan(v))) else float(v)
 
 
+def _blank(v):
+    return v is None or (isinstance(v, float) and math.isnan(v)) or (isinstance(v, str) and not v.strip())
+
+
+def _f(v):
+    """Number or None (blank). Text that is not a number → nan, so every comparison below fails safely."""
+    if _blank(v):
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _whole(v):
+    x = _f(v)
+    return x is not None and not math.isnan(x) and abs(x - round(x)) < EPS
+
+
+def _rows(xls, name, keys):
+    """Records of a sheet (header row 4) that have a value in at least one of the key columns."""
+    df = pd.read_excel(xls, name, header=3, keep_default_na=False, na_values=[""])   # text like "None" stays text
+    df = df.loc[:, [c for c in df.columns if not str(c).startswith("Unnamed")]]
+    cols = [c for c in df.columns if any(str(c).startswith(k) for k in keys)]
+    return df.loc[df[cols].notna().any(axis=1)].reset_index(drop=True)
+
+
+def input_problems(xls):
+    """The Excel sheet 'Checks' (C01–C14, X01–X07) in Python, on the raw sheets, so a workbook edited by a
+    program (no cached formula results) is checked as strictly as one checked by Excel (K19).
+    Returns (errors, warnings), each a list of messages naming sheet, row and field."""
+    E, W = [], []
+    g = lambda r, prefix: next((r[c] for c in r.index if str(c).startswith(prefix)), None)
+    row_no = lambda i: i + 5                                             # Excel row of record i
+
+    # ---- C01 Settings: every parameter has a value
+    st_df = _rows(xls, "Settings", ["Parameter"])
+    st = {}
+    for i, r in st_df.iterrows():
+        st[str(r["Parameter"]).strip()] = r["Value"]
+        if _blank(r["Value"]):
+            E.append(f"Settings row {row_no(i)}: parameter {r['Parameter']} has no value")
+    H = _f(st.get("HorizonPeriods"))
+    # ---- X03 / X06 / X07
+    if not (_whole(H) and 1 <= H <= 52):
+        E.append("Settings: HorizonPeriods must be a whole number between 1 and 52")
+        H = None
+    rp = _f(st.get("ReviewPeriod"))
+    if not (_whole(rp) and 1 <= rp <= (H or 52)):
+        E.append("Settings: ReviewPeriod must be a whole number between 1 and HorizonPeriods")
+    cl = _f(st.get("FillRateChanceLevel"))
+    if cl is None or math.isnan(cl) or not 0 < cl <= 1:
+        E.append("Settings: FillRateChanceLevel must be in (0, 1]")
+    for p in ("NumScenarios", "RandomSeed"):
+        if not _whole(st.get(p)) or _f(st.get(p)) < (1 if p == "NumScenarios" else 0):
+            E.append(f"Settings: {p} must be a whole number{' ≥ 1' if p == 'NumScenarios' else ''}")
+
+    # ---- C02 Locations
+    loc = _rows(xls, "Locations", ["LocationID"])
+    loc_type = {}
+    for i, r in loc.iterrows():
+        lid = r["LocationID"]
+        if lid in loc_type:
+            E.append(f"Locations row {row_no(i)}: duplicate LocationID {lid}")
+        loc_type[lid] = r["Type"]
+        if _blank(r["Name"]) or _blank(r["Type"]):
+            E.append(f"Locations row {row_no(i)}: Name and Type must be filled")
+    # ---- C03 Items
+    it = _rows(xls, "Items", ["ItemID"])
+    item_type, item_sl = {}, {}
+    for i, r in it.iterrows():
+        iid = r["ItemID"]
+        if iid in item_type:
+            E.append(f"Items row {row_no(i)}: duplicate ItemID {iid}")
+        item_type[iid] = r["ItemType"]
+        sl = _f(g(r, "ShelfLife"))
+        item_sl[iid] = sl
+        if _blank(r["Name"]) or _blank(r["ItemType"]) or _blank(r["UoM"]):
+            E.append(f"Items row {row_no(i)}: Name, ItemType and UoM must be filled")
+        if sl is not None and not (sl > 0 and _whole(sl)):
+            E.append(f"Items row {row_no(i)}: ShelfLife of {iid} must be a whole number > 0 (or empty = no expiry)")
+    # ---- C08 LeadTimeDist
+    ltd = _rows(xls, "LeadTimeDist", ["DistID"])
+    dist_sum = {}
+    for i, r in ltd.iterrows():
+        v, p = g(r, "Value"), _f(r["Probability"])
+        if _blank(v) or p is None:
+            E.append(f"LeadTimeDist row {row_no(i)}: Value and Probability must be filled")
+            continue
+        if not (_whole(v) and _f(v) >= 0):
+            E.append(f"LeadTimeDist row {row_no(i)}: lead time {v} of {r['DistID']} must be whole weeks ≥ 0")
+        if math.isnan(p) or not 0 < p <= 1:
+            E.append(f"LeadTimeDist row {row_no(i)}: probability of {r['DistID']} must be in (0, 1]")
+        dist_sum[r["DistID"]] = dist_sum.get(r["DistID"], 0.0) + (0.0 if math.isnan(p) else p)
+    for did, s in dist_sum.items():
+        if abs(s - 1) > 1e-6:
+            E.append(f"LeadTimeDist: probabilities of {did} sum to {s:g}, must be 1")
+    dists = set(dist_sum)
+    # ---- C11 CostTiers
+    ct = _rows(xls, "CostTiers", ["TierTableID"])
+    tiers = {}
+    for i, r in ct.iterrows():
+        if any(_blank(r[c]) for c in ("TierNo", "FromQty", "CostPerUnit", "PricingMode", "QuantityBasis")):
+            E.append(f"CostTiers row {row_no(i)}: TierNo, FromQty, CostPerUnit, PricingMode, QuantityBasis must be filled")
+            continue
+        fr, to, c, no = _f(r["FromQty"]), _f(r["ToQty"]), _f(r["CostPerUnit"]), _f(r["TierNo"])
+        if not fr >= 0 or not c >= 0:
+            E.append(f"CostTiers row {row_no(i)}: FromQty and CostPerUnit must be ≥ 0")
+        if to is not None and not to > fr:
+            E.append(f"CostTiers row {row_no(i)}: ToQty must be greater than FromQty")
+        tab = tiers.setdefault(r["TierTableID"], {})
+        if no in tab:
+            E.append(f"CostTiers row {row_no(i)}: tier {no:g} of {r['TierTableID']} appears twice")
+        tab[no] = (fr, to)
+    for tid, tab in tiers.items():
+        nos = sorted(tab)
+        if nos and tab[nos[0]][0] != 0:
+            E.append(f"CostTiers {tid}: the first tier must start at 0")
+        for a, b in zip(nos, nos[1:]):
+            if tab[a][1] is None or abs(tab[a][1] - tab[b][0]) > EPS:
+                E.append(f"CostTiers {tid}: tier {b:g} must start where tier {a:g} ends (no gaps or overlaps)")
+    # ---- demand (needed by C05/C06 utilisation): mean of the quantiles per row
+    dem = _rows(xls, "Demand", ["ChannelID"])
+    qcols = [c for c in dem.columns if str(c).startswith("Q") and str(c)[1:].isdigit()]
+    ch_ids = set(_rows(xls, "Channels", ["ChannelID"])["ChannelID"])
+    seen, avg_week = set(), 0.0
+    for i, r in dem.iterrows():
+        t = r["Period"]
+        qs = [_f(r[c]) for c in qcols]
+        if r["ChannelID"] not in ch_ids:
+            E.append(f"Demand row {row_no(i)}: unknown channel {r['ChannelID']}")
+        if not (_whole(t) and 1 <= _f(t) <= 52):
+            E.append(f"Demand row {row_no(i)}: Period must be a whole week 1..52")
+        elif (r["ChannelID"], int(_f(t))) in seen:
+            E.append(f"Demand row {row_no(i)}: {r['ChannelID']} week {int(_f(t))} appears twice")
+        else:
+            seen.add((r["ChannelID"], int(_f(t))))
+        if any(q is None for q in qs):
+            E.append(f"Demand row {row_no(i)}: all {len(qcols)} quantiles must be filled")
+        elif any(math.isnan(q) or q < 0 for q in qs) or any(b < a - EPS for a, b in zip(qs, qs[1:])):
+            E.append(f"Demand row {row_no(i)}: quantiles must be ≥ 0 and non-decreasing")
+        elif H and _whole(t) and _f(t) <= H:
+            avg_week += float(np.mean(qs)) / H
+    # ---- X05 every channel has exactly one row for every week 1..H
+    if H:
+        for c in sorted(ch_ids):
+            missing = [t for t in range(1, int(H) + 1) if (c, t) not in seen]
+            if missing:
+                E.append(f"Demand: channel {c} has no row for week(s) {', '.join(map(str, missing[:10]))}"
+                         + (" …" if len(missing) > 10 else ""))
+    # ---- C04 Sourcing
+    src = _rows(xls, "Sourcing", ["ItemID"])
+    eff_max, src_count = {}, {}
+    for i, r in src.iterrows():
+        iid = r["ItemID"]
+        src_count[iid] = src_count.get(iid, 0) + 1
+        need = ("SupplierID", "DestinationID", "MOQ", "OrderMultiple", "MaxOrderQty", "MaxQtyScope",
+                "MaxOrdersPerPeriod", "LeadTimeDistID")
+        if any(_blank(r[c]) for c in need):
+            E.append(f"Sourcing row {row_no(i)}: all fields of {iid} must be filled")
+            continue
+        moq, mult, mx, mo = _f(r["MOQ"]), _f(r["OrderMultiple"]), _f(r["MaxOrderQty"]), _f(r["MaxOrdersPerPeriod"])
+        bad = []
+        if item_type.get(iid) != "RM":
+            bad.append(f"{iid} is not an RM item")
+        if loc_type.get(r["SupplierID"]) != "Supplier":
+            bad.append(f"supplier {r['SupplierID']} is not a Supplier location")
+        if r["DestinationID"] not in loc_type:
+            bad.append(f"destination {r['DestinationID']} unknown")
+        if r["LeadTimeDistID"] not in dists:
+            bad.append(f"lead-time distribution {r['LeadTimeDistID']} unknown")
+        if not (mult > 0 and moq > 0):
+            bad.append("MOQ and OrderMultiple must be > 0")
+        elif abs(moq / mult - round(moq / mult)) > 1e-9:
+            bad.append("MOQ must be a multiple of OrderMultiple")
+        if not mx >= moq:
+            bad.append("MaxOrderQty must be ≥ MOQ")
+        if not mo >= 1:
+            bad.append("MaxOrdersPerPeriod must be ≥ 1")
+        if bad:
+            E.append(f"Sourcing row {row_no(i)}: " + "; ".join(bad))
+        else:
+            if abs(mx / mult - round(mx / mult)) > 1e-9:
+                W.append(f"Sourcing row {row_no(i)}: MaxOrderQty of {iid} is not a multiple of OrderMultiple "
+                         f"(the model uses {math.floor(mx / mult + EPS) * mult:,.0f})")
+            eff_max[iid] = math.floor(mx / mult + EPS) * mult * mo
+    # ---- C05 Production + X02
+    prod = _rows(xls, "Production", ["ItemID"])
+    prod_count = {}
+    for i, r in prod.iterrows():
+        iid = r["ItemID"]
+        prod_count[iid] = prod_count.get(iid, 0) + 1
+        need = ("SiteID", "DestinationID", "MOQ", "BatchSize", "MaxQtyPerOrder", "MaxOrdersPerPeriod",
+                "LeadTimeDistID", "ShelfLifeClockStart")
+        if any(_blank(r[c]) for c in need):
+            E.append(f"Production row {row_no(i)}: all fields of {iid} must be filled")
+            continue
+        moq, b, mx, mo = _f(r["MOQ"]), _f(r["BatchSize"]), _f(r["MaxQtyPerOrder"]), _f(r["MaxOrdersPerPeriod"])
+        bad = []
+        if item_type.get(iid) != "FG":
+            bad.append(f"{iid} is not an FG item")
+        if loc_type.get(r["SiteID"]) != "ProductionSite":
+            bad.append(f"site {r['SiteID']} is not a ProductionSite location")
+        if r["DestinationID"] not in loc_type:
+            bad.append(f"destination {r['DestinationID']} unknown")
+        if r["LeadTimeDistID"] not in dists:
+            bad.append(f"lead-time distribution {r['LeadTimeDistID']} unknown")
+        if not (b > 0 and moq > 0):
+            bad.append("MOQ and BatchSize must be > 0")
+        elif abs(moq / b - round(moq / b)) > 1e-9:
+            bad.append("MOQ must be a multiple of BatchSize")
+        if not mx >= moq:
+            bad.append("MaxQtyPerOrder must be ≥ MOQ")
+        if not mo >= 1:
+            bad.append("MaxOrdersPerPeriod must be ≥ 1")
+        util = avg_week / (mx * mo) if mx and mo and mx > 0 and mo > 0 else 0.0
+        if util > 1:
+            bad.append(f"average weekly demand {avg_week:,.0f} exceeds the production capacity {mx * mo:,.0f} per week")
+        if bad:
+            E.append(f"Production row {row_no(i)}: " + "; ".join(bad))
+        else:
+            if abs(mx / b - round(mx / b)) > 1e-9:
+                W.append(f"Production row {row_no(i)}: MaxQtyPerOrder is not a multiple of BatchSize")
+            if util > 0.9:
+                W.append(f"Production row {row_no(i)}: capacity utilisation {util:.0%} (> 90%)")
+    # ---- C06 BOM + X01 + X04
+    bom = _rows(xls, "BOM", ["ParentItemID"])
+    bom_parents = set()
+    for i, r in bom.iterrows():
+        par, comp = r["ParentItemID"], r["ComponentItemID"]
+        bom_parents.add(par)
+        if _blank(comp) or _blank(r["QtyPerParent"]):
+            E.append(f"BOM row {row_no(i)}: ComponentItemID and QtyPerParent must be filled")
+            continue
+        qty, scrap = _f(r["QtyPerParent"]), _f(r["ScrapRate"]) or 0.0
+        mr = _f(g(r, "MinRemainingShelfLife"))
+        bad = []
+        if item_type.get(par) != "FG":
+            bad.append(f"parent {par} is not an FG item")
+        if comp not in item_type:
+            bad.append(f"component {comp} unknown")
+        if not qty > 0:
+            bad.append("QtyPerParent must be > 0")
+        if not 0 <= scrap < 1:
+            bad.append("ScrapRate must be in [0, 1)")
+        sl = item_sl.get(comp)
+        if sl is not None and mr is None:
+            E.append(f"BOM row {row_no(i)}: MinRemainingShelfLife of perishable {comp} must be filled")
+        elif sl is not None and not (_whole(mr) and 0 <= mr < sl):
+            bad.append(f"freshness rule of {comp} must be whole weeks ≥ 0 and below its shelf life {sl:g} "
+                       f"(usable window ≥ 1 week, X04)")
+        if src_count.get(comp, 0) != 1:
+            bad.append(f"{comp} needs exactly one Sourcing row (found {src_count.get(comp, 0)}, X01)")
+        elif comp in eff_max and qty > 0 and 0 <= scrap < 1:
+            util = qty * avg_week / (1 - scrap) / eff_max[comp] if eff_max[comp] > 0 else float("inf")
+            if util > 1:
+                bad.append(f"average weekly need of {comp} exceeds its maximum weekly supply ({util:.0%})")
+            elif util > 0.9:
+                W.append(f"BOM row {row_no(i)}: supply utilisation of {comp} {util:.0%} (> 90%)")
+        if bad:
+            E.append(f"BOM row {row_no(i)}: " + "; ".join(bad))
+    for iid, typ in item_type.items():
+        if typ == "FG" and (prod_count.get(iid, 0) != 1 or iid not in bom_parents):
+            E.append(f"FG item {iid} needs exactly one Production row and at least one BOM line (X02)")
+    # ---- C07 Lanes
+    ln = _rows(xls, "Lanes", ["LaneID"])
+    lane_ids = set()
+    for i, r in ln.iterrows():
+        bad = []
+        if r["LaneID"] in lane_ids:
+            bad.append(f"duplicate LaneID {r['LaneID']}")
+        lane_ids.add(r["LaneID"])
+        if any(_blank(r[c]) for c in ("FromID", "ToID", "ItemScope", "TransitTimeDistID")):
+            E.append(f"Lanes row {row_no(i)}: FromID, ToID, ItemScope and TransitTimeDistID must be filled")
+            continue
+        if r["FromID"] not in loc_type or r["ToID"] not in loc_type:
+            bad.append("unknown end point")
+        if r["TransitTimeDistID"] not in dists or (not _blank(r["TransitIncludedIn"]) and r["TransitIncludedIn"] not in dists):
+            bad.append("unknown lead-time distribution")
+        if not _blank(r["TransportCostTierTableID"]) and r["TransportCostTierTableID"] not in tiers:
+            bad.append(f"unknown tier table {r['TransportCostTierTableID']}")
+        if bad:
+            E.append(f"Lanes row {row_no(i)}: " + "; ".join(bad))
+    # ---- C09 Channels
+    ch = _rows(xls, "Channels", ["ChannelID"])
+    got = set()
+    for i, r in ch.iterrows():
+        cid = r["ChannelID"]
+        need = ("SourceLocationID", "ItemID", "TargetFillRate", "MinRemainingShelfLife", "UnmetDemand", "DemandInput")
+        if any(_blank(g(r, c)) for c in need):
+            E.append(f"Channels row {row_no(i)}: all fields of {cid} must be filled")
+            continue
+        tgt, need_sl = _f(r["TargetFillRate"]), _f(g(r, "MinRemainingShelfLife"))
+        bad = []
+        if cid in got:
+            bad.append(f"duplicate channel {cid}")
+        got.add(cid)
+        if loc_type.get(cid) != "Channel":
+            bad.append(f"{cid} is not a Channel location")
+        if r["SourceLocationID"] not in loc_type:
+            bad.append(f"source {r['SourceLocationID']} unknown")
+        if item_type.get(r["ItemID"]) != "FG":
+            bad.append(f"item {r['ItemID']} is not an FG item")
+        if not 0 < tgt <= 1:
+            bad.append("TargetFillRate must be in (0, 1]")
+        fsl = item_sl.get(r["ItemID"]) or 0
+        if not (_whole(need_sl) and 0 <= need_sl <= fsl):
+            bad.append(f"shelf-life need must be whole weeks between 0 and the FG shelf life {fsl:g}")
+        if bad:
+            E.append(f"Channels row {row_no(i)}: " + "; ".join(bad))
+    # ---- C12 Costs
+    co = _rows(xls, "Costs", ["ItemID"])
+    for i, r in co.iterrows():
+        iid = r["ItemID"]
+        bad, miss = [], []
+        if iid not in item_type:
+            bad.append(f"unknown item {iid}")
+        if r["LocationID"] not in loc_type:
+            bad.append(f"unknown location {r['LocationID']}")
+        tt = g(r, "ProductionVarCostTierTableID")
+        if not _blank(tt) and tt not in tiers:
+            bad.append(f"unknown tier table {tt}")
+        fields = {"HoldingCost": True, "WasteCost": item_sl.get(iid) is not None,
+                  "OrderFixedCost": item_type.get(iid) == "RM", "OrderVariableCost": item_type.get(iid) == "RM",
+                  "ProductionFixedCost": item_type.get(iid) == "FG", "ProductionVarCostTierTableID": item_type.get(iid) == "FG"}
+        for f, required in fields.items():
+            v = g(r, f)
+            if required and _blank(v):
+                miss.append(f)
+            if f != "ProductionVarCostTierTableID" and not _blank(v) and not _f(v) >= 0:
+                bad.append(f"{f} must be ≥ 0")
+        if miss:
+            E.append(f"Costs row {row_no(i)}: {', '.join(miss)} of {iid} must be filled")
+        if bad:
+            E.append(f"Costs row {row_no(i)}: " + "; ".join(bad))
+    # ---- C13 Init_Inventory
+    inv = _rows(xls, "Init_Inventory", ["LocationID", "ItemID", "Quantity"])
+    for i, r in inv.iterrows():
+        q, a = _f(g(r, "Quantity")), _f(g(r, "RemainingShelfLife"))
+        if _blank(r["LocationID"]) or _blank(r["ItemID"]) or q is None:
+            E.append(f"Init_Inventory row {row_no(i)}: LocationID, ItemID and Quantity must be filled")
+            continue
+        bad = []
+        if r["LocationID"] not in loc_type or r["ItemID"] not in item_type:
+            bad.append("unknown location or item")
+        if not q >= 0:
+            bad.append("Quantity must be ≥ 0")
+        sl = item_sl.get(r["ItemID"])
+        if sl is not None and a is None:
+            E.append(f"Init_Inventory row {row_no(i)}: RemainingShelfLife of perishable {r['ItemID']} must be filled")
+        elif sl is not None and not (_whole(a) and 0 <= a <= sl):
+            bad.append(f"RemainingShelfLife must be whole weeks between 0 and {sl:g}")
+        if bad:
+            E.append(f"Init_Inventory row {row_no(i)}: " + "; ".join(bad))
+    # ---- C14 Open_Orders
+    oo = _rows(xls, "Open_Orders", ["OrderType", "ItemID", "Quantity"])
+    for i, r in oo.iterrows():
+        need = (r["OrderType"], r["ItemID"], r["FromID"], r["ToID"], g(r, "Quantity"), r["ExpectedArrivalPeriod"])
+        if any(_blank(v) for v in need):
+            E.append(f"Open_Orders row {row_no(i)}: OrderType, ItemID, FromID, ToID, Quantity, ExpectedArrivalPeriod "
+                     f"must be filled")
+            continue
+        q, arr, pl = _f(g(r, "Quantity")), _f(r["ExpectedArrivalPeriod"]), _f(r["PlacedInPeriod"])
+        rem = _f(g(r, "RemainingShelfLifeAtArrival"))
+        bad = []
+        if r["ItemID"] not in item_type or r["FromID"] not in loc_type or r["ToID"] not in loc_type:
+            bad.append("unknown item or location")
+        if r["OrderType"] not in ("Purchase", "Production"):
+            bad.append("OrderType must be Purchase or Production")
+        if not q > 0:
+            bad.append("Quantity must be > 0")
+        if not (_whole(arr) and arr >= 1):
+            bad.append("ExpectedArrivalPeriod must be a whole week ≥ 1")
+        if pl is not None and not (_whole(pl) and pl <= 0 and pl < arr):
+            bad.append("PlacedInPeriod must be a whole week ≤ 0 (orders placed before the plan starts)")
+        sl = item_sl.get(r["ItemID"])
+        if rem is not None and not (_whole(rem) and 0 <= rem <= (sl if sl is not None else rem)):
+            bad.append("RemainingShelfLifeAtArrival must be whole weeks within the shelf life")
+        if bad:
+            E.append(f"Open_Orders row {row_no(i)}: " + "; ".join(bad))
+    return E, W
+
+
 def load_data(path):
-    """Read the Excel template into a ModelData object (see sheet descriptions)."""
-    xls = pd.ExcelFile(path)
+    """Read the Excel template into a ModelData object (see sheet descriptions). The Python input checks run
+    first (K19); any error stops here with the full list, warnings are kept in d.warnings. The file is closed
+    again in every case (on Windows an open file cannot be overwritten or deleted)."""
+    with pd.ExcelFile(path) as xls:
+        return _read_workbook(xls)
+
+
+def _read_workbook(xls):
+    errors, warns = input_problems(xls)
+    if errors:
+        raise ValueError("Data validation failed:\n  - " + "\n  - ".join(errors))
     st = _sheet(xls, "Settings").set_index("Parameter")["Value"].to_dict()
 
     # --- lead-time distributions
@@ -347,7 +746,8 @@ def load_data(path):
     for _, row in checks.iterrows():
         vals = list(row.values)
         if "OVERALL" in vals:
-            status = str(vals[vals.index("OVERALL") + 1])
+            v = vals[vals.index("OVERALL") + 1]
+            status = "unknown" if _blank(v) else str(v).strip()       # no cached result (file saved by a program)
 
     return ModelData(
         horizon=H, review_period=int(st["ReviewPeriod"]), start_date=pd.Timestamp(st["PlanningStartDate"]),
@@ -363,7 +763,8 @@ def load_data(path):
         fg_holding=_num(fgc[_col(costs.reset_index(), "HoldingCost")], 0.0),
         fg_waste=_num(fgc[_col(costs.reset_index(), "WasteCost")], 0.0),
         rms=rms, channels=channels, levels=levels, demand_q=demand_q,
-        init_fg=init_fg, init_rm=init_rm, open_prod=open_prod, open_rm=open_rm, data_status=status)
+        init_fg=init_fg, init_rm=init_rm, open_prod=open_prod, open_rm=open_rm, data_status=status, warnings=warns,
+        uom={str(i): str(u) for i, u in items["UoM"].items()})
 
 
 def validate(d):
@@ -371,6 +772,10 @@ def validate(d):
     errors = []
     if d.data_status not in ("READY", "unknown"):
         errors.append(f"Excel sheet Checks shows OVERALL = {d.data_status} (must be READY).")
+    if not 1 <= d.horizon <= 52:
+        errors.append("HorizonPeriods must be between 1 and 52.")
+    if not 0 < d.chance_level <= 1:
+        errors.append("FillRateChanceLevel must be in (0, 1].")
     if not 1 <= d.review_period <= d.horizon:
         errors.append("ReviewPeriod must be between 1 and HorizonPeriods.")
     q = d.demand_q[:, 1:, :]
@@ -662,6 +1067,7 @@ class SeekerModel:
     rm_waste: dict                             # (rm id, week) -> RM units scrapped
     holding: dict                              # week -> holding cost
     keep_alive: list                           # Python objects Seeker calls back into (must outlive env)
+    detail: dict = None                        # report series (only built for the out-of-sample check, L05–L08)
 
 
 SUPPORTS_MAX_SAMPLE = {}
@@ -697,10 +1103,13 @@ def _fefo(T, lots, keys, need):
     return T.min(need, before)
 
 
-def build_model(skr, env, d, layout, x_start, seed, resolution):
+def build_model(skr, env, d, layout, x_start, seed, resolution, detail=False):
     """THE MODEL. Creates in `env`: decision variables (start values x_start), random demand and lead times,
     the week-by-week dynamics E1–E6, total cost, fill rates, objective and fill-rate constraints.
-    `seed` selects the random demand (optimization: Settings!RandomSeed; out-of-sample: other seeds)."""
+    `seed` selects the random demand (optimization: Settings!RandomSeed; out-of-sample: other seeds).
+    detail=True (out-of-sample check only, L05–L08): also builds the per-scenario report series; the
+    optimization and feasibility models never contain them (K06, contract v2).
+    """
     T = _T(env)
     max_sample = OVERSAMPLE_FACTOR * int(resolution)
     H, rho_min = d.horizon, d.rho_min
@@ -785,6 +1194,10 @@ def build_model(skr, env, d, layout, x_start, seed, resolution):
     costs = {n: [] for n in ("rm_ordering", "production", "transport", "holding", "waste")}
     fill_rate, prod_qty, rm_order, prod_arr, rm_arr = {}, {}, {}, {}, {}
     fg_end, fg_waste, rm_end, rm_waste, holding = {}, {}, {}, {}, {}
+    det = {}                                                     # report series, only if detail (L05–L08)
+
+    def tsum(parts):                                             # sum that accepts plain numbers (detail only)
+        return T.sum([p if not isinstance(p, (int, float)) else T.C(p) for p in parts])
 
     def tier_cost(tiers, q):
         if tiers.mode == "Incremental":
@@ -797,15 +1210,23 @@ def build_model(skr, env, d, layout, x_start, seed, resolution):
 
     for t in range(1, H + 1):
         # ---- E1: receipts with full shelf life (F01) -------------------------------------------
-        for a, term in fg_stream.receipts(t, d.fg_shelf_life).items():
+        got = fg_stream.receipts(t, d.fg_shelf_life)
+        for a, term in got.items():
             fg[a] = term if fg.get(a) is None else fg[a] + term
+        if detail:
+            det[("receipts", d.fg_id, t)] = tsum(list(got.values()))
         for k in d.rms:
-            for a, term in rm_stream[k.id].receipts(t, k.shelf_life if k.perishable else 0).items():
+            got = rm_stream[k.id].receipts(t, k.shelf_life if k.perishable else 0)
+            for a, term in got.items():
                 key = a if k.perishable else 0
                 rm[k.id][key] = term if rm[k.id].get(key) is None else rm[k.id][key] + term
+            if detail:
+                det[("receipts", k.id, t)] = tsum(list(got.values()))
 
         # ---- E2: FG review → production order (C01, C06, D02) --------------------------------
         ip_fg = T.sum([v for a, v in fg.items() if a >= rho_min]) + fg_stream.pipeline(t)
+        if detail:
+            det[("position", d.fg_id, t)] = ip_fg
         q = None
         pol = policy("FG", t)
         if pol is not None:
@@ -838,11 +1259,17 @@ def build_model(skr, env, d, layout, x_start, seed, resolution):
         for k in d.rms:
             pol = policy(k.id, t)
             if pol is None:
+                if detail:                                       # echelon position also in inactive weeks
+                    usable_next = T.sum([v for a, v in rm[k.id].items() if a >= k.min_remaining + 1]) if k.perishable \
+                        else rm[k.id].get(0, T.C(0))
+                    det[("position", k.id, t)] = usable_next + rm_stream[k.id].pipeline(t) + k.bom * ip_after
                 continue
             s, S = pol
             usable_next = T.sum([v for a, v in rm[k.id].items() if a >= k.min_remaining + 1]) if k.perishable \
                 else rm[k.id].get(0, T.C(0))
             ip_k = usable_next + rm_stream[k.id].pipeline(t) + k.bom * ip_after
+            if detail:
+                det[("position", k.id, t)] = ip_k
             qk = (ip_k < s) * T.min(k.max_order, T.max(k.moq, k.multiple * env.ceil((S - ip_k) / k.multiple - EPS)))
             rm_arr[(k.id, t)] = rm_stream[k.id].add(t, qk)
             rm_order[(k.id, t)] = qk
@@ -853,6 +1280,8 @@ def build_model(skr, env, d, layout, x_start, seed, resolution):
             dem = demand[(ci, t)]
             served = _fefo(T, fg, sorted(a for a in fg if a >= ch.min_remaining), dem)
             fill_rate[(ci, t)] = env.if_(dem > 0, served / T.max(dem, 1.0), T.C(1))
+            if detail:
+                det[("served", ch.id, t)], det[("lost", ch.id, t)] = served, dem - served
 
         # ---- E5: holding cost on end-of-week stock (I05) -------------------------------------
         fg_end[t] = T.sum(list(fg.values()))
@@ -863,6 +1292,13 @@ def build_model(skr, env, d, layout, x_start, seed, resolution):
                 hold.append(k.holding * rm_end[(k.id, t)])
         holding[t] = T.sum(hold)
         costs["holding"].append(holding[t])
+        if detail:                                               # DC stock health at week end (L05)
+            for ch in d.channels:                                # still sellable to the channel next week
+                det[("eligible_next_week", ch.id, t)] = tsum([v for a, v in fg.items() if a >= ch.min_remaining + 1])
+            num = tsum([a * v for a, v in fg.items()])
+            det[("rsl_num", d.fg_id, t)] = num
+            det[("rsl_mean", d.fg_id, t)] = env.if_(fg_end[t] > 0.5, num / T.max(fg_end[t], 1.0), T.C(0))
+            det[("no_stock", d.fg_id, t)] = T.C(0) - fg_end[t]   # ≥ −0.5 ⇔ no stock (read as a share)
 
         # ---- E6: ageing; unusable lots are wasted immediately (F05, C02, C04) ----------------
         fg_waste[t] = T.sum([v for a, v in fg.items() if a <= rho_min]) if any(a <= rho_min for a in fg) else 0.0
@@ -880,6 +1316,17 @@ def build_model(skr, env, d, layout, x_start, seed, resolution):
 
     cost_parts = {n: T.sum(v) for n, v in costs.items()}
     total = T.sum(list(cost_parts.values()))
+    if detail:                                                   # per-scenario totals for the KPI block (L07)
+        t_first = 1 + d.prod_lead_time.min if d.enforce_from_first_controllable else 1
+        det[("kpi", "avg_end_stock", d.fg_id)] = tsum([fg_end[t] for t in range(1, H + 1)]) / H
+        det[("kpi", "waste", d.fg_id)] = tsum([fg_waste[t] for t in range(1, H + 1)])
+        for k in d.rms:
+            det[("kpi", "avg_end_stock", k.id)] = tsum([rm_end[(k.id, t)] for t in range(1, H + 1)]) / H
+            if k.perishable:
+                det[("kpi", "waste", k.id)] = tsum([rm_waste[(k.id, t)] for t in range(1, H + 1)])
+        for ch in d.channels:
+            det[("kpi", "lost_initial_weeks", ch.id)] = tsum([det[("lost", ch.id, t)] for t in range(1, t_first)])
+            det[("kpi", "lost_controllable_weeks", ch.id)] = tsum([det[("lost", ch.id, t)] for t in range(t_first, H + 1)])
     objective = env.aggregate_mean(total)
     # ---- fill-rate chance constraints (H05–H07) ----------------------------------------------
     alpha = OPTIMIZATION_CHANCE_LEVEL or d.chance_level
@@ -898,7 +1345,7 @@ def build_model(skr, env, d, layout, x_start, seed, resolution):
             env.enforce_geq(fr_stat[(ci, t)], ch.target, f"FR_{ch.id}_w{t}")
     return SeekerModel(env, T, variables, objective, total, cost_parts, fill_rate, fr_share, fr_stat, constrained,
                        demand, lead_prod, lead_rm, open_prod_arr, open_rm_arr, prod_qty, prod_arr, rm_order, rm_arr,
-                       fg_end, fg_waste, rm_end, rm_waste, holding, keep)
+                       fg_end, fg_waste, rm_end, rm_waste, holding, keep, det if detail else None)
 
 
 # ============================================================================
@@ -967,7 +1414,7 @@ def new_env(skr, license_file, n_scenarios, speed):
 
 def single_number(model, term, kind="mean", threshold=0.0):
     """Creates an aggregate of `term` in the model and returns a function that reads it as ONE number
-    after env.evaluate(). kind: mean | p10 | p50 | p90 | share (= share of scenarios with term ≥ threshold).
+    after env.evaluate(). kind: mean | pNN (quantile, e.g. p05) | share (= share of scenarios with term ≥ threshold).
     Plain numbers and Terms that are equal in every scenario (e.g. week-1 decisions) are read directly."""
     env, T = model.env, model.T
     if not hasattr(term, "get_value"):                      # plain number (e.g. a fixed arrival week)
@@ -979,7 +1426,7 @@ def single_number(model, term, kind="mean", threshold=0.0):
         elif kind == "share":
             agg = env.aggregate_relative_frequency_geq(term, T.C(threshold - 1e-6))
         else:
-            agg = env.aggregate_quantile(term, {"p10": 0.10, "p50": 0.50, "p90": 0.90}[kind], False)
+            agg = env.aggregate_quantile(term, int(kind[1:]) / 100.0, False)          # "p05" … "p95"
         return agg.get_value
     except Exception:  # noqa: BLE001 — Seeker refuses aggregates of Terms that do not vary across scenarios
         return (lambda: float(term.get_value() >= threshold - 1e-6)) if kind == "share" else term.get_value
@@ -1104,10 +1551,6 @@ def report_numbers(model, d):
         for kind in ("mean", "p10", "p90"):
             num[(j, kind, t)] = single_number(model, q, kind)
         num[(j, "p_order", t)] = single_number(model, q, "share", 0.5)       # quantities are ≥ MOQ when > 0
-    for t in range(1, R + 1):                                                 # arrival week of commit-now orders
-        num[("prod", "arrival", t)] = single_number(model, model.prod_arrival.get(t, 0.0), "p50")
-        for k in d.rms:
-            num[(k.id, "arrival", t)] = single_number(model, model.rm_arrival.get((k.id, t), 0.0), "p50")
     for t in range(1, H + 1):
         num[("fg_end", t)] = single_number(model, model.fg_end[t])
         num[("fg_waste", t)] = single_number(model, model.fg_waste[t])
@@ -1116,24 +1559,127 @@ def report_numbers(model, d):
             num[(k.id, "end", t)] = single_number(model, model.rm_end[(k.id, t)])
             if k.perishable:
                 num[(k.id, "waste", t)] = single_number(model, model.rm_waste[(k.id, t)])
+    for item, t, q, arr, lt in arrival_streams(model, d):                    # arrival week given an order (L06)
+        if isinstance(arr, (int, np.integer)):
+            num[("arr_fixed", item, t)] = single_number(model, int(arr))
+        else:
+            for w in arrival_candidates(d, item, t, lt):
+                num[("arr_share", item, t, w)] = single_number(model, (q > 0) * (arr <= w), "share", 0.5)
+    if model.detail:
+        num.update(detail_numbers(model, d))
     return num
 
 
-def out_of_sample(skr, d, layout, x, license_file):
+BAND_STATS = ("mean", "p05", "p10", "p25", "p50", "p75", "p90", "p95")
+
+
+def arrival_streams(model, d):
+    """(item, week, order quantity, arrival week, lead time) of every order that can be placed."""
+    out = [(d.fg_id, t, model.prod_qty[t], model.prod_arrival[t], d.prod_lead_time) for t in sorted(model.prod_qty)]
+    for k in d.rms:
+        out += [(k.id, t, model.rm_order[(k.id, t)], model.rm_arrival[(k.id, t)], k.lead_time)
+                for (j, t) in sorted(model.rm_order) if j == k.id]
+    return out
+
+
+def arrival_candidates(d, item, t, lt):
+    """Every week in which an order placed in week t can arrive: t + lead time, or later if an earlier
+    (open) order arrives later (no overtaking, E04)."""
+    opens = d.open_prod if item == d.fg_id else d.open_rm[item]
+    latest = [o["arrival"] if o["certain"] else o["placed"] + int(lt.values.max()) for o in opens]
+    hi = max([t + int(lt.values.max())] + latest)
+    return range(t + int(lt.values.min()), hi + 1)
+
+
+def detail_numbers(model, d):
+    """Single numbers of the report series (L05–L07), read from the out-of-sample model only."""
+    H, det, fg = d.horizon, model.detail, d.fg_id
+    cache, num = {}, {}
+
+    def read(term, kind, thr=0.0):                       # one aggregate per (Term, statistic)
+        key = (id(term), kind, thr) if hasattr(term, "get_value") else (float(term), kind, thr)
+        if key not in cache:
+            cache[key] = single_number(model, term, kind, thr)
+        return cache[key]
+
+    series = []
+    for t in range(1, H + 1):
+        series += [("end_stock", fg, t, model.fg_end[t]), ("waste", fg, t, model.fg_waste[t]),
+                   ("position", fg, t, det[("position", fg, t)]), ("receipts", fg, t, det[("receipts", fg, t)]),
+                   ("order_qty", fg, t, model.prod_qty.get(t, 0.0)), ("rsl_mean", fg, t, det[("rsl_mean", fg, t)])]
+        for k in d.rms:
+            series += [("end_stock", k.id, t, model.rm_end[(k.id, t)]), ("position", k.id, t, det[("position", k.id, t)]),
+                       ("receipts", k.id, t, det[("receipts", k.id, t)]), ("order_qty", k.id, t, model.rm_order.get((k.id, t), 0.0))]
+            if k.perishable:
+                series.append(("waste", k.id, t, model.rm_waste[(k.id, t)]))
+        for ch in d.channels:
+            series += [(name, ch.id, t, det[(name, ch.id, t)]) for name in ("served", "lost", "eligible_next_week")]
+    for name, item, t, term in series:
+        for kind in BAND_STATS:
+            num[("band", name, item, t, kind)] = read(term, kind)
+    for t in range(1, H + 1):
+        num[("band_aux", "rsl_num", fg, t)] = read(det[("rsl_num", fg, t)], "mean")
+        num[("band", "no_stock_share", fg, t, "mean")] = read(det[("no_stock", fg, t)], "share", -0.5)
+    for key, term in det.items():
+        if key[0] == "kpi":
+            for kind in ("mean", "p10", "p90"):
+                num[("kpi",) + key[1:] + (kind,)] = read(term, kind)
+            if key[1] != "avg_end_stock":                # share of scenarios where it happens at all
+                num[("kpi",) + key[1:] + ("share",)] = read(term, "share", 0.5)
+    return num
+
+
+def derived_numbers(oos, d):
+    """After all batches are combined: conditional arrival weeks (exact, from shares) and the stock-weighted
+    mean remaining shelf life (ratio of means). Weeks without any order get no arrival week (nan)."""
+    fg = d.fg_id
+    for (_, item, t) in [k for k in oos if isinstance(k, tuple) and k[0] == "arr_fixed"]:
+        p = oos[("prod" if item == fg else item, "p_order", t)]
+        for kind in BAND_STATS:
+            oos[("band", "arrival_week", item, t, kind)] = oos[("arr_fixed", item, t)] if p > 1e-12 else float("nan")
+    cdf = {}
+    for (_, item, t, w) in [k for k in oos if isinstance(k, tuple) and k[0] == "arr_share"]:
+        cdf.setdefault((item, t), []).append((w, oos[("arr_share", item, t, w)]))
+    for (item, t), pts in cdf.items():
+        p = oos[("prod" if item == fg else item, "p_order", t)]
+        pts.sort()
+        for kind in BAND_STATS:
+            if p <= 1e-12:
+                v = float("nan")
+            elif kind == "mean":
+                v, prev = 0.0, 0.0
+                for w, sh in pts:
+                    v, prev = v + w * (sh - prev) / p, sh
+            else:
+                q = int(kind[1:]) / 100.0
+                v = next((w for w, sh in pts if sh / p >= q - 1e-9), pts[-1][0])
+            oos[("band", "arrival_week", item, t, kind)] = v
+    for t in range(1, d.horizon + 1):
+        if ("band_aux", "rsl_num", fg, t) in oos:
+            stock = oos[("fg_end", t)]
+            oos[("band", "rsl_mean", fg, t, "mean")] = oos[("band_aux", "rsl_num", fg, t)] / stock if stock > 1e-9 else float("nan")
+    for t in range(1, d.review_period + 1):                                  # commit-now notes (v16 keys)
+        for item, key in [(fg, "prod")] + [(k.id, k.id) for k in d.rms]:
+            oos[(key, "arrival", t)] = oos.get(("band", "arrival_week", item, t, "p50"), float("nan"))
+    return oos
+
+
+def out_of_sample(skr, d, layout, x, license_file, detail=True, label="Out-of-sample"):
     """Evaluates decisions x on OUT_OF_SAMPLE_SCENARIOS fresh scenarios (seeds ≠ the optimization seed), in
-    batches of OUT_OF_SAMPLE_BATCH. Means and shares are combined exactly; P10/P90 are batch averages."""
+    batches of OUT_OF_SAMPLE_BATCH. Means and shares are combined exactly; quantiles are batch averages.
+    detail=True also reads the report series of L05–L07 (Bands, KPIs)."""
     sizes = [min(OUT_OF_SAMPLE_BATCH, OUT_OF_SAMPLE_SCENARIOS - s) for s in range(0, OUT_OF_SAMPLE_SCENARIOS, OUT_OF_SAMPLE_BATCH)]
     total = {}
     for b, n in enumerate(sizes):
-        with phase(f"6. Out-of-sample batch {b + 1}/{len(sizes)}: build + evaluate on {n:,} fresh scenarios"):
+        with phase(f"6. {label} batch {b + 1}/{len(sizes)}: build + evaluate on {n:,} fresh scenarios"):
             env = new_env(skr, license_file, n, 0.0)
-            model = build_model(skr, env, d, layout, x, d.seed + 1 + b, n)
+            model = build_model(skr, env, d, layout, x, d.seed + 1 + b, n, detail=detail)
             readers = report_numbers(model, d)
             env.evaluate()
             for key, read in readers.items():
                 total[key] = total.get(key, 0.0) + read() * n
             env.end()
-    oos = {key: v / sum(sizes) for key, v in total.items()}
+    oos = derived_numbers({key: v / sum(sizes) for key, v in total.items()}, d)
     oos["n"] = sum(sizes)
     odd = [k for k in oos if isinstance(k, tuple) and k[1] == "p10" and oos[k] > oos[(k[0], "p90", k[2])] + 1e-6]
     if odd:                                                  # plausibility gate on Seeker's quantile convention
@@ -1144,7 +1690,7 @@ def out_of_sample(skr, d, layout, x, license_file):
 # ============================================================================
 # 7. REPORT — results workbook and console summary (only formatting; all numbers come from Seeker)
 # ============================================================================
-def build_report(d, layout, x, ins, oos):
+def build_report(d, layout, x, ins, oos, oos_start=None):
     pol = layout.decode(x)
     H, R = d.horizon, d.review_period
     weeks = list(range(1, H + 1))
@@ -1230,12 +1776,70 @@ def build_report(d, layout, x, ins, oos):
     summ += [("Feasibility check (section 4b)", ins.get("feasibility", "not run")),
              ("Constraints met in-sample", f"{ins['met']} of {n_con} (start policy {ins['start']['met']})"),
              ("Constraints met out-of-sample", f"{oos_met} of {n_con}"),
-             ("Reorder points at their upper bound", bound_note(layout, x))]
+             ("Reorder points at their upper bound", bound_note(layout, x)),
+             ("Run overrides (K20)", ", ".join(f"{k} = {v}" for k, v in getattr(d, "overrides", None).items())
+              if getattr(d, "overrides", None) else "none"),
+             ("Data warnings (input checks, K19)", "; ".join(getattr(d, "warnings", None) or []) or "none")]
     summ += [(f"Time: {n}", round(t, 1)) for n, t in TIMINGS]
+    bands, kpis = band_and_kpi_tables(d, ins, oos, oos_start)
     return {"Summary": pd.DataFrame(summ, columns=["Item", "Value"]),
             "Commit_Now": pd.DataFrame(commit, columns=["When", "Decision", "Quantity / rule", "Note"]),
             "Policy_sS": pd.DataFrame(pol_rows), "Decisions": pd.DataFrame(dec_rows),
-            "FillRates": pd.DataFrame(fr_rows), "Stock_Waste": pd.DataFrame(sw)}
+            "FillRates": pd.DataFrame(fr_rows), "Stock_Waste": pd.DataFrame(sw),
+            "Bands": bands, "KPIs": kpis}
+
+
+BAND_SERIES = ("end_stock", "position", "waste", "order_qty", "arrival_week", "receipts", "served", "lost",
+               "eligible_next_week", "rsl_mean", "no_stock_share")
+
+
+def band_and_kpi_tables(d, ins, oos, oos_start=None):
+    """Sheets Bands (L05/L06: every weekly series as mean + P05…P95 over the fresh scenarios, long format)
+    and KPIs (L07: totals per scenario, mean + P10/P90; shares; L08: the start policy on the same seeds)."""
+    cols = ["Mean", "P05", "P10", "P25", "P50", "P75", "P90", "P95"]
+    order = {n: i for i, n in enumerate(BAND_SERIES)}
+    keys = sorted({k[1:4] for k in oos if isinstance(k, tuple) and k[0] == "band"},
+                  key=lambda k: (order.get(k[0], 99), k[1] != d.fg_id, k[1], k[2]))
+    rows = [[name, item, t] + [oos.get(("band", name, item, t, s), float("nan")) for s in BAND_STATS]
+            for name, item, t in keys]
+    bands = pd.DataFrame(rows, columns=["Series", "Item", "Week"] + cols)
+    H, fg, u = d.horizon, d.fg_id, getattr(d, "uom", None) or {}
+    t0 = 1 + d.prod_lead_time.min if d.enforce_from_first_controllable else 1
+    k_rows = []
+
+    def add(label, unit, key, share_only=False):
+        if ("kpi",) + key + ("mean",) not in oos and not share_only:
+            return
+        if share_only:
+            k_rows.append([label, "share of scenarios", oos.get(("kpi",) + key + ("share",), float("nan")), None, None])
+        else:
+            k_rows.append([label, unit] + [oos[("kpi",) + key + (s,)] for s in ("mean", "p10", "p90")])
+    add(f"Average end stock {fg}, weeks 1–{H}", u.get(fg, ""), ("avg_end_stock", fg))
+    for k in d.rms:
+        add(f"Average end stock {k.id}, weeks 1–{H}", u.get(k.id, ""), ("avg_end_stock", k.id))
+    add(f"Total waste {fg}, weeks 1–{H}", u.get(fg, ""), ("waste", fg))
+    for k in d.rms:
+        if k.perishable:
+            add(f"Total waste {k.id}, weeks 1–{H}", u.get(k.id, ""), ("waste", k.id))
+    for ch in d.channels:
+        if t0 > 1:
+            add(f"Lost sales {ch.id}, weeks 1–{t0 - 1} (initial state, no decision can change them)", u.get(fg, ""),
+                ("lost_initial_weeks", ch.id))
+        add(f"Lost sales {ch.id}, weeks {t0}–{H} (weeks with fill-rate rules)", u.get(fg, ""), ("lost_controllable_weeks", ch.id))
+    add(f"Scenarios with any {fg} waste", "", ("waste", fg), share_only=True)
+    for ch in d.channels:
+        if t0 > 1:
+            add(f"Scenarios with lost sales {ch.id}, weeks 1–{t0 - 1}", "", ("lost_initial_weeks", ch.id), share_only=True)
+        add(f"Scenarios with lost sales {ch.id}, weeks {t0}–{H}", "", ("lost_controllable_weeks", ch.id), share_only=True)
+    if oos_start is not None:
+        con = ins["constrained"]
+        met = lambda o: sum(o[("fr_share", ci, t)] >= d.chance_level - EPS for ci, t in con)
+        k_rows += [["Start policy: expected total cost (same fresh seeds)", "currency", oos_start["cost"], None, None],
+                   ["Start policy: fill-rate rules met (same fresh seeds)", f"of {len(con)}", met(oos_start), None, None],
+                   ["Optimized policy: fill-rate rules met (fresh)", f"of {len(con)}", met(oos), None, None],
+                   ["Saving vs. start policy (fresh, same seeds)", "share",
+                    1 - oos["cost"] / oos_start["cost"] if oos_start["cost"] else float("nan"), None, None]]
+    return bands, pd.DataFrame(k_rows, columns=["Item", "Unit", "Mean", "P10", "P90"])
 
 
 def write_report(sheets, path):
@@ -1284,19 +1888,45 @@ class RunResult:
     oos: dict                # out-of-sample numbers (section 6)
     sheets: dict             # report tables {sheet name: DataFrame} (section 7)
     timings: list            # [(phase, seconds)]
+    overrides: dict = None   # run overrides that were applied (K20)
+    oos_start: dict = None   # start policy on the same fresh seeds (START_POLICY_OUT_OF_SAMPLE, L08)
 
 
-def run(data_file=None, license_file=None, time_limit=None, skr=None):
+OVERRIDES = {"NumScenarios": ("n_scenarios", 1), "RandomSeed": ("seed", 0)}   # run override → field, minimum
+
+
+def apply_overrides(d, overrides):
+    """Run options that replace Excel settings for one run (K20). Applied before validate(), so they are checked."""
+    bad = []
+    for k, v in (overrides or {}).items():
+        if k not in OVERRIDES:
+            bad.append(f"unknown run override {k} (allowed: {', '.join(OVERRIDES)})")
+        elif not (isinstance(v, (int, np.integer)) or (isinstance(v, float) and v.is_integer())) or v < OVERRIDES[k][1]:
+            bad.append(f"run override {k} must be a whole number ≥ {OVERRIDES[k][1]}")
+        else:
+            setattr(d, OVERRIDES[k][0], int(v))
+    if bad:
+        raise ValueError("Data validation failed:\n  - " + "\n  - ".join(bad))
+    d.overrides = {k: int(v) for k, v in overrides.items()} if overrides else None
+
+
+def run(data_file=None, license_file=None, time_limit=None, skr=None, overrides=None):
     """Sections 1 → 7 without writing files. Settings come from section 0; arguments override the files and
-    the time limit. Raises ValueError (invalid data; the message lists every problem), FileNotFoundError
-    (data or license file) and ImportError (Seeker not installed). Progress is printed to stdout."""
+    the time limit; overrides = {"NumScenarios": int, "RandomSeed": int} replaces those Excel settings for this
+    run (K20). Raises ValueError (invalid data; the message lists every problem), FileNotFoundError (data or
+    license file) and ImportError (Seeker not installed). Progress is printed to stdout."""
     data_file, license_file = data_file or DATA_FILE, license_file or LICENSE_FILE
     TIMINGS.clear()
     if not Path(data_file).exists():
         raise FileNotFoundError(f"Data file not found: {data_file}  (set DATA_FILE in section 0)")
     with phase(f"1. Reading and checking {Path(data_file).name}"):
         d = load_data(data_file)
+        apply_overrides(d, overrides)
         validate(d)
+    if d.warnings:
+        print("Data warnings: " + "; ".join(d.warnings), flush=True)
+    if d.overrides:
+        print("Run overrides: " + ", ".join(f"{k} = {v}" for k, v in d.overrides.items()), flush=True)
     layout = PolicyLayout(d)                                                   # section 2
     time_limit = float(time_limit or TIME_LIMIT_SECONDS or d.time_limit)
     print(f"Data OK: horizon {d.horizon} weeks, {len(d.channels)} channels, {len(d.rms)} raw materials, "
@@ -1317,8 +1947,10 @@ def run(data_file=None, license_file=None, time_limit=None, skr=None):
     if layout.at_bound(x):
         print(f"NOTE: reorder point(s) at their upper bound: {bound_note(layout, x)}", flush=True)
     oos = out_of_sample(skr, d, layout, x, license_file)                       # section 6
-    sheets = build_report(d, layout, x, ins, oos)                              # section 7
-    return RunResult(d, layout, x, layout.decode(x), ins, oos, sheets, list(TIMINGS))
+    oos_start = out_of_sample(skr, d, layout, x0, license_file, detail=False, label="Start policy, out-of-sample") \
+        if START_POLICY_OUT_OF_SAMPLE else None
+    sheets = build_report(d, layout, x, ins, oos, oos_start)                   # section 7
+    return RunResult(d, layout, x, layout.decode(x), ins, oos, sheets, list(TIMINGS), d.overrides, oos_start)
 
 
 def main():
