@@ -661,6 +661,11 @@
      "test_double": {
       "type": "boolean",
       "title": "Test Double"
+     },
+     "restart_needed": {
+      "type": "boolean",
+      "title": "Restart Needed",
+      "default": false
      }
     },
     "type": "object",

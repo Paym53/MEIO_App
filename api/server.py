@@ -56,6 +56,7 @@ HOST, PORT = "127.0.0.1", int(os.environ.get("MEIO_PORT", "8000"))        # loca
 WORKER = ROOT / "api" / "worker.py"
 ENGINE_FILE = ROOT / "engine" / "meio_seeker_stochastic.py"
 OPENAPI_FILE = ROOT / "api" / "openapi.json"
+CODE_FILES = (ROOT / "api" / "server.py", WORKER, ENGINE_FILE)            # changed on disk → the API needs a restart
 MIN_TOKEN_LENGTH = 32
 MAX_UPLOAD_MB = 20
 DEFAULT_TIME_LIMIT, MAX_TIME_LIMIT = 250, 3600                             # Seeker search time [s]
@@ -135,6 +136,14 @@ def update_status(folder, **fields):
     status.update(fields)
     write_json(Path(folder) / "status.json", status)
     return status
+
+
+def code_stamp():
+    """Modification times of the app's code. The API loads its code once; after a pull it must be restarted."""
+    return tuple(f.stat().st_mtime_ns if f.exists() else None for f in CODE_FILES)
+
+
+STARTED_WITH = code_stamp()
 
 
 def new_run_id():
@@ -286,6 +295,7 @@ class Health(BaseModel):
     busy: bool
     current_run: str | None
     test_double: bool
+    restart_needed: bool = False          # the app's code changed on disk (an update was pulled): restart the API
 
 
 class Table(BaseModel):
@@ -426,7 +436,7 @@ def health():
     m = re.search(r'^SCRIPT_VERSION = "(.+)"', src, re.M)                  # read as text: never import the engine
     return Health(status="ok", engine_version=m.group(1) if m else None, license_found=LICENSE_FILE.exists(),
                   busy=busy(), current_run=CURRENT["id"] if busy() else None,
-                  test_double=os.environ.get("MEIO_TEST_DOUBLE") == "1")
+                  test_double=os.environ.get("MEIO_TEST_DOUBLE") == "1", restart_needed=code_stamp() != STARTED_WITH)
 
 
 @app.post("/validate", response_model=Validation)
