@@ -328,6 +328,10 @@ lint, build) **and** the full UI test suite, added together once all screens exi
   Decisions.Status ("—" otherwise); units from KPIs "Average end stock <item>," Unit; arrival from Bands
   arrival_week ("never ordered" when empty); grey only rows where every "<point> active" is "fixed 0".
 - Run dialog: optional form fields never sent when empty (null, undefined or "").
+- Inventory: s/S only on Bands series "position"; served/lost/eligible_next_week read per channel (Item = channel id);
+  units from the engine; no_stock_share = Mean only.
+- Master data: demand bands by level position in demand.quantiles[channel][week][level] (Q05–Q95, Q25–Q75, Q45–Q55,
+  no median); lead-time bars pair lead_time.weeks[i] with probabilities[i].
 
 **Decisions 08.11. (user):** single user (one token, no per-user login); no floating assistant; order of work:
 **engine v17 first → API update → Lovable prompts** (build pack v2: Knowledge rules A–J, design-shell Prompt A, page
@@ -379,7 +383,9 @@ dialog; Overview; Decisions + Orders; Inventory; Master data + Solver settings; 
 Explainability with verbatim texts), credit-saving: one API read in prompt 1, no Lovable tests, small fixes by Claude
 via PRs in the dashboard repo (user must not prompt Lovable while such a PR is open). Prompt 1 ≈ 10 credits.
 Prompts 1–4 done and checked by the user; review fixes: dashboard PR #1 (Policy_sS lookup, invented badge fallback,
-units, (s,S) greying) merged. Next: prompt 5 (Inventory).
+units, (s,S) greying) merged. Prompt 5 (Inventory) → fix PR #2 (series "position", per-channel flows, units) merged.
+Prompt 6 (Master data + Solver settings) → fix PR #3 (demand quantile layout, lead-time pairs). Lovable keeps guessing
+field names: the fixes always come from the real /input and result layouts (worker.describe_input, engine sheets).
 **API update 2 (next, before the Master data / scenario screens):** what-if edits written into a copy of the
 uploaded workbook (openpyxl, values only; engine K19 checks it), with an original-vs-changed list per run.
 
