@@ -29,4 +29,4 @@ addopts = "-q -p no:cacheprovider --cov=api --cov-report=term-missing:skip-cover
 
 [tool.coverage.run]
 patch = ["subprocess"]               # also measure the worker processes the server starts
-omit = ["api/test_api.py"]
+omit = ["*/api/test_api.py"]       # pattern, not a relative path: worker and .bat tests start Python in other folders
