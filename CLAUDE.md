@@ -354,6 +354,14 @@ improvement path (5,126 → 112,013.35; 6,282 → 111,783.95). Already in v16, s
   `cost_parts_out_of_sample` (`ins["parts"]`, `oos[("part", n)]`); new `run_info` (product, horizon, review period,
   `first_rule_week`, start date, time limit, scenarios, seed, chance levels, fresh scenarios, switches, overrides,
   warnings); sheets incl. `Bands` and `KPIs` passed through unchanged.
+**Verified 08.11. on the user's PC:** 168 tests pass on Windows (9 min); a real run through API v2 with NumScenarios
+100 (the `/docs` page pre-fills optional form fields, so it sent overrides): €107,695 and 86/90 on fresh scenarios, 372 s
+(vs €112,128 and 88/90 at 200 scenarios: cheaper because it meets fewer rules, so not comparable; AC4). The estimate
+ignores NumScenarios (feasibility and build scale with it): fine for now. For default runs without the UI, use
+`curl.exe -F file=@…` instead of `/docs`.
+**Restart after a pull:** the API loads its code once; a pull while it runs left the old server calling the new worker
+with old arguments (08.11.). Now `/health` returns `restart_needed` (mtimes of server.py, worker.py and the engine
+changed since start) and the worker answers an old-style call with "restart start_worker.bat".
 **API update 2 (next, before the Master data / scenario screens):** what-if edits written into a copy of the
 uploaded workbook (openpyxl, values only; engine K19 checks it), with an original-vs-changed list per run.
 

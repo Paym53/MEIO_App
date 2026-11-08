@@ -99,6 +99,8 @@ The API runs on your PC; ngrok gives it a fixed internet address so the web app 
   `https://<your domain>/docs` → *Authorize* with your token → `GET /health` → *Execute* shows `"status": "ok"`.
 - **Use on this PC only:** leave `NGROK_DOMAIN` empty; the API is then at http://127.0.0.1:8000/docs.
 - **Stop:** press Ctrl+C in the API window (answer `Y`), then close the "MEIO tunnel" window.
+- **After pulling an update:** stop both windows and start `start_worker.bat` again. The API loads its code once at
+  start; `/health` shows `"restart_needed": true` (and the web app's status badge says so) until you restart.
 
 The `/docs` page is visible to anyone who knows the address, but it only describes the API: every action needs the token.
 Each run is kept in `runs\<id>\` (input, log, results; gitignored).

@@ -322,7 +322,7 @@ def test_unknown_or_malformed_run_ids_are_not_found(api):
 def test_health_reports_engine_license_and_test_double(api, monkeypatch, tmp_path):
     h = api.get("/health").json()
     assert h == {"status": "ok", "engine_version": te.ms.SCRIPT_VERSION, "license_found": True, "busy": False,
-                 "current_run": None, "test_double": True}
+                 "current_run": None, "test_double": True, "restart_needed": False}
     monkeypatch.setattr(server, "LICENSE_FILE", tmp_path / "missing.sio")
     assert api.get("/health").json()["license_found"] is False
     run_id = start(api)
@@ -614,3 +614,21 @@ def start_with(client, form):
     r = client.post("/runs", files=upload(TEMPLATE), data={"time_limit": "1", **form})
     assert r.status_code == 202, r.text
     return r.json()["id"]
+
+
+def test_health_says_when_the_api_needs_a_restart_after_an_update(api, monkeypatch, tmp_path):
+    code = tmp_path / "server.py"
+    code.write_text("v1", encoding="utf-8")
+    monkeypatch.setattr(server, "CODE_FILES", (code,))
+    monkeypatch.setattr(server, "STARTED_WITH", server.code_stamp())
+    assert api.get("/health").json()["restart_needed"] is False
+    os.utime(code, ns=(code.stat().st_atime_ns, code.stat().st_mtime_ns + 10**9))     # an update was pulled
+    assert api.get("/health").json()["restart_needed"] is True
+
+
+def test_a_worker_called_the_old_way_tells_the_user_to_restart(tmp_path, capsys):
+    folder = tmp_path / "run"
+    folder.mkdir()
+    assert worker.main(["run", str(folder), "lic", "250"], {worker.TEST_DOUBLE_ENV: "1"}) == worker.EXIT_FAILED
+    assert "start_worker.bat again" in capsys.readouterr().err
+    assert "restart" in json.loads((folder / "status.json").read_text(encoding="utf-8"))["message"]

@@ -315,6 +315,11 @@ def main(argv, environ):
             set_status(argv[1], state="failed", message=f"Unexpected error: {type(e).__name__}: {e}", errors=[])
             return EXIT_FAILED
     print(__doc__, file=sys.stderr)
+    if argv and argv[0] == "run" and len(argv) >= 2:      # an API started before an update calls the old way
+        print("The API that started this worker is older than the worker (an update was pulled while it was "
+              "running). Close both windows and start start_worker.bat again.", file=sys.stderr)
+        set_status(argv[1], state="failed", errors=[], message="The API needs a restart after the last update: "
+                   "close both windows and start start_worker.bat again.")
     return EXIT_FAILED
 
 
