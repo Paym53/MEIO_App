@@ -2,7 +2,7 @@
  "openapi": "3.1.0",
  "info": {
   "title": "MEIO local API",
-  "version": "1"
+  "version": "2"
  },
  "paths": {
   "/health": {
@@ -101,7 +101,7 @@
    },
    "post": {
     "summary": "Create Run",
-    "description": "Starts an optimization run in the background (refused while another run is in progress).",
+    "description": "Starts an optimization run in the background (refused while another run is in progress).\nnum_scenarios / random_seed replace the Excel NumScenarios / RandomSeed for this run only (engine rule K20);\noptimization_chance_level may only be equal to or stricter than the Excel FillRateChanceLevel.",
     "operationId": "create_run_runs_post",
     "requestBody": {
      "content": {
@@ -185,12 +185,110 @@
       }
      }
     }
+   },
+   "patch": {
+    "summary": "Label Run",
+    "description": "Sets the run's label and/or note (shown in the history and the scenario comparison).",
+    "operationId": "label_run_runs__run_id__patch",
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ],
+    "parameters": [
+     {
+      "name": "run_id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "title": "Run Id"
+      }
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/RunLabel"
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/RunSummary"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Validation Error",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/runs/{run_id}/input": {
+   "get": {
+    "summary": "Get Input",
+    "description": "The master data of the run's workbook, exactly as the engine read it.",
+    "operationId": "get_input_runs__run_id__input_get",
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ],
+    "parameters": [
+     {
+      "name": "run_id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "title": "Run Id"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/InputData"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Validation Error",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      }
+     }
+    }
    }
   },
   "/runs/{run_id}/result": {
    "get": {
     "summary": "Get Result",
-    "description": "Everything the engine reported, as JSON: the headline and the six result tables.",
+    "description": "Everything the engine reported, as JSON: headline, run info and the eight result tables.",
     "operationId": "get_result_runs__run_id__result_get",
     "security": [
      {
@@ -330,6 +428,73 @@
       "minimum": 1.0,
       "title": "Time Limit",
       "default": 250
+     },
+     "out_of_sample_scenarios": {
+      "type": "integer",
+      "maximum": 20000.0,
+      "minimum": 500.0,
+      "title": "Out Of Sample Scenarios",
+      "default": 2500
+     },
+     "feasibility_check": {
+      "type": "boolean",
+      "title": "Feasibility Check",
+      "default": true
+     },
+     "start_policy_out_of_sample": {
+      "type": "boolean",
+      "title": "Start Policy Out Of Sample",
+      "default": false
+     },
+     "optimization_chance_level": {
+      "anyOf": [
+       {
+        "type": "number",
+        "exclusiveMaximum": 1.0,
+        "exclusiveMinimum": 0.0
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Optimization Chance Level"
+     },
+     "num_scenarios": {
+      "anyOf": [
+       {
+        "type": "integer",
+        "maximum": 2000.0,
+        "minimum": 1.0
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Num Scenarios"
+     },
+     "random_seed": {
+      "anyOf": [
+       {
+        "type": "integer",
+        "minimum": 0.0
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Random Seed"
+     },
+     "label": {
+      "type": "string",
+      "maxLength": 80,
+      "title": "Label",
+      "default": ""
+     },
+     "note": {
+      "type": "string",
+      "maxLength": 1000,
+      "title": "Note",
+      "default": ""
      }
     },
     "type": "object",
@@ -406,6 +571,24 @@
       "type": "number",
       "title": "Start Policy Cost"
      },
+     "saving_vs_start_in_sample": {
+      "type": "number",
+      "title": "Saving Vs Start In Sample"
+     },
+     "cost_parts_in_sample": {
+      "additionalProperties": {
+       "type": "number"
+      },
+      "type": "object",
+      "title": "Cost Parts In Sample"
+     },
+     "cost_parts_out_of_sample": {
+      "additionalProperties": {
+       "type": "number"
+      },
+      "type": "object",
+      "title": "Cost Parts Out Of Sample"
+     },
      "scenarios_in_sample": {
       "type": "integer",
       "title": "Scenarios In Sample"
@@ -430,6 +613,9 @@
      "cost_in_sample",
      "rules_met_in_sample",
      "start_policy_cost",
+     "saving_vs_start_in_sample",
+     "cost_parts_in_sample",
+     "cost_parts_out_of_sample",
      "scenarios_in_sample",
      "scenarios_out_of_sample",
      "seeker_status"
@@ -488,6 +674,144 @@
     ],
     "title": "Health"
    },
+   "InputData": {
+    "properties": {
+     "settings": {
+      "$ref": "#/components/schemas/InputSettings"
+     },
+     "product": {
+      "additionalProperties": true,
+      "type": "object",
+      "title": "Product"
+     },
+     "raw_materials": {
+      "items": {
+       "additionalProperties": true,
+       "type": "object"
+      },
+      "type": "array",
+      "title": "Raw Materials"
+     },
+     "channels": {
+      "items": {
+       "additionalProperties": true,
+       "type": "object"
+      },
+      "type": "array",
+      "title": "Channels"
+     },
+     "demand": {
+      "additionalProperties": true,
+      "type": "object",
+      "title": "Demand"
+     },
+     "initial_stock": {
+      "additionalProperties": {
+       "items": {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       "type": "array"
+      },
+      "type": "object",
+      "title": "Initial Stock"
+     },
+     "open_orders": {
+      "additionalProperties": {
+       "items": {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       "type": "array"
+      },
+      "type": "object",
+      "title": "Open Orders"
+     },
+     "warnings": {
+      "items": {
+       "type": "string"
+      },
+      "type": "array",
+      "title": "Warnings"
+     },
+     "tables": {
+      "additionalProperties": {
+       "$ref": "#/components/schemas/Table"
+      },
+      "type": "object",
+      "title": "Tables"
+     }
+    },
+    "type": "object",
+    "required": [
+     "settings",
+     "product",
+     "raw_materials",
+     "channels",
+     "demand",
+     "initial_stock",
+     "open_orders",
+     "warnings",
+     "tables"
+    ],
+    "title": "InputData",
+    "description": "The master data exactly as the engine read it from the workbook (rows and fields named as in the template)."
+   },
+   "InputSettings": {
+    "properties": {
+     "horizon_weeks": {
+      "type": "integer",
+      "title": "Horizon Weeks"
+     },
+     "review_period_weeks": {
+      "type": "integer",
+      "title": "Review Period Weeks"
+     },
+     "start_date": {
+      "type": "string",
+      "title": "Start Date"
+     },
+     "chance_level": {
+      "type": "number",
+      "title": "Chance Level"
+     },
+     "scenarios": {
+      "type": "integer",
+      "title": "Scenarios"
+     },
+     "random_seed": {
+      "type": "integer",
+      "title": "Random Seed"
+     },
+     "time_limit_seconds": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Time Limit Seconds"
+     },
+     "rules_from_first_controllable_week": {
+      "type": "boolean",
+      "title": "Rules From First Controllable Week"
+     }
+    },
+    "type": "object",
+    "required": [
+     "horizon_weeks",
+     "review_period_weeks",
+     "start_date",
+     "chance_level",
+     "scenarios",
+     "random_seed",
+     "time_limit_seconds",
+     "rules_from_first_controllable_week"
+    ],
+    "title": "InputSettings"
+   },
    "MissedRule": {
     "properties": {
      "channel": {
@@ -537,6 +861,9 @@
      "headline": {
       "$ref": "#/components/schemas/Headline"
      },
+     "run_info": {
+      "$ref": "#/components/schemas/RunInfo"
+     },
      "sheets": {
       "additionalProperties": {
        "$ref": "#/components/schemas/Table"
@@ -569,10 +896,144 @@
      "seeker_version",
      "test_double",
      "headline",
+     "run_info",
      "sheets",
      "timings"
     ],
     "title": "Result"
+   },
+   "RunInfo": {
+    "properties": {
+     "product_id": {
+      "type": "string",
+      "title": "Product Id"
+     },
+     "horizon_weeks": {
+      "type": "integer",
+      "title": "Horizon Weeks"
+     },
+     "review_period_weeks": {
+      "type": "integer",
+      "title": "Review Period Weeks"
+     },
+     "first_rule_week": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "First Rule Week"
+     },
+     "start_date": {
+      "type": "string",
+      "title": "Start Date"
+     },
+     "time_limit_seconds": {
+      "type": "number",
+      "title": "Time Limit Seconds"
+     },
+     "scenarios_in_sample": {
+      "type": "integer",
+      "title": "Scenarios In Sample"
+     },
+     "random_seed": {
+      "type": "integer",
+      "title": "Random Seed"
+     },
+     "chance_level": {
+      "type": "number",
+      "title": "Chance Level"
+     },
+     "optimization_chance_level": {
+      "type": "number",
+      "title": "Optimization Chance Level"
+     },
+     "scenarios_out_of_sample": {
+      "type": "integer",
+      "title": "Scenarios Out Of Sample"
+     },
+     "feasibility_check": {
+      "type": "boolean",
+      "title": "Feasibility Check"
+     },
+     "start_policy_out_of_sample": {
+      "type": "boolean",
+      "title": "Start Policy Out Of Sample"
+     },
+     "overrides": {
+      "anyOf": [
+       {
+        "additionalProperties": {
+         "type": "integer"
+        },
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Overrides"
+     },
+     "warnings": {
+      "items": {
+       "type": "string"
+      },
+      "type": "array",
+      "title": "Warnings"
+     }
+    },
+    "type": "object",
+    "required": [
+     "product_id",
+     "horizon_weeks",
+     "review_period_weeks",
+     "first_rule_week",
+     "start_date",
+     "time_limit_seconds",
+     "scenarios_in_sample",
+     "random_seed",
+     "chance_level",
+     "optimization_chance_level",
+     "scenarios_out_of_sample",
+     "feasibility_check",
+     "start_policy_out_of_sample",
+     "overrides",
+     "warnings"
+    ],
+    "title": "RunInfo"
+   },
+   "RunLabel": {
+    "properties": {
+     "label": {
+      "anyOf": [
+       {
+        "type": "string",
+        "maxLength": 80
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Label"
+     },
+     "note": {
+      "anyOf": [
+       {
+        "type": "string",
+        "maxLength": 1000
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Note"
+     }
+    },
+    "type": "object",
+    "title": "RunLabel"
    },
    "RunStatus": {
     "properties": {
@@ -623,6 +1084,40 @@
       "type": "boolean",
       "title": "Test Double",
       "default": false
+     },
+     "settings": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Settings"
+     },
+     "file": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "File"
+     },
+     "label": {
+      "type": "string",
+      "title": "Label",
+      "default": ""
+     },
+     "note": {
+      "type": "string",
+      "title": "Note",
+      "default": ""
      },
      "errors": {
       "items": {
@@ -725,6 +1220,40 @@
       "type": "boolean",
       "title": "Test Double",
       "default": false
+     },
+     "settings": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Settings"
+     },
+     "file": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "File"
+     },
+     "label": {
+      "type": "string",
+      "title": "Label",
+      "default": ""
+     },
+     "note": {
+      "type": "string",
+      "title": "Note",
+      "default": ""
      }
     },
     "type": "object",
@@ -775,6 +1304,24 @@
       },
       "type": "array",
       "title": "Errors"
+     },
+     "warnings": {
+      "items": {
+       "type": "string"
+      },
+      "type": "array",
+      "title": "Warnings",
+      "default": []
+     },
+     "input": {
+      "anyOf": [
+       {
+        "$ref": "#/components/schemas/InputData"
+       },
+       {
+        "type": "null"
+       }
+      ]
      }
     },
     "type": "object",

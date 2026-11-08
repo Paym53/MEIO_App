@@ -5,23 +5,25 @@
 Started by api/server.py, never imported by it. This is the ONLY app file that imports the engine.
 
   python -u api/worker.py validate <input.xlsx> <answer.json>
-  python -u api/worker.py run <run folder> <license file> <time limit [s]>
+  python -u api/worker.py run <run folder> <license file>          (settings in <run folder>/request.json)
 
-  validate : engine.load_data() + engine.validate()  → answer.json {"valid", "errors"}
-  run      : engine.run()                            → result.json (the API's result contract)
+  validate : engine.load_data() + engine.validate()  → answer.json {"valid", "errors", "warnings", "input"}
+  run      : engine.load_data()                      → input.json   (the master data as the engine reads it)
+             engine.run()                            → result.json  (the API's result contract)
                                                        results.xlsx (the engine's own workbook, engine.write_report)
                                                        status.json  (done / invalid / failed)
 Everything printed (engine phase lines, Seeker progress) goes to the run's log.txt, which the server streams.
 
-Every number in result.json is copied from the engine's RunResult; nothing is recomputed (CLAUDE.md §2).
+Every number in input.json and result.json is copied from the engine; nothing is recomputed (CLAUDE.md §2).
 
-  0. SETTINGS ........ where the engine lives; the test-double switch
+  0. SETTINGS ........ where the engine lives; the test-double switch; run settings → engine constants
   1. ENGINE .......... import the engine (and, for tests only, the Seeker test double)
   2. DATA SOURCE ..... where the input workbook comes from (Excel now; a database later)
   3. VALIDATE ........ data checks only
-  4. RESULT .......... RunResult → result.json (contract version 1)
-  5. RUN ............. the whole engine pipeline for one run folder
-  6. MAIN
+  4. INPUT ........... the master data as the engine read it → JSON (Master data page)
+  5. RESULT .......... RunResult → result.json (contract version 2)
+  6. RUN ............. the whole engine pipeline for one run folder
+  7. MAIN
 ================================================================================
 """
 import datetime as dt
@@ -40,8 +42,14 @@ import numpy as np
 # ============================================================================
 ENGINE_DIR = Path(__file__).resolve().parent.parent / "engine"
 TEST_DOUBLE_ENV = "MEIO_TEST_DOUBLE"      # "1" = use the Seeker test double from engine/test_engine.py (tests only!)
-RESULT_CONTRACT_VERSION = 1               # bump on any change to the result.json layout (and to api/openapi.json)
+RESULT_CONTRACT_VERSION = 2               # bump on any change to the result.json layout (and to api/openapi.json)
 EXIT_DONE, EXIT_FAILED, EXIT_INVALID = 0, 1, 2
+# run setting (request.json) → engine module constant (CLAUDE.md §6 "Settings"); None = keep the engine's default
+SETTING_CONSTANTS = {"out_of_sample_scenarios": "OUT_OF_SAMPLE_SCENARIOS",
+                     "feasibility_check": "FEASIBILITY_CHECK",
+                     "start_policy_out_of_sample": "START_POLICY_OUT_OF_SAMPLE",
+                     "optimization_chance_level": "OPTIMIZATION_CHANCE_LEVEL"}
+RAW_TABLES = ("Locations", "Lanes", "Items", "Model_Assumptions")   # template sheets shown as they are
 
 
 # ============================================================================
@@ -79,27 +87,28 @@ def error_lines(exc):
 
 def validate(engine, path):
     try:
-        engine.validate(engine.load_data(str(path)))
+        d = engine.load_data(str(path))
+        engine.validate(d)
     except ValueError as e:
-        return {"valid": False, "errors": error_lines(e)}
+        return {"valid": False, "errors": error_lines(e), "warnings": [], "input": None}
     except Exception as e:  # noqa: BLE001 — any unreadable workbook is a data problem for the user
-        return {"valid": False,
+        return {"valid": False, "warnings": [], "input": None,
                 "errors": [f"The workbook could not be read as the MEIO template: {type(e).__name__}: {e}"]}
-    return {"valid": True, "errors": []}
+    return {"valid": True, "errors": [], "warnings": list(d.warnings or []), "input": describe_input(engine, d, path)}
 
 
 # ============================================================================
-# 4. RESULT — RunResult → result.json. Copies only; the comments name the engine source of every field.
+# 4. INPUT — the master data exactly as engine.load_data() read it (copies only)
 # ============================================================================
 def cell(v):
-    """One table cell as plain JSON (numbers exact, dates ISO, missing = null)."""
+    """One value as plain JSON (numbers exact, dates ISO, missing or infinite = null)."""
     if isinstance(v, (bool, np.bool_)):
         return bool(v)
     if isinstance(v, (int, np.integer)):
         return int(v)
     if isinstance(v, (float, np.floating)):
-        return None if math.isnan(v) else float(v)
-    if isinstance(v, (dt.date, dt.datetime)):
+        return float(v) if math.isfinite(v) else None
+    if isinstance(v, (dt.datetime, dt.date)):
         return v.isoformat()
     return None if v is None else str(v)
 
@@ -109,6 +118,64 @@ def table(df):
             "rows": [[cell(v) for v in row] for row in df.itertuples(index=False)]}
 
 
+def lead_time(lt):
+    return {"weeks": [cell(v) for v in lt.values], "probabilities": [cell(p) for p in lt.probs]}
+
+
+def tiers(t):
+    """Cost tiers; "to": null = no upper limit."""
+    if t is None:
+        return None
+    rows = zip(t.froms, t.tos, t.costs, strict=True)
+    return {"mode": t.mode, "tiers": [{"from": cell(f), "to": cell(to), "cost_per_unit": cell(c)} for f, to, c in rows]}
+
+
+def lots(pairs):
+    return [{"remaining_shelf_life": cell(a), "quantity": cell(q)} for a, q in pairs]
+
+
+def orders(rows):
+    return [{k: cell(v) for k, v in o.items()} for o in rows]
+
+
+def raw_material(k, unit):
+    return {"id": k.id, "unit": unit, "bom_per_unit": cell(k.bom), "perishable": k.perishable,
+            "shelf_life_weeks": cell(k.shelf_life), "min_remaining_shelf_life": cell(k.min_remaining),
+            "moq": cell(k.moq), "order_multiple": cell(k.multiple), "max_order": cell(k.max_order),
+            "lead_time": lead_time(k.lead_time), "order_fixed_cost": cell(k.fixed_cost),
+            "order_variable_cost": cell(k.var_cost), "holding_cost": cell(k.holding), "waste_cost": cell(k.waste)}
+
+
+def describe_input(engine, d, path):
+    unit = d.uom or {}
+    with engine.pd.ExcelFile(str(path)) as xls:                    # the engine's own sheet reader (_sheet)
+        raw = {s: table(engine._sheet(xls, s).drop(columns=["RowCheck"], errors="ignore")) for s in RAW_TABLES}
+    return {
+        "settings": {"horizon_weeks": d.horizon, "review_period_weeks": d.review_period,
+                     "start_date": d.start_date.date().isoformat(), "chance_level": cell(d.chance_level),
+                     "scenarios": d.n_scenarios, "random_seed": d.seed, "time_limit_seconds": cell(d.time_limit),
+                     "rules_from_first_controllable_week": d.enforce_from_first_controllable},
+        "product": {"id": d.fg_id, "unit": unit.get(d.fg_id), "shelf_life_weeks": d.fg_shelf_life,
+                    "holding_cost": cell(d.fg_holding), "waste_cost": cell(d.fg_waste),
+                    "production": {"moq": cell(d.prod_moq), "batch": cell(d.prod_batch), "max": cell(d.prod_max),
+                                   "lead_time": lead_time(d.prod_lead_time), "fixed_cost": cell(d.prod_fixed),
+                                   "cost_tiers": tiers(d.prod_tiers), "transport_tiers": tiers(d.transport_tiers)}},
+        "raw_materials": [raw_material(k, unit.get(k.id)) for k in d.rms],
+        "channels": [{"id": c.id, "serving_order": i + 1, "target_fill_rate": cell(c.target),
+                      "min_remaining_shelf_life": c.min_remaining} for i, c in enumerate(d.channels)],
+        "demand": {"quantile_levels": [cell(x) for x in d.levels],          # weeks 1..H, one list per channel
+                   "quantiles": {c.id: [[cell(q) for q in d.demand_q[ci, t]] for t in range(1, d.horizon + 1)]
+                                 for ci, c in enumerate(d.channels)}},
+        "initial_stock": {d.fg_id: lots(d.init_fg), **{k: lots(v) for k, v in d.init_rm.items()}},
+        "open_orders": {"production": orders(d.open_prod), **{k: orders(v) for k, v in d.open_rm.items()}},
+        "warnings": list(d.warnings or []),
+        "tables": raw,
+    }
+
+
+# ============================================================================
+# 5. RESULT — RunResult → result.json. Copies only; the comments name the engine source of every field.
+# ============================================================================
 def column(df, prefix):
     """Report columns can carry the scenario count in their name, e.g. 'P(FR ≥ target) (2,500 fresh scenarios)'."""
     hits = [c for c in df.columns if str(c).startswith(prefix)]
@@ -125,37 +192,55 @@ def missed_rules(fill_rates):
             for _, r in rows.iterrows()]
 
 
-def build_result(engine, res, test_double):
-    ins, oos, sheets = res.ins, res.oos, res.sheets
-    fr = sheets["FillRates"]
-    constrained = fr[fr["Constrained"] == "yes"]
-    headline = {
+def headline(engine, res):
+    ins, oos, fr = res.ins, res.oos, res.sheets["FillRates"]
+    summary = dict(res.sheets["Summary"].values)
+    return {
         "cost_out_of_sample": float(oos["cost"]),                              # the headline (CLAUDE.md §2)
         "rules_total": int(len(ins["constrained"])),
-        "rules_met_out_of_sample": int((constrained["Status out-of-sample"] == "OK").sum()),
+        "rules_met_out_of_sample": int((fr[fr["Constrained"] == "yes"]["Status out-of-sample"] == "OK").sum()),
         "rules_missed_out_of_sample": missed_rules(fr),
         "feasibility": str(ins["feasibility"]),                                # one line, section 4b
         "bound_note": str(engine.bound_note(res.layout, res.x)),               # "none" or which setting to raise
         "cost_in_sample": float(ins["cost"]),
         "rules_met_in_sample": int(ins["met"]),
         "start_policy_cost": float(ins["start"]["cost"]),
+        "saving_vs_start_in_sample": float(summary["Saving vs. start policy (in-sample)"]),
+        "cost_parts_in_sample": {n: float(v) for n, v in ins["parts"].items()},
+        "cost_parts_out_of_sample": {n: float(oos[("part", n)]) for n in ins["parts"]},
         "scenarios_in_sample": int(ins["n"]),
         "scenarios_out_of_sample": int(oos["n"]),
         "seeker_status": str(ins["status"]),
     }
+
+
+def run_info(engine, res, settings):
+    d = res.data                                                               # after the run overrides (K20)
+    return {"product_id": d.fg_id, "horizon_weeks": d.horizon, "review_period_weeks": d.review_period,
+            "first_rule_week": min((t for _, t in res.ins["constrained"]), default=None),
+            "start_date": d.start_date.date().isoformat(), "time_limit_seconds": cell(settings["time_limit"]),
+            "scenarios_in_sample": d.n_scenarios, "random_seed": d.seed, "chance_level": cell(d.chance_level),
+            "optimization_chance_level": cell(engine.OPTIMIZATION_CHANCE_LEVEL or d.chance_level),
+            "scenarios_out_of_sample": int(res.oos["n"]), "feasibility_check": bool(engine.FEASIBILITY_CHECK),
+            "start_policy_out_of_sample": bool(engine.START_POLICY_OUT_OF_SAMPLE),
+            "overrides": res.overrides, "warnings": list(d.warnings or [])}
+
+
+def build_result(engine, res, test_double, settings):
     return {
         "contract_version": RESULT_CONTRACT_VERSION,
         "engine_version": engine.SCRIPT_VERSION,
-        "seeker_version": str(ins["version"]),
+        "seeker_version": str(res.ins["version"]),
         "test_double": test_double,                         # True = fake Seeker: numbers are not optimal
-        "headline": headline,
-        "sheets": {name: table(df) for name, df in sheets.items()},
+        "headline": headline(engine, res),
+        "run_info": run_info(engine, res, settings),
+        "sheets": {name: table(df) for name, df in res.sheets.items()},
         "timings": [[str(p), float(s)] for p, s in res.timings],
     }
 
 
 # ============================================================================
-# 5. RUN
+# 6. RUN
 # ============================================================================
 def write_json(path, obj):
     """Write via a temporary file and rename, so the server never reads a half-written file."""
@@ -178,10 +263,26 @@ def set_status(run_dir, **fields):
     write_json(path, status)
 
 
-def run(engine, skr, test_double, run_dir, license_file, time_limit):
+def apply_settings(engine, d, settings):
+    """Run settings → engine constants. The optimization chance level may never be below the Excel rule."""
+    level = settings.get("optimization_chance_level")
+    if level is not None and level < d.chance_level:
+        raise ValueError(f"Data validation failed:\n  - Optimization chance level {level:g} is below the Excel "
+                         f"FillRateChanceLevel {d.chance_level:g}; it may only be equal or higher (stricter).")
+    for key, constant in SETTING_CONSTANTS.items():
+        if settings.get(key) is not None:
+            setattr(engine, constant, settings[key])
+
+
+def run(engine, skr, test_double, run_dir, license_file):
     run_dir = Path(run_dir)
+    settings = json.loads((run_dir / "request.json").read_text(encoding="utf-8"))
     try:
-        res = engine.run(str(input_workbook(run_dir)), str(license_file), time_limit=float(time_limit), skr=skr)
+        d = engine.load_data(str(input_workbook(run_dir)))
+        write_json(run_dir / "input.json", describe_input(engine, d, input_workbook(run_dir)))
+        apply_settings(engine, d, settings)
+        res = engine.run(str(input_workbook(run_dir)), str(license_file), time_limit=float(settings["time_limit"]),
+                         skr=skr, overrides=settings.get("overrides"))
     except ValueError as e:
         set_status(run_dir, state="invalid", message="The data did not pass the engine's checks.",
                    errors=error_lines(e))
@@ -189,7 +290,7 @@ def run(engine, skr, test_double, run_dir, license_file, time_limit):
     except (FileNotFoundError, ImportError) as e:
         set_status(run_dir, state="failed", message=str(e), errors=[])
         return EXIT_FAILED
-    result = build_result(engine, res, test_double)
+    result = build_result(engine, res, test_double, settings)
     write_json(run_dir / "result.json", result)
     engine.write_report(res.sheets, run_dir / "results.xlsx")
     h = result["headline"]
@@ -199,14 +300,14 @@ def run(engine, skr, test_double, run_dir, license_file, time_limit):
 
 
 # ============================================================================
-# 6. MAIN
+# 7. MAIN
 # ============================================================================
 def main(argv, environ):
     engine, skr, test_double = load_engine(environ)
     if len(argv) == 3 and argv[0] == "validate":
         write_json(argv[2], validate(engine, argv[1]))
         return EXIT_DONE
-    if len(argv) == 4 and argv[0] == "run":
+    if len(argv) == 3 and argv[0] == "run":
         try:
             return run(engine, skr, test_double, *argv[1:])
         except Exception as e:  # noqa: BLE001 — record any crash for the user; the traceback goes to log.txt

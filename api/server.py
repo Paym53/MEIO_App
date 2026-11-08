@@ -9,7 +9,8 @@ Every request needs the header  Authorization: Bearer <MEIO_TOKEN>.  The server 
 each validation or run is one api/worker.py process (one engine run per process, CLAUDE.md §2), and every number
 it returns was written by that worker from the engine's RunResult.
 
-Run folder  runs/<id>/ :  input.xlsx · status.json · log.txt · result.json · results.xlsx
+Run folder  runs/<id>/ :  input.xlsx · request.json (settings) · status.json · label.json · log.txt · input.json ·
+                          result.json · results.xlsx
 
   0. SETTINGS ........ environment variables (set in local_settings.bat) and named constants
   1. SECURITY ........ token check
@@ -21,6 +22,7 @@ Run folder  runs/<id>/ :  input.xlsx · status.json · log.txt · result.json ·
 ================================================================================
 """
 import datetime as dt
+import hashlib
 import hmac
 import json
 import os
@@ -39,7 +41,7 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # ============================================================================
 # 0. SETTINGS
@@ -57,9 +59,17 @@ OPENAPI_FILE = ROOT / "api" / "openapi.json"
 MIN_TOKEN_LENGTH = 32
 MAX_UPLOAD_MB = 20
 DEFAULT_TIME_LIMIT, MAX_TIME_LIMIT = 250, 3600                             # Seeker search time [s]
+DEFAULT_OOS, MIN_OOS, MAX_OOS = 2500, 500, 20000                           # fresh scenarios for the check
+MAX_SCENARIOS = 2000                                                       # NumScenarios override (optimizer)
+DEFAULT_SETTINGS = {"time_limit": DEFAULT_TIME_LIMIT, "out_of_sample_scenarios": DEFAULT_OOS,
+                    "feasibility_check": True, "start_policy_out_of_sample": False,
+                    "optimization_chance_level": None, "overrides": None}
 VALIDATE_TIMEOUT_SECONDS = 120
-# Time left = fixed phases + search (Seeker overruns its limit by ~7 %); user's PC, 07.11.: 115 s + 266.6 s at 250 s
-ETA_FIXED_SECONDS, ETA_SEARCH_FACTOR = 115.0, 1.07
+# Expected run time, fitted on the user's PC (engine v17.1, 08.11.: 407 s at the defaults):
+#   reading/build/gaps 30 s + feasibility check 21 s + 0.033 s per fresh scenario (82.5 s at 2,500; twice with the
+#   start policy on fresh scenarios) + search = time limit + 24 s (273 s at 250 s; 54 s at 30 s)
+ETA_BASE_SECONDS, ETA_FEASIBILITY_SECONDS = 30.0, 21.0
+ETA_OOS_SECONDS_PER_SCENARIO, ETA_SEARCH_OVERHEAD_SECONDS = 0.033, 24.0
 WATCHDOG_FACTOR = 3.0                                                      # a run taking 3 × its estimate is stopped
 EXIT_WAIT_SECONDS = 30.0                                                   # a finished worker gets this to exit
 LOG_TAIL_LINES = 40
@@ -110,6 +120,16 @@ def read_status(folder):
     return json.loads((Path(folder) / "status.json").read_text(encoding="utf-8"))
 
 
+def read_label(folder):
+    """Label and note live in their own file, so they never collide with the worker writing status.json."""
+    path = Path(folder) / "label.json"
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+
+def run_view(folder):
+    return {**read_status(folder), **read_label(folder)}
+
+
 def update_status(folder, **fields):
     status = read_status(folder)
     status.update(fields)
@@ -134,8 +154,17 @@ def read_upload(file: UploadFile):
 # ============================================================================
 # 3. PROGRESS
 # ============================================================================
-def expected_seconds(time_limit):
-    return ETA_FIXED_SECONDS + ETA_SEARCH_FACTOR * float(time_limit)
+def settings_of(status):
+    """The run's settings (runs from before settings existed only recorded the time limit)."""
+    recorded = status.get("settings", {})
+    return {**DEFAULT_SETTINGS, "time_limit": status.get("time_limit", DEFAULT_TIME_LIMIT), **recorded}
+
+
+def expected_seconds(settings):
+    s = {**DEFAULT_SETTINGS, **settings}
+    check = ETA_OOS_SECONDS_PER_SCENARIO * s["out_of_sample_scenarios"] * (2 if s["start_policy_out_of_sample"] else 1)
+    feasibility = ETA_FEASIBILITY_SECONDS if s["feasibility_check"] else 0.0
+    return ETA_BASE_SECONDS + feasibility + check + float(s["time_limit"]) + ETA_SEARCH_OVERHEAD_SECONDS
 
 
 def progress(folder, status):
@@ -146,7 +175,7 @@ def progress(folder, status):
     left = None
     if status["state"] == "running":
         elapsed = (dt.datetime.now().astimezone() - dt.datetime.fromisoformat(status["started"])).total_seconds()
-        left = max(0.0, expected_seconds(status["time_limit"]) - elapsed)
+        left = max(0.0, expected_seconds(settings_of(status)) - elapsed)
     return {"phase": phases[-1] if phases else None, "seconds_left": left, "log_tail": lines[-LOG_TAIL_LINES:]}
 
 
@@ -184,10 +213,10 @@ def let_finished_worker_exit():
         proc.wait()
 
 
-def watch(run_id, proc, folder, time_limit):
+def watch(run_id, proc, folder, settings):
     """Waits for the worker; stops it after WATCHDOG_FACTOR × the expected time; records crashes."""
     try:
-        code = proc.wait(timeout=WATCHDOG_FACTOR * expected_seconds(time_limit))
+        code = proc.wait(timeout=WATCHDOG_FACTOR * expected_seconds(settings))
     except subprocess.TimeoutExpired:
         proc.kill()
         code = proc.wait()
@@ -203,7 +232,7 @@ def watch(run_id, proc, folder, time_limit):
             CURRENT.update(id=None, proc=None, thread=None, cancelled=False)
 
 
-def start_run(data, time_limit):
+def start_run(data, file_name, settings, label_and_note=None):
     with LOCK:
         if busy():
             raise HTTPException(409, f"A run is already in progress ({CURRENT['id']}).")
@@ -212,13 +241,16 @@ def start_run(data, time_limit):
         folder = RUNS_DIR / run_id
         folder.mkdir(parents=True)
         (folder / "input.xlsx").write_bytes(data)
+        write_json(folder / "request.json", settings)
+        write_json(folder / "label.json", label_and_note or {})
+        file = {"name": file_name, "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
         write_json(folder / "status.json", {"id": run_id, "state": "running", "created": now(), "started": now(),
-                                            "finished": None, "time_limit": time_limit, "message": "Running.",
-                                            "errors": []})
-        cmd = [sys.executable, "-u", str(WORKER), "run", str(folder), str(LICENSE_FILE), str(time_limit)]
+                                            "finished": None, "time_limit": settings["time_limit"],
+                                            "settings": settings, "file": file, "message": "Running.", "errors": []})
+        cmd = [sys.executable, "-u", str(WORKER), "run", str(folder), str(LICENSE_FILE)]
         with open(folder / "log.txt", "wb") as log:
             proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, cwd=str(ROOT), env=worker_env())
-        thread = threading.Thread(target=watch, args=(run_id, proc, folder, time_limit), daemon=True)
+        thread = threading.Thread(target=watch, args=(run_id, proc, folder, settings), daemon=True)
         CURRENT.update(id=run_id, proc=proc, thread=thread, cancelled=False)
         thread.start()
     return run_id
@@ -256,9 +288,40 @@ class Health(BaseModel):
     test_double: bool
 
 
+class Table(BaseModel):
+    columns: list[str]
+    rows: list[list[Any]]
+
+
+class InputSettings(BaseModel):
+    horizon_weeks: int
+    review_period_weeks: int
+    start_date: str
+    chance_level: float
+    scenarios: int
+    random_seed: int
+    time_limit_seconds: float | None
+    rules_from_first_controllable_week: bool
+
+
+class InputData(BaseModel):
+    """The master data exactly as the engine read it from the workbook (rows and fields named as in the template)."""
+    settings: InputSettings
+    product: dict[str, Any]               # id, unit, shelf life, costs, production (MOQ, batch, max, lead time, tiers)
+    raw_materials: list[dict[str, Any]]   # per RM: BOM, shelf life, freshness rule, MOQ, multiple, max, LT, costs
+    channels: list[dict[str, Any]]        # id, serving_order, target_fill_rate, min_remaining_shelf_life
+    demand: dict[str, Any]                # quantile_levels; quantiles[channel][week 1..H] = 10 values
+    initial_stock: dict[str, list[dict[str, Any]]]
+    open_orders: dict[str, list[dict[str, Any]]]
+    warnings: list[str]
+    tables: dict[str, Table]              # Locations, Lanes, Items, Model_Assumptions as in the template
+
+
 class Validation(BaseModel):
     valid: bool
     errors: list[str]                     # the engine's messages, one problem per entry
+    warnings: list[str] = []              # do not stop a run (e.g. a max order not a multiple of the order step)
+    input: InputData | None = None        # the master data, when the workbook is valid
 
 
 class RunSummary(BaseModel):
@@ -270,6 +333,15 @@ class RunSummary(BaseModel):
     message: str
     summary: dict[str, Any] | None = None  # done runs: cost_out_of_sample, rules_met_out_of_sample, rules_total
     test_double: bool = False             # True = run on the Seeker test double (development only)
+    settings: dict[str, Any] | None = None  # the run settings (see POST /runs)
+    file: dict[str, Any] | None = None    # uploaded workbook: name, sha256 fingerprint, bytes
+    label: str = ""
+    note: str = ""
+
+
+class RunLabel(BaseModel):
+    label: str | None = Field(None, max_length=80)
+    note: str | None = Field(None, max_length=1000)
 
 
 class RunStatus(RunSummary):
@@ -296,14 +368,30 @@ class Headline(BaseModel):
     cost_in_sample: float
     rules_met_in_sample: int
     start_policy_cost: float
+    saving_vs_start_in_sample: float      # engine Summary; share (0.068 = 6.8 %)
+    cost_parts_in_sample: dict[str, float]
+    cost_parts_out_of_sample: dict[str, float]
     scenarios_in_sample: int
     scenarios_out_of_sample: int
     seeker_status: str
 
 
-class Table(BaseModel):
-    columns: list[str]
-    rows: list[list[Any]]
+class RunInfo(BaseModel):
+    product_id: str
+    horizon_weeks: int
+    review_period_weeks: int
+    first_rule_week: int | None           # weeks before it are fixed by stock on hand and open orders
+    start_date: str
+    time_limit_seconds: float
+    scenarios_in_sample: int
+    random_seed: int
+    chance_level: float
+    optimization_chance_level: float
+    scenarios_out_of_sample: int
+    feasibility_check: bool
+    start_policy_out_of_sample: bool
+    overrides: dict[str, int] | None
+    warnings: list[str]
 
 
 class Result(BaseModel):
@@ -312,7 +400,8 @@ class Result(BaseModel):
     seeker_version: str
     test_double: bool
     headline: Headline
-    sheets: dict[str, Table]              # Summary, Commit_Now, Policy_sS, Decisions, FillRates, Stock_Waste
+    run_info: RunInfo
+    sheets: dict[str, Table]  # Summary, Commit_Now, Policy_sS, Decisions, FillRates, Stock_Waste, Bands, KPIs
     timings: list[tuple[str, float]]
 
 
@@ -326,8 +415,8 @@ async def lifespan(_app):
     yield
 
 
-app = FastAPI(title="MEIO local API", version="1", lifespan=lifespan, dependencies=[Depends(require_token)])
-app.add_middleware(CORSMiddleware, allow_origin_regex=ALLOWED_ORIGINS, allow_methods=["GET", "POST"],
+app = FastAPI(title="MEIO local API", version="2", lifespan=lifespan, dependencies=[Depends(require_token)])
+app.add_middleware(CORSMiddleware, allow_origin_regex=ALLOWED_ORIGINS, allow_methods=["GET", "POST", "PATCH"],
                    allow_headers=["Authorization", "Content-Type", "ngrok-skip-browser-warning"])
 
 
@@ -348,29 +437,61 @@ def validate(file: Annotated[UploadFile, File()]):
 
 @app.post("/runs", response_model=RunStatus, status_code=202)
 def create_run(file: Annotated[UploadFile, File()],
-               time_limit: Annotated[int, Form(ge=1, le=MAX_TIME_LIMIT)] = DEFAULT_TIME_LIMIT):
-    """Starts an optimization run in the background (refused while another run is in progress)."""
-    return get_run(start_run(read_upload(file), time_limit))
+               time_limit: Annotated[int, Form(ge=1, le=MAX_TIME_LIMIT)] = DEFAULT_TIME_LIMIT,
+               out_of_sample_scenarios: Annotated[int, Form(ge=MIN_OOS, le=MAX_OOS)] = DEFAULT_OOS,
+               feasibility_check: Annotated[bool, Form()] = True,
+               start_policy_out_of_sample: Annotated[bool, Form()] = False,
+               optimization_chance_level: Annotated[float | None, Form(gt=0, lt=1)] = None,
+               num_scenarios: Annotated[int | None, Form(ge=1, le=MAX_SCENARIOS)] = None,
+               random_seed: Annotated[int | None, Form(ge=0)] = None,
+               label: Annotated[str, Form(max_length=80)] = "",
+               note: Annotated[str, Form(max_length=1000)] = ""):
+    """Starts an optimization run in the background (refused while another run is in progress).
+    num_scenarios / random_seed replace the Excel NumScenarios / RandomSeed for this run only (engine rule K20);
+    optimization_chance_level may only be equal to or stricter than the Excel FillRateChanceLevel."""
+    data = read_upload(file)
+    overrides = {k: v for k, v in (("NumScenarios", num_scenarios), ("RandomSeed", random_seed)) if v is not None}
+    settings = {"time_limit": time_limit, "out_of_sample_scenarios": out_of_sample_scenarios,
+                "feasibility_check": feasibility_check, "start_policy_out_of_sample": start_policy_out_of_sample,
+                "optimization_chance_level": optimization_chance_level, "overrides": overrides or None}
+    return get_run(start_run(data, file.filename, settings, {"label": label, "note": note}))
 
 
 @app.get("/runs", response_model=list[RunSummary])
 def list_runs():
     """Run history, newest first."""
     folders = sorted(RUNS_DIR.glob("*/status.json"), reverse=True) if RUNS_DIR.exists() else []
-    return [read_status(f.parent) for f in folders if RUN_ID.match(f.parent.name)]
+    return [run_view(f.parent) for f in folders if RUN_ID.match(f.parent.name)]
 
 
 @app.get("/runs/{run_id}", response_model=RunStatus)
 def get_run(run_id: str):
     """Status of one run, with the current phase, estimated seconds left and the last log lines."""
     folder = run_dir(run_id)
-    status = read_status(folder)
+    status = run_view(folder)
     return {**status, **progress(folder, status)}
+
+
+@app.patch("/runs/{run_id}", response_model=RunSummary)
+def label_run(run_id: str, body: RunLabel):
+    """Sets the run's label and/or note (shown in the history and the scenario comparison)."""
+    folder = run_dir(run_id)
+    write_json(folder / "label.json", {**read_label(folder), **body.model_dump(exclude_none=True)})
+    return run_view(folder)
+
+
+@app.get("/runs/{run_id}/input", response_model=InputData)
+def get_input(run_id: str):
+    """The master data of the run's workbook, exactly as the engine read it."""
+    folder = run_dir(run_id)
+    if not (folder / "input.json").exists():
+        raise HTTPException(409, "The run has no master data (the workbook could not be read).")
+    return json.loads((folder / "input.json").read_text(encoding="utf-8"))
 
 
 @app.get("/runs/{run_id}/result", response_model=Result)
 def get_result(run_id: str):
-    """Everything the engine reported, as JSON: the headline and the six result tables."""
+    """Everything the engine reported, as JSON: headline, run info and the eight result tables."""
     folder = run_dir(run_id)
     state = read_status(folder)["state"]
     if state != "done":
