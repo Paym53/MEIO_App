@@ -539,6 +539,11 @@ def test_master_data_is_exactly_what_the_engine_read(api, done):
     assert inp["initial_stock"]["FG1"] == [{"remaining_shelf_life": a, "quantity": q} for a, q in d.init_fg]
     assert len(inp["open_orders"]["production"]) == len(d.open_prod) and inp["warnings"] == d.warnings
     assert len(inp["tables"]["Model_Assumptions"]["rows"]) == 82
+    src = inp["tables"]["Sourcing"]                                            # which supplier delivers which material
+    item, supplier = src["columns"].index("ItemID"), src["columns"].index("SupplierID")
+    assert [(r[item], r[supplier]) for r in src["rows"]] == [("RM1", "SUP_VPL"), ("RM2", "SUP_VPL"),
+                                                             ("RM3", "SUP_EHK"), ("RM4", "SUP_ACR")]
+    assert "EffectiveMaxOrderQty" not in src["columns"]                        # Excel formula; engine: max_order
     assert "RowCheck" not in inp["tables"]["Locations"]["columns"]
     assert api.get(f"/runs/{done[0]}/input").json() == inp                     # the run keeps the same master data
 

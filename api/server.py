@@ -324,7 +324,7 @@ class InputData(BaseModel):
     initial_stock: dict[str, list[dict[str, Any]]]
     open_orders: dict[str, list[dict[str, Any]]]
     warnings: list[str]
-    tables: dict[str, Table]              # Locations, Lanes, Items, Model_Assumptions as in the template
+    tables: dict[str, Table]              # Locations, Lanes, Items, Sourcing, Model_Assumptions as in the template
 
 
 class Validation(BaseModel):
