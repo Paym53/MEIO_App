@@ -324,6 +324,18 @@ lint, build) **and** the full UI test suite, added together once all screens exi
 - Runs/compare (AC4): costs compared only when rules_met_out_of_sample is equal; otherwise a warning, no difference.
 - Overview: KPI strip = headline fields; fresh saving from KPIs row when present, else in-sample (labelled); heatmap
   status from FillRates "Status out-of-sample", fixed weeks before run_info.first_rule_week; KPIs rows by name.
+  Fixed weeks (Status "info") show their share in grey without ✓/✕. Feasibility "not run" → "Not checked".
+  Decisions to take now: Commit_Now columns When / Decision / "Quantity / rule" / Note (week from "Week 1"); cards only
+  for week-1 quantity > 0; why = Bands "position" week 1 Mean vs Policy_sS s/S + input order limits; week-2 rules
+  listed only when P(order) > 0 (Decisions). Channel rows from FillRates (serving order), never a fixed list.
+- Supply-chain map (React Flow): nodes = input.tables.Locations (LocationID, Type) only; supplier edges from Sourcing
+  (SupplierID → DestinationID, label "RMx · LT"), others from Lanes; runs without Sourcing show a hint. Panels:
+  bars only for order_qty and receipts, other series as band/line charts; open orders keys qty/placed/arrival;
+  channel fill rate from the column "P(FR ≥ target) (" (fresh, not the in-sample one that comes first); "fixed weeks"
+  shading only on DC and channel charts; KPI unit "share of scenarios" shown as %.
+- Orders: rows = (stream, week) with P(order) > 0 + open orders; quantity labelled "avg. over all futures (incl. no
+  order)"; arrival P50 (P05–P95) only over futures that order; open orders "before W1 (week −3)"; review cards
+  formatted with the item unit.
 - Decisions/Orders: (s,S) from wide Policy_sS (`FG s`/`FG S` exact case, production point "FG"); badges only from
   Decisions.Status ("—" otherwise); units from KPIs "Average end stock <item>," Unit; arrival from Bands
   arrival_week ("never ordered" when empty); grey only rows where every "<point> active" is "fixed 0".
@@ -331,7 +343,10 @@ lint, build) **and** the full UI test suite, added together once all screens exi
 - Inventory: s/S only on Bands series "position"; served/lost/eligible_next_week read per channel (Item = channel id);
   units from the engine; no_stock_share = Mean only.
 - Master data: demand bands by level position in demand.quantiles[channel][week][level] (Q05–Q95, Q25–Q75, Q45–Q55,
-  no median); lead-time bars pair lead_time.weeks[i] with probabilities[i].
+  no median); lead-time bars pair lead_time.weeks[i] with probabilities[i]. Nine subtabs (/master-data/<slug>);
+  no solver settings there (time limit, scenarios, seed live only in the Run dialog / Solver settings); non-perishables
+  "no expiry", never "0 weeks"; stock "usable for" chips = remaining shelf life ≥ channel / production minimum.
+  Model assumptions are on Explainability, not Master data.
 
 **Decisions 08.11. (user):** single user (one token, no per-user login); no floating assistant; order of work:
 **engine v17 first → API update → Lovable prompts** (build pack v2: Knowledge rules A–J, design-shell Prompt A, page
@@ -394,7 +409,12 @@ probabilities, no summed total). **User-approved exception to "never compute":**
 week range, the mean of the Bands "Mean" values (FG1 end_stock) and their sum (FG1 waste) may be shown, labelled
 "mean of selected weeks" / "expected total in selected weeks" (exact for means by linearity); never for quantiles.
 Not in the model, so not shown: capacity overrides, closed weeks, cut reasons, forecast mean/std, RM remaining shelf
-life. The map needs `input.tables.Sourcing` (supplier → material), added on 09.11.
+life. The map needs `input.tables.Sourcing` (supplier → material), added on 09.11.; `input.json` is written when a
+run is made, so runs before 09.11. have no supplier arrows (start a new run).
+**Dashboard progress (09.11.):** Overview, map + panels, Orders and Master data reworked and merged (dashboard PRs #4–#10;
+Lovable prompts A, B, map rebuild, Orders, Master data; Claude's review fixes in the same PRs). One place per input:
+solver settings only in the Run dialog. Open idea (not requested yet): engine output of the order quantity **only over
+futures that order** (like arrival_week), so Orders can show "if ordered: …" instead of only the all-futures mean.
 **API update 2 (next, before the Master data / scenario screens):** what-if edits written into a copy of the
 uploaded workbook (openpyxl, values only; engine K19 checks it), with an original-vs-changed list per run.
 
