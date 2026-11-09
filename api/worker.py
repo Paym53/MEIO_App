@@ -49,7 +49,9 @@ SETTING_CONSTANTS = {"out_of_sample_scenarios": "OUT_OF_SAMPLE_SCENARIOS",
                      "feasibility_check": "FEASIBILITY_CHECK",
                      "start_policy_out_of_sample": "START_POLICY_OUT_OF_SAMPLE",
                      "optimization_chance_level": "OPTIMIZATION_CHANCE_LEVEL"}
-RAW_TABLES = ("Locations", "Lanes", "Items", "Model_Assumptions")   # template sheets shown as they are
+RAW_TABLES = ("Locations", "Lanes", "Items", "Sourcing", "Model_Assumptions")   # template sheets shown as they are
+EXCEL_ONLY_COLUMNS = ["RowCheck", "EffectiveMaxOrderQty"]   # Excel formulas (empty in edited copies); engine values
+                                                            # are in raw_materials[] (max_order)
 
 
 # ============================================================================
@@ -149,7 +151,7 @@ def raw_material(k, unit):
 def describe_input(engine, d, path):
     unit = d.uom or {}
     with engine.pd.ExcelFile(str(path)) as xls:                    # the engine's own sheet reader (_sheet)
-        raw = {s: table(engine._sheet(xls, s).drop(columns=["RowCheck"], errors="ignore")) for s in RAW_TABLES}
+        raw = {s: table(engine._sheet(xls, s).drop(columns=EXCEL_ONLY_COLUMNS, errors="ignore")) for s in RAW_TABLES}
     return {
         "settings": {"horizon_weeks": d.horizon, "review_period_weeks": d.review_period,
                      "start_date": d.start_date.date().isoformat(), "chance_level": cell(d.chance_level),
