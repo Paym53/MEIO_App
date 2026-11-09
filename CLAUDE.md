@@ -386,6 +386,15 @@ Prompts 1–4 done and checked by the user; review fixes: dashboard PR #1 (Polic
 units, (s,S) greying) merged. Prompt 5 (Inventory) → fix PR #2 (series "position", per-channel flows, units) merged.
 Prompt 6 (Master data + Solver settings) → fix PR #3 (demand quantile layout, lead-time pairs). Lovable keeps guessing
 field names: the fixes always come from the real /input and result layouts (worker.describe_input, engine sheets).
+**Overview rework (09.11., user notes):** status line (targets reachable? + small bound-note and review chips), KPI
+strip, "Decisions to take now" (week-1 action cards are certain: decided before demand; week-2 rules with P(order)),
+number heatmap (shares, not counts), small cost and run-quality cards, Risk section removed; supply-chain map rebuilt
+with React Flow (Prompt B) incl. a lead-time ladder (each segment = its own lead time, stochastic = range + the given
+probabilities, no summed total). **User-approved exception to "never compute":** on the Overview, for the selected
+week range, the mean of the Bands "Mean" values (FG1 end_stock) and their sum (FG1 waste) may be shown, labelled
+"mean of selected weeks" / "expected total in selected weeks" (exact for means by linearity); never for quantiles.
+Not in the model, so not shown: capacity overrides, closed weeks, cut reasons, forecast mean/std, RM remaining shelf
+life. The map needs `input.tables.Sourcing` (supplier → material), added on 09.11.
 **API update 2 (next, before the Master data / scenario screens):** what-if edits written into a copy of the
 uploaded workbook (openpyxl, values only; engine K19 checks it), with an original-vs-changed list per run.
 
