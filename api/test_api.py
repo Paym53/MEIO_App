@@ -801,6 +801,25 @@ def test_a_whatif_run_records_its_original_and_changes(api, done):
     assert api.get(f"/runs/{done[0]}/changes").json() == []                                        # the original
 
 
+def test_a_run_again_on_the_same_data_uses_the_same_workbook_with_new_settings(api, done):
+    row = row_of(api, done[0], "Items", "FG1")
+    edit = [{"sheet": "Items", "row": row, "column": "TargetFillRate", "value": 0.9}]
+    whatif = wait(api, api.post("/runs", data={"base_run": done[0], "edits": json.dumps(edit),
+                                               "time_limit": "1"}).json()["id"])
+    for source in (done[1], whatif):                                                   # an upload and a what-if
+        r = api.post("/runs", data={"same_data_as": source["id"], "time_limit": "2", "num_scenarios": "30"})
+        assert r.status_code == 202, r.text
+        again = wait(api, r.json()["id"])
+        assert again["state"] == "done", again
+        assert again["file"] == source["file"]                                         # byte for byte (W08)
+        assert (again["base_run"], again["changes"]) == (source["base_run"], source["changes"])
+        assert again["settings"]["time_limit"] == 2 and again["settings"]["overrides"] == {"NumScenarios": 30}
+        assert api.get(f"/runs/{again['id']}/changes").json() == api.get(f"/runs/{source['id']}/changes").json()
+    assert api.get(f"/runs/{again['id']}/input").json()["product"]["fill_rate_target"] == 0.9
+    r = api.post("/whatif/validate", json={"base_run": again["id"], "edits": edit})
+    assert r.status_code == 409 and done[0] in r.json()["detail"]                    # still a what-if (W05)
+
+
 def test_a_whatif_is_never_the_base_of_another_whatif(api, done):
     row = row_of(api, done[0], "Items", "FG1")
     edit = [{"sheet": "Items", "row": row, "column": "TargetFillRate", "value": 0.9}]
@@ -816,13 +835,15 @@ def test_a_run_needs_either_a_file_or_a_whatif(api, done):
     both = api.post("/runs", files=upload(TEMPLATE), data={"base_run": done[0], "edits": "[]"})
     assert both.status_code == 400
     assert api.post("/runs", data={"base_run": done[0], "edits": "not json"}).status_code == 422
+    assert api.post("/runs", data={"base_run": done[0], "edits": "[]", "same_data_as": done[0]}).status_code == 400
+    assert api.post("/runs", data={"same_data_as": "20991231-235959-ffff"}).status_code == 404
     assert api.post("/whatif/validate", json={"base_run": "20991231-235959-ffff", "edits": []}).status_code == 404
 
 
 def test_the_app_rules_are_served_in_the_model_assumptions_columns(api):
     rules = api.get("/app-rules").json()
     assert rules["columns"] == ["ID", "Topic", "Title", "Rule / mechanic", "Source", "Status", "Where"]
-    assert [r[0] for r in rules["rows"]] == ["W01", "W02", "W03", "W04", "W05", "W06", "W07"]
+    assert [r[0] for r in rules["rows"]] == ["W01", "W02", "W03", "W04", "W05", "W06", "W07", "W08"]
     assert all(len(r) == len(rules["columns"]) and all(r) for r in rules["rows"])
 
 

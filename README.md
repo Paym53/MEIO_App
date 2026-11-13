@@ -85,7 +85,11 @@ in `engine\MEIO_Data_Template.xlsx` and writes `engine\MEIO_Results_stochastic.x
 change the values shown as fields (for demand either single quantiles or a shift such as "+2,000 units" for one channel
 and week; stock lots, open orders and possible lead times can also be added or removed), check, then run. A
 what-if always starts from the original upload, never from another what-if. The fill-rate target and the review period
-are changed only here, not in the run dialog. The app's own rules for this (W01–W07) are listed on Explainability.
+are changed only here, not in the run dialog. The app's own rules for this (W01–W08) are listed on Explainability.
+
+**Data and runs:** the top bar first picks the **data** (an upload, or a what-if shown in blue with its changes on
+click), then a **run** on that data. *Run optimization → Same data* (or *Run again* in Run history) runs the selected
+data again, byte for byte, with other solver settings, e.g. a quick what-if again as a decision run.
 
 **Since engine v18.1 (13.11.):**
 - **Workbooks:** workbooks made for the old engine are refused. Copy your values by hand into the new

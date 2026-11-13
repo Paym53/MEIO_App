@@ -132,6 +132,12 @@ APP_RULES = [
      "policy on fresh scenarios are set per run in the Run dialog, not in the master data. Optimizer "
      "scenarios and random seed replace the Excel values for that run only (engine K20).",
      "User decision 09.11.", "Decided", "Run dialog; api/server.py"],
+    ["W08", "Run settings", "Run again on the same data",
+     "Any run can be run again with other solver settings on exactly the same data: the API copies that "
+     "run's workbook byte for byte (same sha256 fingerprint). A what-if run again keeps its original and its "
+     "change list, so it is still a what-if of the original, not a what-if of a what-if (W05). Runs with the "
+     "same fingerprint use the same data; the dashboard groups them under one data set.",
+     "User decision 14.11.", "Decided", "api/server.py same_data; dashboard top bar and Run dialog"],
 ]
 
 
@@ -400,6 +406,21 @@ def original_base(base_run):
     return folder
 
 
+def same_data(run_id):
+    """(bytes, file name) of an earlier run's input.xlsx: a run again on the same data (W08)."""
+    folder = run_dir(run_id)
+    return (folder / "input.xlsx").read_bytes(), (read_status(folder).get("file") or {}).get("name", run_id)
+
+
+def same_origin(run_id):
+    """A what-if run again keeps its original run and change list (still no chaining, W05/W08); None for uploads."""
+    folder = run_dir(run_id)
+    base = read_status(folder).get("base_run")
+    changes = folder / "changes.json"
+    return {"base_run": base, "changes": json.loads(changes.read_text(encoding="utf-8")) if changes.exists() else []} \
+        if base else None
+
+
 def whatif_copy(base_run, edits):
     """(answer, bytes of the checked copy or None): the worker writes the edits into a copy of the original run's
     workbook and runs the engine's checks on it. The original input.xlsx is only read (W01)."""
@@ -653,6 +674,7 @@ def validate_whatif(body: WhatIf):
 def create_run(file: Annotated[UploadFile | None, File()] = None,
                base_run: Annotated[str | None, Form()] = None,
                edits: Annotated[str | None, Form()] = None,
+               same_data_as: Annotated[str | None, Form()] = None,
                time_limit: Annotated[int, Form(ge=1, le=MAX_TIME_LIMIT)] = DEFAULT_TIME_LIMIT,
                out_of_sample_scenarios: Annotated[int, Form(ge=MIN_OOS, le=MAX_OOS)] = DEFAULT_OOS,
                feasibility_check: Annotated[bool, Form()] = True,
@@ -662,12 +684,14 @@ def create_run(file: Annotated[UploadFile | None, File()] = None,
                label: Annotated[str, Form(max_length=80)] = "",
                note: Annotated[str, Form(max_length=1000)] = ""):
     """Starts an optimization run in the background (refused while another run is in progress), either on an uploaded
-    workbook (file) or as a what-if: base_run = an original run, edits = JSON list of edits (see POST /whatif/validate);
-    an invalid what-if is refused with the engine's errors (422) and starts nothing.
+    workbook (file), as a what-if (base_run = an original run, edits = JSON list of edits, see POST /whatif/validate;
+    an invalid what-if is refused with the engine's errors, 422, and starts nothing) or again on the data of an earlier
+    run (same_data_as = that run: the same workbook byte for byte, a what-if keeps its original and changes; W08).
     num_scenarios / random_seed replace the Excel NumScenarios / RandomSeed for this run only (engine rule K20).
     The fill-rate target and the review period come from the workbook only (W04)."""
-    if (file is None) == (base_run is None):
-        raise HTTPException(400, "Send either a workbook (file) or a what-if (base_run and edits), not both.")
+    if sum(x is not None for x in (file, base_run, same_data_as)) != 1:
+        raise HTTPException(400, "Send exactly one of: a workbook (file), a what-if (base_run and edits) or the "
+                                 "run whose data to use again (same_data_as).")
     overrides = {k: v for k, v in (("NumScenarios", num_scenarios), ("RandomSeed", random_seed)) if v is not None}
     settings = {"time_limit": time_limit, "out_of_sample_scenarios": out_of_sample_scenarios,
                 "feasibility_check": feasibility_check, "start_policy_out_of_sample": start_policy_out_of_sample,
@@ -675,6 +699,8 @@ def create_run(file: Annotated[UploadFile | None, File()] = None,
     label_and_note = {"label": label, "note": note}
     if file is not None:
         return get_run(start_run(read_upload(file), file.filename, settings, label_and_note))
+    if same_data_as is not None:
+        return get_run(start_run(*same_data(same_data_as), settings, label_and_note, same_origin(same_data_as)))
     try:
         parsed = [Edit.model_validate(e).model_dump() for e in json.loads(edits or "[]")]
     except (ValueError, TypeError) as e:
