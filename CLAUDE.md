@@ -568,6 +568,11 @@ futures that order** (like arrival_week), so Orders can show "if ordered: …" i
   and `{sheet, row, delete: true}` (clears the row), only for Init_Inventory, Open_Orders, LeadTimeDist and their input
   columns (`worker.ROW_SHEETS`); W02 updated. Tested: new lot, new open order, stochastic lead time (8 wk 80 %, 10 wk
   20 %), removed lot; 208 tests, coverage 98.4 %.
+- **Run again on the same data (14.11., W08):** `POST /runs` with `same_data_as` = a run id copies that run's
+  input.xlsx byte for byte (same sha256); a what-if keeps its `base_run` and changes.json (still no chaining). Data set =
+  runs with the same `file.sha256` (dashboard `src/lib/data-sets.ts`). Dashboard: top bar Data picker (uploads /
+  what-ifs, what-if chip with change list) → Run picker (time · preset · cost · rules); Run dialog "Same data" (default
+  when a run is selected) or "Upload"; Run history "Run again" and a Data column; run page and comparison show the data.
 - **Dashboard edit mode (14.11., user notes; dashboard PR #14, built by Claude, no Lovable credits):** inline fields in
   the normal Master data screens for only these values: horizon, review period; shelf lives, BOM quantity, usable-while
   minimum; MOQ, order step, max per order, lead-time editor (weeks + probability per possibility, add/remove); target
