@@ -8,18 +8,21 @@ implementation, scenario by scenario.
 
   0. SEEKER TEST DOUBLE ...... strict stand-in for Seeker's Python API (evaluates the same model Terms)
   1. INPUT CONTROL ........... the Excel is read correctly; every Excel check (C01–C14, X01–X07) also runs in
-                               Python, so edited copies are checked as strictly; every error has a message
+                               Python, so edited copies are checked as strictly; every error has a message;
+                               warnings X08 (open orders vs lead time) and X09 (lot size vs shelf life)
   2. PHYSICS & DYNAMICS ...... engine = reference in every scenario: lots, FEFO, priority, (s,S), echelon,
                                lead times, no overtaking, tiers, waste, fill rates; edge cases
-  3. MODEL FUNCTIONALITY ..... decision variables & bounds, start policy, chance constraints, priorities,
-                               feasibility check, search model unchanged by the report series, bands,
-                               arrival weeks, KPIs, run overrides, start policy on fresh scenarios
+  3. MODEL FUNCTIONALITY ..... decision variables & bounds, start policy (target-aware z, lot cap, lot guard), fill-rate rule,
+                               fill-rate target from Excel or section 0, priorities, feasibility check, start check
+                               and repair, search model unchanged by the report series, bands, arrival weeks,
+                               KPIs, expected waste and warning, run overrides, start policy on fresh scenarios
   4. OUTPUT CONTROL .......... whole run vs reference, run() result, frozen output schema, errors, files
   5. STRESS-TEST CASES ....... the 26 data changes of meio_stress_tests.py do what they say
   6. ENGINE FINGERPRINT ...... the engine files are unchanged (they are maintained in the engine session)
 ================================================================================
 """
 import copy
+import math
 import hashlib
 import sys
 import types
@@ -277,7 +280,7 @@ DATA = str(ROOT / "MEIO_Data_Template.xlsx")
 D0 = ref.load_data(DATA)
 ref.make_scenarios(D0, 10, 1)            # sorts open orders by placement (the engine's loader does the same)
 STRESS = {c[0]: c for c in st.CASES}
-CONTRACT_VERSION = 2
+CONTRACT_VERSION = 4
 
 
 # ---------------------------------------------------------------------------- shared helpers
@@ -431,12 +434,13 @@ def stressed(cid):
 # ============================================================================
 def test_data_loading_equals_reference():
     d = ms.load_data(DATA)
-    for f in ("horizon", "review_period", "chance_level", "n_scenarios", "seed", "time_limit", "fg_shelf_life",
+    for f in ("horizon", "review_period", "fill_rate_target", "n_scenarios", "seed", "time_limit", "fg_shelf_life",
               "prod_moq", "prod_batch", "prod_max", "prod_fixed", "fg_holding", "fg_waste", "init_fg", "init_rm",
               "open_prod", "open_rm", "enforce_from_first_controllable"):
         assert getattr(d, f) == getattr(D0, f), f
     np.testing.assert_array_equal(d.demand_q, D0.demand_q)
-    assert [c.id for c in d.channels] == [c.id for c in D0.channels]
+    assert [(c.id, c.priority, c.target) for c in d.channels] == [(c.id, c.priority, c.target) for c in D0.channels]
+    assert [c.id for c in d.channels] == ["D2C", "B2B", "AMZ"] and d.fill_rate_target == 0.95     # H02, H04
     for a, b in zip(d.rms, D0.rms):
         assert (a.id, a.bom, a.shelf_life, a.min_remaining, a.moq, a.multiple, a.max_order, a.var_cost) == \
                (b.id, b.bom, b.shelf_life, b.min_remaining, b.moq, b.multiple, b.max_order, b.var_cost)
@@ -453,9 +457,9 @@ INVALID = {   # data change → message the engine must give (validate collects 
     "RM MOQ not a multiple": (lambda d: setattr(d.rms[2], "moq", 205.0), "MOQ must be a multiple of OrderMultiple"),
     "RM shelf life ≤ freshness rule": (lambda d: setattr(d.rms[2], "shelf_life", 36), "shelf life must exceed"),
     "initial FG fresher than possible": (lambda d: d.init_fg.append((40, 100.0)), "Initial FG lot"),
-    "fill-rate target > 1": (lambda d: setattr(d.channels[0], "target", 1.2), "target in (0,1]"),
+    "fill-rate target > 1": (lambda d: setattr(d, "fill_rate_target_excel", 1.2), "Items!TargetFillRate must be in (0, 1]"),
     "channel needs more shelf life than FG has": (lambda d: setattr(d.channels[1], "min_remaining", 40), "shelf-life need"),
-    "too few scenarios for the chance level": (lambda d: setattr(d, "n_scenarios", 50), "NumScenarios too small"),
+    "shortage priority repeated": (lambda d: setattr(d.channels[1], "priority", 1), "ShortagePriority must rank"),
     "Excel Checks sheet not READY": (lambda d: setattr(d, "data_status", "ERRORS"), "OVERALL"),
 }
 
@@ -480,7 +484,7 @@ def test_every_problem_is_listed_at_once():
         INVALID[case][0](d)
     with pytest.raises(ValueError) as e:
         ms.validate(d)
-    assert all(m in str(e.value) for m in ("ReviewPeriod", "Production: MOQ", "target in (0,1]"))
+    assert all(m in str(e.value) for m in ("ReviewPeriod", "Production: MOQ", "TargetFillRate must be in (0, 1]"))
 
 
 def _row(ws, col, val):
@@ -529,15 +533,16 @@ def _tier(table, no, col, value):
 
 S = lambda name, value: _set("Settings", name, 2, value)
 EXCEL_CHECKS = {   # Excel check → edit of an openpyxl copy → message of the engine. Cross-checked once against
-    # Excel's own verdict (LibreOffice recalculation of every copy): all 43 rejected by both.
+    # Excel's own verdict (LibreOffice recalculation of every copy): all rejected by both (last check 12.11.).
     "C01 parameter blank": (S("RandomSeed", None), "parameter RandomSeed has no value"),
     "X03 horizon 60": (S("HorizonPeriods", 60), "HorizonPeriods must be a whole number between 1 and 52"),
     "X06 review period 40": (S("ReviewPeriod", 40), "ReviewPeriod must be a whole number"),
-    "X07 chance level 1.5": (S("FillRateChanceLevel", 1.5), "FillRateChanceLevel must be in (0, 1]"),
-    "X07 too few scenarios": (S("NumScenarios", 50), "NumScenarios too small"),
     "C02 duplicate location": (_copy_row("Locations", "DC", 7), "duplicate LocationID DC"),
     "C02 location type blank": (_set("Locations", "RMW", 3, None), "Name and Type must be filled"),
-    "C03 duplicate item": (_copy_row("Items", "RM2", 6), "duplicate ItemID RM2"),
+    "C03 duplicate item": (_copy_row("Items", "RM2", 7), "duplicate ItemID RM2"),
+    "C03 FG target 1.2": (_set("Items", "FG1", 6, 1.2), "TargetFillRate of FG1 must be in (0, 1]"),
+    "C03 FG target blank": (_set("Items", "FG1", 6, None), "TargetFillRate of FG1 must be in (0, 1]"),
+    "C03 RM with a target": (_set("Items", "RM3", 6, 0.9), "TargetFillRate is only for finished goods"),
     "C03 shelf life 0": (_set("Items", "RM3", 5, 0), "ShelfLife of RM3 must be a whole number > 0"),
     "C04 MOQ not a multiple": (_set("Sourcing", "RM1", 4, 725), "MOQ must be a multiple of OrderMultiple"),
     "C04 max below MOQ": (_set("Sourcing", "RM4", 6, 500), "MaxOrderQty must be ≥ MOQ"),
@@ -556,8 +561,10 @@ EXCEL_CHECKS = {   # Excel check → edit of an openpyxl copy → message of the
     "C07 lane tier table unknown": (_set("Lanes", "L_KAJA_DC", 6, "CT_NOPE"), "unknown tier table CT_NOPE"),
     "C08 lead time 6.6": (_set("LeadTimeDist", "LT_PROD_KAJA", 2, 6.6), "must be whole weeks ≥ 0"),
     "C08 probability 1.2": (_set("LeadTimeDist", "LT_RM1", 3, 1.2), "probability of LT_RM1 must be in (0, 1]"),
-    "C09 target 1.2": (_set("Channels", "AMZ", 5, 1.2), "TargetFillRate must be in (0, 1]"),
-    "C09 shelf need 40": (_set("Channels", "B2B", 6, 40), "shelf-life need must be whole weeks"),
+    "C09 priority used twice": (_set("Channels", "AMZ", 6, 1), "ShortagePriority 1 is used twice"),
+    "C09 priority 4 of 3": (_set("Channels", "AMZ", 6, 4), "ShortagePriority must be a whole number from 1 to 3"),
+    "C09 priority blank": (_set("Channels", "B2B", 6, None), "all fields of B2B must be filled"),
+    "C09 shelf need 40": (_set("Channels", "B2B", 5, 40), "shelf-life need must be whole weeks"),
     "C10 demand row twice": (_copy_row("Demand", "D2C", 13), "D2C week 1 appears twice"),
     "X05 demand row missing": (_demand("B2B", 20, None, None), "channel B2B has no row for week(s) 20"),
     "C10 quantiles decreasing": (_demand("AMZ", 5, 13, 1), "quantiles must be ≥ 0 and non-decreasing"),
@@ -580,7 +587,9 @@ VALID_EDITS = {
     "price change": _set("Costs", "RM3", 6, 3.5),
     "stochastic production lead time": _set("Production", "FG1", 8, "LT_PROD_KAJA_STOCH"),
     "400 scenarios, seed 7": lambda wb: (S("NumScenarios", 400)(wb), S("RandomSeed", 7)(wb)),
-    "D2C target 97%": _set("Channels", "D2C", 5, 0.97),
+    "product target 97%": _set("Items", "FG1", 6, 0.97),
+    "Amazon served first": lambda wb: (_set("Channels", "AMZ", 6, 1)(wb), _set("Channels", "D2C", 6, 3)(wb)),
+    "review period 4 weeks": S("ReviewPeriod", 4),
 }
 
 
@@ -649,12 +658,13 @@ def test_errors_are_exceptions_not_exits(tmp_path, monkeypatch):
     import openpyxl
     wb = openpyxl.load_workbook(DATA)
     ws = wb["Settings"]
+    ws = wb["Items"]
     for row in ws.iter_rows():
-        if row[0].value == "NumScenarios":
-            row[1].value = 10                      # too few scenarios for the 99% chance level
+        if row[0].value == "FG1":
+            row[5].value = 1.5                     # fill-rate target outside (0, 1]
     bad = tmp_path / "bad.xlsx"
     wb.save(bad)
-    with pytest.raises(ValueError, match="NumScenarios"):
+    with pytest.raises(ValueError, match="TargetFillRate"):
         ms.run(str(bad), str(lic), skr=fake)
     monkeypatch.setitem(sys.modules, "seeker", None)
     with pytest.raises(ImportError, match="pip install ioseeker"):
@@ -760,6 +770,90 @@ def test_both_seeker_signatures_and_stratified_demand(accept, monkeypatch):
     below = np.array([(vals <= e + 0.5).sum() for e in edges])
     assert np.all(np.abs(below - np.arange(10, 100, 10)) <= 2), below
 
+# ---------------------------------------------------------------------------- review period (A03)
+V18_START = {"template z1.5": [104634.978775, 0.993502104, 86], "template z2.5": [110845.472425, 0.997880384, 89],
+             "L2 z1.5": [104162.212625, 0.993085005, 81], "L2 z2.5": [110794.0597, 0.997919183, 83],
+             "S1 z1.5": [105747.132225, 0.985541841, 83], "S1 z2.5": [112315.037825, 0.988679752, 86]}
+
+
+def test_review_period_1_is_exactly_the_v18_model():
+    """R = 1: every week is a run week, so cost, mean fill rate and met cells equal the v18.0 engine (recorded 12.11.)."""
+    for name, cid in (("template", None), ("L2", "L2"), ("S1", "S1")):
+        d = stressed(cid) if cid else copy.deepcopy(D0)
+        assert d.review_period == 1
+        d.n_scenarios = 200
+        lay = ms.PolicyLayout(d)
+        for z in (1.5, 2.5):
+            fr, cost = ms.evaluate_policy(fake, d, lay, ms.start_policy(d, z=z), "lic", "x")
+            got = [round(cost, 6), round(float(np.mean(list(fr.values()))), 9), len(ms.rules_met(d, fr))]
+            assert got == V18_START[f"{name} z{z}"], (name, z, got)
+
+
+@pytest.mark.parametrize("R", [2, 4])
+def test_model_equals_reference_with_a_review_period(R):
+    """The planned position between runs (A03) is written a second time in the reference: same in every scenario,
+    with fixed and with uncertain lead times; the zero policy checks that s = 0 never orders (planned position ≥ 0)."""
+    for name in ("start", "random_wide", "zero"):
+        d = copy.deepcopy(D0)
+        d.review_period = R
+        check_equal(d, policies(d)[name])
+    d = stochastic_data()
+    d.review_period = R
+    for name in ("start", "random_small"):
+        check_equal(copy.deepcopy(d), policies(d)[name], R=80)
+
+
+def _reference_run(d, x, scen):
+    return ref.MEIOSimulator(d, scen).run(ms.PolicyLayout(d).decode(x), detail=True)
+
+
+def test_committed_weeks_are_the_same_in_every_future_and_cycles_ignore_later_demand():
+    """Weeks 1..R are decided at this run: identical in every scenario. Inside a later cycle the orders depend only on
+    what was known at its run week; changing the demand of the run week itself changes nothing until the next run."""
+    d = copy.deepcopy(D0)
+    d.review_period = 4
+    x = policies(d)["random_wide"]
+    scen = ref.make_scenarios(d, 120, 11)
+    res = _reference_run(d, x, scen)
+    keys = ["prod_qty"] + [f"{k.id}_order" for k in d.rms]
+    for key in keys:
+        assert np.all(res.detail[key][:, 1:5] == res.detail[key][:1, 1:5]), key
+    assert any(res.detail[key][:, 1:5].sum() > 0 for key in keys)
+    changed = copy.deepcopy(scen)
+    changed.demand[:, :, 5] = changed.demand[:, :, 5] * 2 + 300                 # run week 5: demand after the review
+    res2 = _reference_run(d, x, changed)
+    for key in keys:
+        np.testing.assert_array_equal(res.detail[key][:, 1:9], res2.detail[key][:, 1:9])
+    assert any(not np.array_equal(res.detail[key][:, 9:], res2.detail[key][:, 9:]) for key in keys)
+    d.review_period = 1                                                          # control: weekly runs do react
+    a, b = _reference_run(d, x, scen), _reference_run(d, x, changed)
+    assert any(not np.array_equal(a.detail[key][:, 6:9], b.detail[key][:, 6:9]) for key in keys)
+
+
+def test_start_policy_safety_stock_counts_the_uncertainty_since_the_last_run():
+    d1, d4 = copy.deepcopy(D0), copy.deepcopy(D0)
+    d4.review_period = 4
+    p1, p4 = ms.start_policy(d1, z=2.0), ms.start_policy(d4, z=2.0)
+    for t in (1, 5, 9):                                                          # run weeks: unchanged
+        assert p4["FG"][0][t] == pytest.approx(p1["FG"][0][t])
+    for t in (2, 3, 4, 6):                                                       # planned weeks: more safety stock
+        assert p4["FG"][0][t] > p1["FG"][0][t]
+    assert p4["FG"][0][4] - p1["FG"][0][4] > p4["FG"][0][2] - p1["FG"][0][2]      # the older the information, the more
+    assert ms.run_week(d4, 4) == 1 and ms.run_week(d4, 5) == 5 and ms.run_week(d1, 7) == 7
+
+
+def test_x10_warns_when_the_horizon_is_too_short_and_matches_excel():
+    d = copy.deepcopy(D0)
+    assert not [w for w in ms.data_warnings(d) if "(X10)" in w]                  # 36 ≥ 18 + 1 + 8
+    d.review_period = 11                                                         # 36 < 18 + 11 + 8 = 37
+    w = [w for w in ms.data_warnings(d) if "(X10)" in w]
+    assert len(w) == 1 and "echelon lead time 18" in w[0]
+    import openpyxl
+    ws = openpyxl.load_workbook(DATA)["Checks"]
+    f = [r[5].value for r in ws.iter_rows() if r[0].value == "X10"]
+    assert len(f) == 1 and f"+{ms.HORIZON_MARGIN_WEEKS},1,0)" in f[0]            # same margin in Excel and Python
+
+
 # ============================================================================
 # 3. MODEL FUNCTIONALITY
 # ============================================================================
@@ -811,13 +905,72 @@ def test_raising_extra_cover_weeks_raises_only_that_bound_and_note_says_so(monke
     assert more.mult["RM3"] == 50 and more.mult["FG"] == 100
 
 
+def z_reference(d):
+    """K07 target-aware z₀, built independently: G(z) = E[(X − z)⁺] by numerical integration, solved on a grid."""
+    xs = np.linspace(-8, 12, 200001)
+    pdf = np.exp(-0.5 * xs ** 2) / math.sqrt(2 * math.pi)
+    G = lambda z: float(np.trapezoid(np.maximum(xs - z, 0) * pdf, xs))
+    mean = d.demand_q[:, 1:, :].mean(2).sum(0)
+    var = (((d.demand_q[:, 1:, -1] - d.demand_q[:, 1:, 0]) / 3.29) ** 2).sum(0)
+    W = d.prod_lead_time.max + 1 + 2
+    y = (1 - d.fill_rate_target) * mean.mean() / math.sqrt(W * var.mean())
+    grid = np.arange(0.0, 4.0 + 1e-9, 0.001)
+    return float(next((z for z in grid if G(z) <= y), 4.0))
+
+
+def k07_reference(d, z=None):
+    """K07, built independently: the v17.1 formula (reference heuristic) with the target-aware z + lot cap + lot guard."""
+    pol = ref.heuristic_policy(d, z_reference(d) if z is None else z, 2, 4, 4)
+    mean = d.demand_q[:, 1:, :].mean(2)
+    sell = sum(mean[ci].mean() * max(0, d.fg_shelf_life - c.min_remaining + 1) for ci, c in enumerate(d.channels))
+    lot = max(d.prod_moq, min(4 * mean.sum(0).mean(), sell))
+    s_fg = pol["FG"][0]
+    pol["FG"] = (s_fg, np.where(s_fg > 0, s_fg + lot, 0.0))
+    for k in d.rms:
+        s, _ = pol[k.id]
+        s = np.where(s > 0, np.maximum(s, k.bom * (s_fg + d.prod_moq)), 0.0)
+        pol[k.id] = (s, np.where(s > 0, s + max(k.moq, k.bom * lot), 0.0))
+    return pol
+
+
+def test_normal_loss_function_and_target_aware_z():
+    """K07: G(z) and its inverse against known values; z₀ falls with the target; z = 4 at a 100% target."""
+    assert ms.normal_loss(0.0) == pytest.approx(0.398942, abs=1e-6)
+    assert ms.normal_loss(1.0) == pytest.approx(0.083315, abs=1e-6)
+    assert ms.normal_loss(2.0) == pytest.approx(0.008491, abs=1e-6)
+    for y in (0.3, 0.05, 0.001):
+        assert ms.normal_loss(ms.normal_loss_inverse(y)) == pytest.approx(y, rel=1e-9)
+    d = copy.deepcopy(D0)
+    zs = []
+    for beta in (1.0, 0.99, 0.98, 0.95, 0.90, 0.80):
+        d.fill_rate_target = beta
+        zs.append(ms.start_z(d))
+        assert zs[-1] == pytest.approx(z_reference(d), abs=2e-3), beta
+    assert zs[0] == ms.START_Z_MAX and all(a > b for a, b in zip(zs, zs[1:])), zs
+    d.fill_rate_target = 0.95
+    assert ms.start_z(d) == pytest.approx(1.216, abs=1e-3)                    # template value (12.11.)
+
+
 def test_start_policy_formula():
     d = copy.deepcopy(D0)
     pol = ms.start_policy(d)
-    ref_pol = ref.heuristic_policy(d, 4.0, 2, 4, 4)                     # unchanged from the calibrated default
+    ref_pol = k07_reference(d, ms.start_z(d))          # z itself is checked against z_reference in the test above
     for j in pol:
         np.testing.assert_allclose(pol[j][0], ref_pol[j][0])
         np.testing.assert_allclose(pol[j][1], ref_pol[j][1])
+    # the lot guard raises only the last raw-material weeks on the template (cover window cut at the horizon); with z = 4
+    pol = ms.start_policy(d, z=4.0)
+    np.testing.assert_allclose(pol["FG"][0], k07_reference(d, 4.0)["FG"][0])
+    old = ref.heuristic_policy(d, 4.0, 2, 4, 4)
+    raised = [(k.id, t) for k in d.rms for t in range(1, d.horizon + 1) if pol[k.id][0][t] > old[k.id][0][t] + 1e-9]
+    assert len(raised) == 4 and min(t for _, t in raised) >= 20, raised
+    # the lot cap binds when a fresh lot can sell less than 4 weeks of demand (here: only D2C, 5 weeks)
+    d2 = copy.deepcopy(D0)
+    d2.fg_shelf_life, d2.prod_moq, d2.prod_batch = 20, 100.0, 100.0
+    p2 = ms.start_policy(d2)
+    d2c = [ci for ci, c in enumerate(d2.channels) if c.id == "D2C"][0]
+    sell = d2.demand_q[d2c, 1:, :].mean(1).mean() * 5
+    assert p2["FG"][1][1] - p2["FG"][0][1] == pytest.approx(sell) and ms.fresh_lot_sales(d2) == pytest.approx(sell)
     # hand calculation, FG week 1: window = max production LT 6 + 1 + 2 = 9 weeks (1..9)
     q = d.demand_q
     mu = q[:, 1:10, :].mean(2).sum(0)
@@ -835,19 +988,27 @@ def test_start_policy_formula():
     assert ms.start_policy(d, z=2.0)["FG"][0][1] < pol["FG"][0][1]
 
 
-@pytest.mark.parametrize("form", ["quantile", "frequency"])
-def test_constraint_statistic_matches_chance_definition(form, monkeypatch):
-    monkeypatch.setattr(ms, "FILL_RATE_CONSTRAINT_FORM", form)
+
+def test_fill_rate_rule_is_the_expected_fill_rate_per_cell():
+    """H05: one constraint per constrained cell, judging the mean over the scenarios of served ÷ demand against the
+    product's target; the cell example of the spec (94 × 100%, 3 × 80%, 3 × 0% → 96.4%) is met at 95%, not at 97%."""
     d = copy.deepcopy(D0)
     _, _, model, res = check_equal(d, policies(d)["random_small"], R=200)
-    stat = ref.chance_stat(res.fill_rate, d.chance_level)
-    assert len(model.fr_stat) == len(model.constrained) == 90
-    for (ci, t), term in model.fr_stat.items():
-        share = np.mean(res.fill_rate[:, ci, t] >= d.channels[ci].target - 1e-6)
-        assert model.fr_share[(ci, t)].get_value() == pytest.approx(share)
-        if form == "quantile":
-            assert term.get_value() == pytest.approx(stat[ci, t])
-        assert (share >= d.chance_level - 1e-9) == (stat[ci, t] >= d.channels[ci].target - 1e-9)
+    assert len(model.constrained) == 90 and len(model.env._cons) == 90
+    assert {r for _, r, _ in model.env._cons} == {0.95}
+    mean = ref.expected_fill_rate(res.fill_rate)
+    for (ci, t), agg in model.fr_mean.items():
+        assert agg.get_value() == pytest.approx(mean[ci, t])
+    assert ms.constraints_met(model, d) == sum(mean[ci, t] >= 0.95 - 1e-9 for ci, t in model.constrained)
+    d90 = copy.deepcopy(D0)
+    d90.fill_rate_target = 0.90
+    _, _, m90 = build(d90, policies(d90)["random_small"], R=20)
+    assert {r for _, r, _ in m90.env._cons} == {0.90}                              # the rule uses the run's target
+    example = (94 * 1.0 + 3 * 0.8 + 3 * 0.0) / 100
+    d.fill_rate_target = 0.95
+    assert example == pytest.approx(0.964) and ms.cell_met(d, example)
+    d.fill_rate_target = 0.97
+    assert not ms.cell_met(d, example)
 
 
 def test_priorities_set_for_every_variable():
@@ -901,7 +1062,7 @@ def note_for(cid, n=200):
     env.set_stochastic_parameters(n, 0.0)
     model = ms.build_model(fake, env, d, layout, layout.encode(pol0), d.seed, n)
     env.evaluate()
-    return ms.feasibility_note(d, {k: model.fr_share[k].get_value() for k in model.constrained}, max_share)
+    return ms.feasibility_note(d, {k: model.fr_mean[k].get_value() for k in model.constrained}, max_share)
 
 
 def test_feasibility_check_no_false_alarm_on_feasible_cases():
@@ -910,13 +1071,14 @@ def test_feasibility_check_no_false_alarm_on_feasible_cases():
 
 
 def test_feasibility_check_finds_the_supply_gaps():
-    d1 = note_for("D1")                               # +30% demand: strawberry gap weeks 15–19
-    for frag in ("D2C w", "B2B w", "AMZ w", "16"):
-        assert frag in d1, d1
-    o2 = note_for("O2")                               # cancelled strawberry orders: weeks 15–16
-    assert "fail whatever we decide" in o2 and "16" in o2, o2
-    o5 = note_for("O5")                               # strawberry capacity below demand
-    assert "fail whatever we decide" in o5 and "AMZ" in o5, o5
+    """Under H05 (expected fill rate ≥ 95%) a gap counts only if it lowers the mean of a cell below the target:
+    demand +30% (D1) is reachable on average (it failed the old chance rule in weeks 15–19); cancelled strawberry
+    orders (O2) leave Amazon week 16 at 91.6%; strawberry capacity below demand (O5) fails B2B/AMZ weeks."""
+    assert note_for("D1").startswith("OK")
+    o2 = note_for("O2")
+    assert "fail whatever we decide" in o2 and "AMZ w16" in o2 and "91.6%" in o2, o2
+    o5 = note_for("O5")
+    assert "fail whatever we decide" in o5 and "AMZ w" in o5 and "B2B w" in o5, o5
 
 
 def test_feasibility_note_needs_both_policies_to_fail_and_groups_weeks():
@@ -932,14 +1094,15 @@ def test_feasibility_note_needs_both_policies_to_fail_and_groups_weeks():
 
 
 def test_search_model_has_no_report_series():
-    """The report series are built only for the out-of-sample check (L05). The search and feasibility models
-    are the v16 model: same Terms in the same order (13,102 Terms on the template; the full Seeker call
-    sequence was compared with v16 once: identical, also with stochastic lead times)."""
+    """The report series are built only for the out-of-sample check (L05). The search and feasibility models have
+    13,099 Terms on the template (v16–v17.2: 13,102; v18 uses one aggregate_mean per cell instead of a share with a
+    target constant per channel, so 3 constants fewer; the Seeker call sequence was compared with v17.2: identical
+    apart from the fill-rate aggregates)."""
     d = copy.deepcopy(D0)
     x = policies(d)["start"]
     env, _, model = build(d, x, R=20)
     env_d, _, model_d = build(d, x, R=20, detail=True)
-    assert model.detail is None and env.n_terms() == 13102
+    assert model.detail is None and env.n_terms() == 13099
     assert model_d.detail and env_d.n_terms() > env.n_terms()
     assert model.objective.get_value() == model_d.objective.get_value()
 
@@ -1009,6 +1172,7 @@ def test_bands_are_the_statistics_of_the_reference_series(lead):
 def test_arrival_weeks_are_conditional_on_an_order():
     """L06: arrival week of the order placed in week t, over the scenarios where it is placed (nan if never)."""
     d = stochastic_data()
+    d.review_period = 2                                              # commit-now notes for weeks 1 and 2
     d.open_prod[1]["arrival"] = 9                                    # pushes some arrivals (no overtaking)
     _, oos, res = detail_oos(d, policies(d)["random_wide"], R=200)
     rec, checked = res.detail, 0
@@ -1028,7 +1192,7 @@ def test_arrival_weeks_are_conditional_on_an_order():
                 assert got == pytest.approx(want), (item, t, kind)
             checked += placed.any()
     assert checked > 20
-    for t in (1, 2):                                                 # commit-now notes use the conditional P50
+    for t in range(1, d.review_period + 1):                          # commit-now notes use the conditional P50
         assert oos[("prod", "arrival", t)] == oos[("band", "arrival_week", d.fg_id, t, "p50")] or \
             np.isnan(oos[("prod", "arrival", t)])
 
@@ -1068,11 +1232,11 @@ def test_run_overrides_change_the_in_sample_run_and_are_checked(tmp_path, monkey
     monkeypatch.setattr(ms, "build_model", lambda *a, **k: seen.append((a[5], a[6], k.get("detail", False))) or real(*a, **k))
     res = headless_run(tmp_path, monkeypatch, overrides={"NumScenarios": 100, "RandomSeed": 43})
     assert res.overrides == {"NumScenarios": 100, "RandomSeed": 43} and res.ins["n"] == 100
-    assert seen[0] == (43, 100, False) and seen[1] == (43, 100, False)          # feasibility + search
-    assert seen[2] == (44, 60, True)                                             # fresh seeds never = 43
+    assert all(c == (43, 100, False) for c in seen if not c[2]) and len(seen) >= 3  # feasibility, start check, search
+    assert [c for c in seen if c[2]] == [(44, 60, True)]                           # fresh seeds never = 43
     summ = dict(res.sheets["Summary"].values)
     assert summ["Run overrides (K20)"] == "NumScenarios = 100, RandomSeed = 43"
-    for bad, msg in (({"NumScenarios": 50}, "NumScenarios too small"), ({"Speed": 1}, "unknown run override Speed"),
+    for bad, msg in (({"NumScenarios": 0}, "must be a whole number ≥ 1"), ({"Speed": 1}, "unknown run override Speed"),
                      ({"NumScenarios": 100.5}, "must be a whole number"), ({"RandomSeed": -1}, "must be a whole number")):
         with pytest.raises(ValueError, match=msg):
             headless_run(tmp_path, monkeypatch, overrides=bad)
@@ -1082,13 +1246,285 @@ def test_start_policy_on_the_same_fresh_seeds(tmp_path, monkeypatch):
     monkeypatch.setattr(ms, "START_POLICY_OUT_OF_SAMPLE", True)
     res = headless_run(tmp_path, monkeypatch)
     d = res.data
-    x0 = res.layout.encode(ms.start_policy(d))
+    assert not res.ins["repair"]["used"]
+    x0 = res.layout.encode(ms.start_policy(d, z=res.ins["start_z"]["z"]))          # the start Seeker used (K07)
     _, _, model = build(copy.deepcopy(D0), x0, R=60, seed=d.seed + 1)
     assert res.oos_start["cost"] == pytest.approx(model.objective.get_value(), rel=1e-12)
     kpi = dict(zip(res.sheets["KPIs"]["Item"], res.sheets["KPIs"]["Mean"]))
     assert kpi["Saving vs. start policy (fresh, same seeds)"] == pytest.approx(1 - res.oos["cost"] / res.oos_start["cost"])
     monkeypatch.setattr(ms, "START_POLICY_OUT_OF_SAMPLE", False)
     assert headless_run(tmp_path, monkeypatch).oos_start is None
+
+
+def fast_copy(tmp_path, moq=None, name="fast.xlsx"):
+    """The fast-moving test case of 10.11. as an openpyxl copy of the template: 24 weeks, FG shelf life 3, RM3/RM4 8,
+    short lead times, no freshness needs, starting stock with 1–3 weeks left (open orders keep the old lead times)."""
+    import openpyxl
+    wb = openpyxl.load_workbook(DATA)
+    for row in wb["Items"].iter_rows(min_row=5):
+        if row[0].value == "FG1":
+            row[4].value = 3
+        if row[0].value in ("RM3", "RM4"):
+            row[4].value = 8
+    lts = {"LT_RM1": 2, "LT_RM2": 1, "LT_RM3": 2, "LT_RM4": 4, "LT_PROD_KAJA": 1}
+    for row in wb["LeadTimeDist"].iter_rows(min_row=5):
+        if row[0].value in lts:
+            row[1].value = lts[row[0].value]
+    for row in wb["Channels"].iter_rows(min_row=5, max_row=7):
+        row[4].value = 0                                   # MinRemainingShelfLife
+    for row in wb["BOM"].iter_rows(min_row=5):
+        if row[1].value in ("RM3", "RM4"):
+            row[3].value = 0
+    for row in wb["Init_Inventory"].iter_rows(min_row=5):
+        if row[3].value is not None:
+            row[3].value = min(row[3].value, 3 if row[1].value == "FG1" else 2)
+    for row in wb["Settings"].iter_rows(min_row=5):
+        if row[0].value == "HorizonPeriods":
+            row[1].value = 24
+    if moq:
+        wb["Production"]["D5"].value = moq
+    path = tmp_path / name
+    wb.save(path)
+    return str(path)
+
+
+def run_file(tmp_path, monkeypatch, path, **kw):
+    lic = tmp_path / "license.sio"
+    lic.write_text("x")
+    monkeypatch.setattr(ms, "OUT_OF_SAMPLE_SCENARIOS", 60)
+    monkeypatch.setattr(ms, "OUT_OF_SAMPLE_BATCH", 60)
+    return ms.run(path, str(lic), time_limit=1, skr=fake, **kw)
+
+
+def test_fill_rate_target_from_excel_or_section_0(tmp_path, monkeypatch):
+    """K08: None → Items!TargetFillRate; a number replaces it for the search, start, checks and report."""
+    seen = []
+    real = ms.build_model
+    monkeypatch.setattr(ms, "build_model", lambda *a, **k: seen.append(a[2].fill_rate_target) or real(*a, **k))
+    res = headless_run(tmp_path, monkeypatch)
+    summ = dict(res.sheets["Summary"].values)
+    assert res.data.fill_rate_target == res.data.fill_rate_target_excel == 0.95 and set(seen) == {0.95}
+    assert "fill-rate target 95.0% (Excel Items!TargetFillRate of FG1)" in summ["Seeker settings"]
+    monkeypatch.setattr(ms, "OPTIMIZATION_FILL_RATE", 0.90)
+    seen.clear()
+    res = headless_run(tmp_path, monkeypatch)
+    summ = dict(res.sheets["Summary"].values)
+    assert res.data.fill_rate_target == 0.90 and res.data.fill_rate_target_excel == 0.95 and set(seen) == {0.90}
+    assert {c.target for c in res.data.channels} == {0.90}
+    assert "fill-rate target 90.0% (section 0 OPTIMIZATION_FILL_RATE; Excel 95.0%)" in summ["Seeker settings"]
+    assert res.ins["start_z"]["z0"] == pytest.approx(0.858, abs=1e-3)                 # start z from 90%
+    fr = res.sheets["FillRates"]
+    col = [c for c in fr.columns if c.startswith("Expected FR in-sample")][0]
+    con = fr[fr["Constrained"] == "yes"]
+    assert (fr["Target"] == 0.90).all()
+    assert ((con[col] >= 0.90 - 1e-9) == (con["Status in-sample"] == "OK")).all()        # status judged at 90%
+    assert int(summ["Constraints met in-sample"].split(" of ")[0]) == int((con[col] >= 0.90 - 1e-9).sum())
+    for bad in (0.0, 1.5):
+        monkeypatch.setattr(ms, "OPTIMIZATION_FILL_RATE", bad)
+        with pytest.raises(ValueError, match="OPTIMIZATION_FILL_RATE"):
+            headless_run(tmp_path, monkeypatch)
+
+
+def test_fill_rates_sheet_explains_each_cell(tmp_path, monkeypatch):
+    """L04: per cell the expected fill rate (in-sample, fresh), the share of fresh scenarios fully served and the
+    P10 fill rate, all equal to the reference simulator on the same fresh scenarios."""
+    res = headless_run(tmp_path, monkeypatch)
+    fr = res.sheets["FillRates"].set_index(["Channel", "Week"])
+    n = res.oos["n"]
+    cols = {c.split(" (")[0]: c for c in fr.columns if "(" in c}
+    assert set(cols) >= {"Expected FR in-sample", "Expected FR", "Fully served", "FR in a bad scenario, P10",
+                         "Worst 5% of futures, average FR"}
+    d, x = res.data, res.x
+    _, _, model = build(copy.deepcopy(D0), x, R=n, seed=d.seed + 1)
+    sim = ref.MEIOSimulator(copy.deepcopy(D0), seeker_scenarios(model, d)).run(res.layout.decode(x))
+    for ci, ch in enumerate(d.channels):
+        for t in (7, 20, 36):
+            f = sim.fill_rate[:, ci, t]
+            assert fr.loc[(ch.id, t), cols["Expected FR"]] == pytest.approx(f.mean(), rel=1e-9)
+            assert fr.loc[(ch.id, t), cols["Fully served"]] == pytest.approx((f >= 1 - 1e-6).mean())
+            assert fr.loc[(ch.id, t), "Status out-of-sample"] == ("OK" if f.mean() >= 0.95 - 1e-9 else "BELOW TARGET")
+            tail = np.sort(f)[:int(round(0.05 * n))].mean()                     # the worst 5% (n = 60 → 3 futures)
+            assert fr.loc[(ch.id, t), cols["Worst 5% of futures, average FR"]] == pytest.approx(tail, abs=1e-9)
+    ci, t = min(res.ins["constrained"], key=lambda k: res.oos[("fr_mean",) + k])
+    assert dict(res.sheets["Summary"].values)["Weakest cell (out-of-sample)"].startswith(
+        f"{d.channels[ci].id} week {t}: expected FR {res.oos[('fr_mean', ci, t)]:.1%} (target 95.0%)")
+
+
+def test_worst_5_percent_average_is_exact_also_with_ties():
+    """L04: the tail formula equals the mean of the lowest 5% of futures, also for all-or-nothing weeks."""
+    rng = np.random.default_rng(3)
+    for f in (np.minimum(1, rng.gamma(2, 0.6, 2000)), np.where(rng.random(2000) < 0.046, 0.0, 1.0),
+              np.where(rng.random(2000) < 0.06, rng.random(2000), 1.0), np.ones(2000)):
+        env = fake.Env("lic", True)
+        env.set_stochastic_parameters(len(f), 0.0)
+        term = fake.Term(env, lambda: f.copy(), [], True)
+        read = ms.single_number(types.SimpleNamespace(env=env, T=ms._T(env)), term, "tail5")
+        env.evaluate()
+        assert read() == pytest.approx(np.sort(f)[:100].mean(), abs=1e-9)
+
+
+def test_input_warnings_x08_open_orders_and_x09_lot_size(tmp_path):
+    """X08 / X09 (K19): silent on the template; on the fast-moving copy every open order placed under the old lead
+    times and the MOQ 6,000 (> about 5,600 cans a fresh lot can sell) are flagged; MOQ 2,000 is not."""
+    assert len(ms.load_data(DATA).warnings) == 2                                   # only the two Sourcing warnings
+    w = ms.load_data(fast_copy(tmp_path)).warnings
+    x08 = [m for m in w if "(X08)" in m]
+    assert len(x08) == 9 and any("PRD-FG1-02" in m and "no overtaking" in m for m in x08)
+    assert any(m.startswith("Open_Orders row 11 (PO-RM4-02)") and "12 weeks after placement" in m and "4 weeks" in m for m in x08)
+    x09 = [m for m in w if "(X09)" in m]
+    assert len(x09) == 1 and "Production MOQ 6,000" in x09[0]
+    d = ms.load_data(fast_copy(tmp_path, moq=2000, name="moq2000.xlsx"))
+    assert not [m for m in d.warnings if "(X09)" in m]
+    sell = ms.fresh_lot_sales(d)                                                   # 4 sellable weeks × mean demand
+    assert sell == pytest.approx(4 * d.demand_q[:, 1:, :].mean(2).mean(1).sum())
+    tpl = ms.load_data(DATA)                                                       # D2C 21 weeks, AMZ/B2B 13 weeks
+    mean_c = tpl.demand_q[:, 1:, :].mean(2).mean(1)
+    assert ms.fresh_lot_sales(tpl) == pytest.approx(sum(m * (37 - c.min_remaining) for m, c in zip(mean_c, tpl.channels)))
+
+
+def test_max_supply_reorder_point_is_the_reachable_position_plus_one_order():
+    """K17 v17.2: s = S = reachable position + max order (small enough for a repaired start, K21)."""
+    d = copy.deepcopy(D0)
+    lay = ms.PolicyLayout(d)
+    pol = ms.max_supply_policy(d, lay)
+    fg0 = sum(q for _, q in d.init_fg) + sum(o["qty"] for o in d.open_prod)
+    rm0 = {k.id: sum(q for _, q in d.init_rm[k.id]) + sum(o["qty"] for o in d.open_rm[k.id]) for k in d.rms}
+    for t in (1, 10):
+        reach = fg0 + min([(t - 1) * d.prod_max] + [(rm0[k.id] + (t - 1) * k.max_order) / k.bom for k in d.rms])
+        assert reach + d.prod_max < pol["FG"][0][t] <= reach + d.prod_max + lay.mult["FG"]
+        for k in d.rms:
+            r = rm0[k.id] + k.bom * fg0 + (t - 1) * k.max_order + k.max_order
+            assert r < pol[k.id][0][t] <= r + lay.mult[k.id] and pol[k.id][1][t] == pol[k.id][0][t]
+    assert pol["FG"][0][lay.active_until["FG"] + 1] == 0
+
+
+def test_start_check_raises_z_on_the_template_without_repair(tmp_path, monkeypatch, capsys):
+    """K07: the target-aware start (z₀ = 1.22 at 95%) misses a few cells on Seeker's scenarios; the start check raises z
+    in steps of 0.5 until every cell is met, then Seeker starts from it — no repair."""
+    res = headless_run(tmp_path, monkeypatch)
+    out = capsys.readouterr().out
+    zr = res.ins["start_z"]
+    assert zr["z0"] == pytest.approx(1.216, abs=1e-3) and zr["z"] > zr["z0"] and zr["z"] <= ms.START_Z_MAX
+    assert [s["z"] for s in zr["steps"]] == [zr["z0"]] + [1.5 + 0.5 * i for i in range(len(zr["steps"]) - 1)]
+    assert zr["steps"][-1]["met"] == 90 and all(s["met"] < 90 for s in zr["steps"][:-1])
+    assert res.ins["start"]["met"] == 90 and f"Seeker starts from z = {zr['z']:.2f}" in out
+    assert "START REPAIR USED" not in out and not res.ins["repair"]["used"]
+    summ = dict(res.sheets["Summary"].values)
+    assert summ["Start repair (section 4c, K21)"] == "not needed — the start check raised z (see 'Start policy')"
+    assert summ["Start policy (warm start)"].startswith(f"z = {zr['z']:.2f} (z₀ = 1.22 from fill-rate target 95.0% "
+                                                        "via the normal loss function, raised by the start check)")
+    assert "Start policy before repair (in-sample)" not in summ
+    monkeypatch.setattr(ms, "START_Z", 4.0)                                        # fixed z: no steps
+    res = headless_run(tmp_path, monkeypatch)
+    assert res.ins["start_z"]["steps"] == [] and res.ins["repair"] == {"used": False}
+    assert dict(res.sheets["Summary"].values)["Start policy (warm start)"].startswith("z = 4.00 (fixed in section 0")
+
+
+def test_lower_target_gives_a_lower_start_z_and_cheaper_start():
+    d = copy.deepcopy(D0)
+    costs = []
+    for beta in (0.98, 0.95, 0.90):
+        d.fill_rate_target = beta
+        lay, pol = ms.PolicyLayout(d), ms.start_policy(d)
+        lay.include_start(pol)
+        _, _, model = build(d, lay.encode(pol), R=50)
+        costs.append(model.objective.get_value())
+    assert costs[0] > costs[1] > costs[2], costs
+
+
+def test_start_check_and_repair_on_the_fast_moving_case(tmp_path, monkeypatch, capsys):
+    """Fast-moving copy (MOQ 6,000). (a) Target-aware start: z₀ ≈ 1.0 misses cells, the start check raises z to 2.0 and
+    every cell is met — no repair. (b) With z fixed at 1.0 (no steps) the repair (K21) makes the start feasible."""
+    res = run_file(tmp_path, monkeypatch, fast_copy(tmp_path))
+    zr = res.ins["start_z"]
+    assert zr["z0"] == pytest.approx(0.997, abs=1e-3) and zr["z"] == 2.0 and [s["z"] for s in zr["steps"]][1:] == [1.5, 2.0]
+    assert res.ins["start"]["met"] == 69 and not res.ins["repair"]["used"]
+    capsys.readouterr()
+    monkeypatch.setattr(ms, "START_Z", 1.0)
+    calls = []
+    real = ms.evaluate_policy
+    monkeypatch.setattr(ms, "evaluate_policy", lambda *a, **k: calls.append(a[5]) or real(*a, **k))
+    res = run_file(tmp_path, monkeypatch, fast_copy(tmp_path, name="fast2.xlsx"))
+    out = capsys.readouterr().out
+    rec = res.ins["repair"]
+    assert res.ins["start_z"]["steps"] == [] and rec["used"] and rec["start_met"] < rec["target"] == rec["n"] == 69
+    assert rec["steps"][-1]["met"] == 69 and rec["chosen_met_target"] and res.ins["start"]["met"] == 69
+    assert all(c.startswith("4c. Start repair R") for c in calls[1:]) and len(calls[1:]) == len(
+        [s for s in rec["steps"] if s["step"] != "R3"])
+    assert out.count("START REPAIR USED") == 2
+    summ = dict(res.sheets["Summary"].values)
+    assert summ["Start repair (section 4c, K21)"].startswith("USED: start policy met")
+    assert summ["Start policy before repair (in-sample)"].endswith(f"{rec['start_met']} of 69 rules met")
+    # the repaired weeks: maximum supply only in the order weeks before a missed week, elsewhere the formula
+    pol0, msp = ms.start_policy(res.data, z=1.0), ms.max_supply_policy(res.data, res.layout)
+    raised = ms._raise_before(res.data, res.layout, pol0, msp, [24], 6)
+    lead = res.data.prod_lead_time.min
+    for t in range(1, 24 - lead - 5):
+        assert raised["FG"][0][t] == pol0["FG"][0][t]
+    for t in range(24 - lead - 5, 24 - lead + 1):
+        assert raised["FG"][0][t] == msp["FG"][0][t]
+
+
+def test_start_repair_off_and_not_needed_cases(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(ms, "START_REPAIR", False)
+    monkeypatch.setattr(ms, "START_Z", 1.0)                                      # no z steps, no repair
+    res = run_file(tmp_path, monkeypatch, fast_copy(tmp_path))
+    assert "START_REPAIR = False" in capsys.readouterr().out and res.ins["repair"] == {"used": False}
+    monkeypatch.setattr(ms, "START_Z", None)                                     # z steps still run without repair
+    res = run_file(tmp_path, monkeypatch, fast_copy(tmp_path, name="f3.xlsx"))
+    assert res.ins["start_z"]["z"] > res.ins["start_z"]["z0"] and not res.ins["repair"]["used"]
+    monkeypatch.setattr(ms, "START_REPAIR", True)
+    res = run_file(tmp_path, monkeypatch, fast_copy(tmp_path, moq=2000, name="m2.xlsx"))  # the guard suffices here
+    assert not res.ins["repair"]["used"] and res.ins["start"]["met"] == len(res.ins["constrained"])
+
+
+def test_repair_keeps_the_best_step_when_no_step_meets_the_target(monkeypatch):
+    """If no step meets every target rule, Seeker starts from the step meeting the most (then the cheapest)."""
+    d = copy.deepcopy(D0)
+    lay = ms.PolicyLayout(d)
+    keys = [(0, 10), (0, 11), (0, 12)]
+    start = {keys[0]: 1.0, keys[1]: 0.5, keys[2]: 0.5}
+    maxs = {keys[0]: 0.5, keys[1]: 1.0, keys[2]: 1.0}
+    results = iter([({keys[0]: 0.5, keys[1]: 1.0, keys[2]: 0.5}, 200.0),     # R1: 1 of 3 target rules
+                    ({keys[0]: 0.5, keys[1]: 1.0, keys[2]: 1.0}, 300.0),     # R2 (6): 2 of 3
+                    ({keys[0]: 0.5, keys[1]: 1.0, keys[2]: 1.0}, 250.0)])    # R2 (12): 2 of 3, cheaper
+    monkeypatch.setattr(ms, "evaluate_policy", lambda *a, **k: next(results))
+    pol0 = ms.start_policy(d)
+    _, rec = ms.repair_start(fake, d, lay, pol0, start, 100.0, maxs, "lic")
+    assert [s["step"] for s in rec["steps"]] == ["R1", "R2", "R2", "R3"]
+    assert rec["chosen"].startswith("R2: maximum supply in the 12") and not rec["chosen_met_target"]
+
+
+def test_waste_shares_use_the_right_demand():
+    """L10: FG waste ÷ expected FG demand; raw-material waste ÷ (BOM × expected FG demand)."""
+    d = copy.deepcopy(D0)
+    oos = {("fg_waste", t): 10.0 for t in range(1, 37)}
+    oos.update({(k.id, "waste", t): 2.0 for k in d.rms for t in range(1, 37)})
+    rows, _ = ms.waste_summary(d, oos)
+    demand = d.demand_q[:, 1:, :].mean(2).sum()
+    got = {i: sh for i, _, sh in rows}
+    assert got["FG1"] == pytest.approx(360 / demand)
+    for k in d.rms:
+        if k.perishable:
+            assert got[k.id] == pytest.approx(72 / (k.bom * demand))
+
+
+def test_expected_waste_rows_and_warning(tmp_path, monkeypatch, capsys):
+    """L10: waste rows on the fresh scenarios; no warning on the template; a warning above the limit."""
+    res = headless_run(tmp_path, monkeypatch)
+    summ = dict(res.sheets["Summary"].values)
+    fg = sum(res.oos[("fg_waste", t)] for t in range(1, 37))
+    demand = res.data.demand_q[:, 1:, :].mean(2).sum()
+    assert summ["Expected waste FG1 (out-of-sample, L10)"] == f"{fg:,.0f} pcs = {fg / demand:.1%} of expected demand"
+    assert "Expected waste RM3 (out-of-sample, L10)" in summ and "Expected waste RM1 (out-of-sample, L10)" not in summ
+    rm4 = [k for k in res.data.rms if k.id == "RM4"][0]
+    w4 = sum(res.oos[("RM4", "waste", t)] for t in range(1, 37))
+    assert summ["Expected waste RM4 (out-of-sample, L10)"] == f"{w4:,.0f} kg = {w4 / (rm4.bom * demand):.1%} of expected demand"
+    assert summ["Waste warning (L10)"] == "none" and "WARNING (L10)" not in capsys.readouterr().out
+    monkeypatch.setattr(ms, "WASTE_WARNING_SHARE", 0.0)
+    res = headless_run(tmp_path, monkeypatch)
+    assert "WARNING (L10): expected waste is high" in capsys.readouterr().out
+    assert "MEIO_shelf_life_aware_policies.md" in dict(res.sheets["Summary"].values)["Waste warning (L10)"]
 
 
 def test_single_number_reads_aggregates_and_constant_terms():
@@ -1125,10 +1561,10 @@ def test_out_of_sample_batches_combine_exactly(monkeypatch):
         env, _, model = build(d, x, R=nb, seed=d.seed + 1 + b)
         res = ref.MEIOSimulator(d, seeker_scenarios(model, d)).run(lay.decode(x))
         costs.append(res.cost.sum())
-        shares.append((res.fill_rate[:, 1, 20] >= d.channels[1].target - 1e-6).sum())
+        shares.append(res.fill_rate[:, 1, 20].sum())                    # expected fill rate: sum of FR, then ÷ N
     assert oos["n"] == 120
     assert oos["cost"] == pytest.approx(sum(costs) / 120, rel=1e-12)
-    assert oos[("fr_share", 1, 20)] == pytest.approx(sum(shares) / 120)
+    assert oos[("fr_mean", 1, 20)] == pytest.approx(sum(shares) / 120)
 
 # ============================================================================
 # 4. OUTPUT CONTROL
@@ -1143,8 +1579,8 @@ def test_whole_run_report_matches_reference(tmp_path, monkeypatch):
     seen = {}
     real_opt = ms.optimize
 
-    def spy(*a):
-        x, ins = real_opt(*a)
+    def spy(*a, **k):
+        x, ins = real_opt(*a, **k)
         seen["x"], seen["layout"] = x, a[2]
         return x, ins
     monkeypatch.setattr(ms, "optimize", spy)
@@ -1166,7 +1602,7 @@ def test_whole_run_report_matches_reference(tmp_path, monkeypatch):
     sw = xl["Stock_Waste"].set_index("Week")
     np.testing.assert_allclose(sw["FG1 end stock (mean)"].values, res.detail["fg_end"][:, 1:].mean(0), rtol=1e-9)
     fr = xl["FillRates"]
-    col = [c for c in fr.columns if c.startswith("Mean FR")][0]
+    col = [c for c in fr.columns if c.startswith("Expected FR (")][0]
     ref_mean = [res.fill_rate[:, ci, t].mean() for ci in range(len(d.channels)) for t in range(1, d.horizon + 1)]
     np.testing.assert_allclose(fr[col].values, ref_mean, rtol=1e-9)
     np.testing.assert_allclose(dec["P(production)"].values, (res.detail["prod_qty"][:, 1:] > 0).mean(0))
@@ -1178,13 +1614,13 @@ def test_whole_run_report_matches_reference(tmp_path, monkeypatch):
         if isinstance(key, tuple) and len(key) == 3 and key[1] == "mean" and key[2] == 2:
             oos2[key] = 12345.0
     rows = real_report(d_, lay_, x_, ins_, oos2)["Commit_Now"]
-    week1 = rows[rows["When"] == "Week 1"].set_index("Decision")["Quantity / rule"]
+    week1 = rows[rows["When"] == "Week 1"].set_index("Decision")["Quantity"]
     assert week1["Production order FG1 (KAJA)"] == res.detail["prod_qty"][0, 1]
     for k in d.rms:
         assert week1[f"Supplier order {k.id}"] == res.detail[f"{k.id}_order"][0, 1]
         assert week1[f"Transfer {k.id} RMW → KAJA"] == pytest.approx(res.detail[f"{k.id}_transfer"][0, 1])
     commit = xl["Commit_Now"]
-    rm3 = commit[(commit["When"] == "Week 1") & (commit["Decision"] == "Supplier order RM3")]["Quantity / rule"].iloc[0]
+    rm3 = commit[(commit["When"] == "Week 1") & (commit["Decision"] == "Supplier order RM3")]["Quantity"].iloc[0]
     assert float(rm3) == res.detail["RM3_order"][0, 1]
 
 
@@ -1238,6 +1674,38 @@ def headless(tmp_path, monkeypatch):
     return ms.run(str(DATA), str(lic), time_limit=1, skr=fake)
 
 
+def test_commit_now_lists_every_decision_of_the_review_period(tmp_path, monkeypatch):
+    """R = 4: Commit_Now holds exact quantities for weeks 1–4 (no rules), equal to the reference in every scenario;
+    the Decisions sheet marks weeks 1–4 COMMIT NOW and names the run week that plans each later week (L02, L03)."""
+    import openpyxl
+    wb = openpyxl.load_workbook(DATA)
+    for row in wb["Settings"].iter_rows():
+        if row[0].value == "ReviewPeriod":
+            row[1].value = 4
+    path = tmp_path / "r4.xlsx"
+    wb.save(path)
+    lic = tmp_path / "license.sio"
+    lic.write_text("x")
+    monkeypatch.setattr(ms, "OUT_OF_SAMPLE_SCENARIOS", 60)
+    monkeypatch.setattr(ms, "OUT_OF_SAMPLE_BATCH", 60)
+    res = ms.run(str(path), str(lic), time_limit=1, skr=fake)
+    d, commit, dec = res.data, res.sheets["Commit_Now"], res.sheets["Decisions"]
+    assert d.review_period == 4 and list(commit["When"].unique()) == ["Week 1", "Week 2", "Week 3", "Week 4"]
+    assert not commit["Decision"].str.contains("Rule").any()
+    dr = ref.load_data(str(path))
+    rr = ref.MEIOSimulator(dr, ref.make_scenarios(dr, 50, 5)).run(res.policy, detail=True)
+    for t in range(1, 5):
+        rows = commit[commit["When"] == f"Week {t}"].set_index("Decision")["Quantity"]
+        assert np.all(rr.detail["prod_qty"][:, t] == rows["Production order FG1 (KAJA)"])
+        for k in d.rms:
+            assert np.all(rr.detail[f"{k.id}_order"][:, t] == rows[f"Supplier order {k.id}"])
+    assert list(dec["Status"][:4]) == ["COMMIT NOW (exact)"] * 4
+    assert dec["Status"][4] == "Indicative — re-optimized at the run in week 5"
+    assert dec["Status"][5] == "Indicative — planned at the run in week 5"
+    assert list(res.sheets["Policy_sS"]["Planned at run week"][:9]) == [1, 1, 1, 1, 5, 5, 5, 5, 9]
+    assert "R = 4 weeks" in res.sheets["Summary"].set_index("Item").loc["Review period (A03)", "Value"]
+
+
 def schema_of(res):
     return {"contract_version": CONTRACT_VERSION,
             "sheets": {name: list(map(str, df.columns)) for name, df in res.sheets.items()}}
@@ -1250,7 +1718,7 @@ def test_run_returns_everything_an_app_needs(tmp_path, monkeypatch):
     assert set(res.policy) == {"FG", "RM1", "RM2", "RM3", "RM4"}
     for s, S in res.policy.values():
         assert len(s) == len(S) == H + 1 and (S >= s).all()
-    for key in ("cost", "parts", "fr_share", "met", "start", "status", "feasibility", "constrained"):
+    for key in ("cost", "parts", "fr_mean", "met", "start", "status", "feasibility", "constrained", "repair", "start_z"):
         assert key in res.ins, key
     assert res.oos["n"] == 60 and "cost" in res.oos
     assert res.ins["feasibility"].startswith("OK")
@@ -1265,9 +1733,9 @@ def test_output_schema_is_frozen(tmp_path, monkeypatch):
     assert got == OUTPUT_SCHEMA, "output schema changed: update OUTPUT_SCHEMA and CONTRACT_VERSION (engine session)"
 
 
-# frozen output schema (contract version 2: v1 + Bands, KPIs): sheet → column names, template data
+# frozen output schema (contract version 3: v2 + rule E — FillRates columns, one target per product): sheet → column names, template data
 OUTPUT_SCHEMA = {
- "contract_version": 2,
+ "contract_version": 4,
  "sheets": {
   "Summary": [
    "Item",
@@ -1276,12 +1744,13 @@ OUTPUT_SCHEMA = {
   "Commit_Now": [
    "When",
    "Decision",
-   "Quantity / rule",
+   "Quantity",
    "Note"
   ],
   "Policy_sS": [
    "Week",
    "WeekStart",
+   "Planned at run week",
    "FG s",
    "FG S",
    "FG active",
@@ -1332,11 +1801,13 @@ OUTPUT_SCHEMA = {
    "Week",
    "Target",
    "Constrained",
-   "P(FR ≥ target) in-sample (200 Seeker scenarios)",
+   "Expected FR in-sample (200 Seeker scenarios)",
    "Status in-sample",
-   "Mean FR (60 fresh scenarios)",
-   "P(FR ≥ target) (60 fresh scenarios)",
-   "Status out-of-sample"
+   "Expected FR (60 fresh scenarios)",
+   "Status out-of-sample",
+   "Fully served (60 fresh scenarios)",
+   "FR in a bad scenario, P10 (60 fresh scenarios)",
+   "Worst 5% of futures, average FR (60 fresh scenarios)"
   ],
   "Stock_Waste": [
    "Week",
@@ -1374,6 +1845,7 @@ OUTPUT_SCHEMA = {
 }
 
 
+
 # ============================================================================
 # 5. STRESS-TEST CASES — every data change does exactly what its name says
 # ============================================================================
@@ -1384,12 +1856,14 @@ def test_every_case_produces_valid_data_and_a_model_layout():
 
 
 def test_channel_change_keeps_priority_rule_and_demand_rows_aligned():
-    d = stressed("F2")                                           # AMZ 0.97 > B2B 0.95 → served before B2B
-    assert [c.id for c in d.channels] == ["D2C", "AMZ", "B2B"]
-    old = {c.id: D0.demand_q[i] for i, c in enumerate(D0.channels)}
+    """Stress changes keep the serving order of ShortagePriority (H02) and the demand rows; targets are per product."""
+    d = stressed("R1")                                           # freshness change: order and demand rows unchanged
+    assert [c.id for c in d.channels] == ["D2C", "B2B", "AMZ"]
     for i, c in enumerate(d.channels):
-        np.testing.assert_array_equal(d.demand_q[i], old[c.id])
-    assert [round(c.target, 2) for c in stressed("F1").channels] == [0.99, 0.96, 0.91]
+        np.testing.assert_array_equal(d.demand_q[i], D0.demand_q[i])
+    for cid, value in (("F1", 0.96), ("F2", 0.98), ("F3", 0.90)):
+        d = stressed(cid)
+        assert d.fill_rate_target == value and {c.target for c in d.channels} == {value}
 
 
 def test_demand_changes():
@@ -1431,10 +1905,10 @@ def test_noise_and_direction_logic():
 # ============================================================================
 
 
-ENGINE_SHA256 = {   # engine v17.1 — set by the engine session (python test_engine.py --fingerprint)
-    "meio_seeker_stochastic.py": "ac458725d122b544f27f62315bc5ba3cb94e4be751a0cf96ccad1b780c16dba5",
-    "reference_simulator.py": "4033fc65563cfd0834b073870eef10dff06e90be49fc5b6734050382b615aab8",
-    "meio_stress_tests.py": "c64f9c6ba04117472b327ec603ff638df2030736e124a1ca58a62c76f417a93b",
+ENGINE_SHA256 = {   # engine v18.1 — set by the engine session (python test_engine.py --fingerprint)
+    "meio_seeker_stochastic.py": "1c6eed4c49ce15932987b100d30182e745ae02f8011a28fdbae39e95b8e8521d",
+    "reference_simulator.py": "a308374a5ae34f9798d4457a0cdcfe16e470861630f14ce1844f4019680c9025",
+    "meio_stress_tests.py": "f0fc2fe4fe372f045874de1d35846961eb1eb01d027a24b91810c17982af7a5c",
 }
 
 

@@ -14,8 +14,9 @@ are real model numbers, the search is trivial.
   6. ONE RUN AT A TIME (AC6) .... second run refused; cancel; watchdog; crash and restart recovery
   7. ARCHITECTURE & CONTRACT .... server never imports the engine; frozen API contract; result model = worker output
   8. START SCRIPT .............. settings template complete, secrets gitignored; the .bat checks (Windows)
-  9. SETTINGS, MASTER DATA ..... run settings reach the engine; chance-level guard; overrides; master data = engine's
-                                 reading; label/note; time estimate = measured run
+  9. SETTINGS, MASTER DATA ..... run settings reach the engine; the run's own fill-rate target is used and reset;
+                                 overrides; master data = engine's reading; label/note; time estimate = measured
+                                 runs incl. the start check; keep-awake; runs of older engines are not shown
 ================================================================================
 """
 import ast
@@ -181,18 +182,21 @@ def test_headline_is_the_engines_out_of_sample_result(done):
     assert result["test_double"] is True and result["seeker_version"].startswith("FAKE")
 
 
-def test_missed_rules_are_the_rows_the_engine_marks_below_level(done):
+def test_missed_rules_are_the_rows_the_engine_marks_below_target(done):
     _, _, result = done
     t = result["sheets"]["FillRates"]
     fr = pd.DataFrame(t["rows"], columns=t["columns"])
     hit = fr.index[fr["Constrained"] == "yes"][[0, 5]]
-    fr.loc[hit, "Status out-of-sample"] = "BELOW LEVEL"
-    share = [c for c in fr.columns if c.startswith("P(FR ≥ target) (")][0]
-    below = fr.index[(fr["Constrained"] == "yes") & (fr["Status out-of-sample"] == "BELOW LEVEL")]
-    assert set(hit) < set(below)                                 # the forced rows plus the run's own misses
+    fr.loc[hit, "Status out-of-sample"] = "BELOW TARGET"
+    col = {k: next(c for c in fr.columns if c.startswith(p)) for k, p in
+           [("expected_fill_rate", "Expected FR ("), ("fully_served", "Fully served ("),
+            ("bad_scenario_p10", "FR in a bad scenario, P10 ("), ("worst_5pct_average", "Worst 5% of futures")]}
+    below = fr.index[(fr["Constrained"] == "yes") & (fr["Status out-of-sample"] == "BELOW TARGET")]
+    assert set(hit) <= set(below)                                # the forced rows plus the run's own misses
     expected = [{"channel": fr.at[i, "Channel"], "week": int(fr.at[i, "Week"]), "target": fr.at[i, "Target"],
-                 "share": fr.at[i, share]} for i in below]
+                 **{k: fr.at[i, c] for k, c in col.items()}} for i in below]
     assert worker.missed_rules(fr) == expected
+    assert "Expected FR in-sample (" not in col["expected_fill_rate"]          # the fresh column, not Seeker's own
 
 
 def test_progress_shows_phase_and_log(done, api):
@@ -229,9 +233,25 @@ def test_result_json_is_an_exact_copy_of_the_run_result(tmp_path, monkeypatch):
     assert h["bound_note"] == te.ms.bound_note(res.layout, res.x) and h["start_policy_cost"] == res.ins["start"]["cost"]
     assert h["cost_parts_in_sample"] == res.ins["parts"] and len(h["cost_parts_in_sample"]) == 5
     assert h["cost_parts_out_of_sample"] == {n: res.oos[("part", n)] for n in res.ins["parts"]}
-    assert h["saving_vs_start_in_sample"] == dict(res.sheets["Summary"].values)["Saving vs. start policy (in-sample)"]
+    summary = dict(res.sheets["Summary"].values)
+    assert h["saving_vs_start_in_sample"] == summary["Saving vs. start policy (in-sample)"]
+    assert (h["fill_rate_target"], h["fill_rate_target_excel"]) == (res.data.fill_rate_target, 0.95)
+    assert h["fill_rate_target_source"] == "Excel Items!TargetFillRate of FG1"
+    assert (h["weakest_cell"], h["review_period"]) == (summary["Weakest cell (out-of-sample)"],
+                                                       summary["Review period (A03)"])
+    assert h["start_policy"] == summary["Start policy (warm start)"]
+    assert h["start_repair"] == summary["Start repair (section 4c, K21)"]
+    assert h["start_repair_used"] is bool(res.ins["repair"].get("used"))
+    assert h["start_check"]["z0"] == res.ins["start_z"]["z0"] and h["start_check"]["z"] == res.ins["start_z"]["z"]
+    assert [s["z"] for s in h["start_check"]["steps"]] == [s["z"] for s in res.ins["start_z"]["steps"]]
+    assert h["waste_warning"] == summary["Waste warning (L10)"]
+    waste = {k.split(" ")[2]: v for k, v in summary.items() if str(k).startswith("Expected waste")}
+    assert h["expected_waste"] == waste
+    assert set(h["expected_waste"]) == {"FG1", "RM3", "RM4"}                   # FG1 and the perishable materials
     info = out["run_info"]
-    assert (info["horizon_weeks"], info["review_period_weeks"], info["first_rule_week"]) == (36, 2, 7)
+    assert (info["horizon_weeks"], info["review_period_weeks"], info["first_rule_week"]) == (36, 1, 7)
+    assert (info["fill_rate_target"], info["fill_rate_target_excel"], info["optimization_fill_rate"]) == \
+        (0.95, 0.95, None)
     assert info["warnings"] == res.data.warnings and info["product_id"] == "FG1" and info["overrides"] is None
 
 
@@ -252,7 +272,7 @@ def test_every_number_shown_equals_the_results_workbook(done, api, tmp_path):
     (tmp_path / "w.xlsx").write_bytes(r.content)
     book = pd.read_excel(tmp_path / "w.xlsx", sheet_name=None)
     assert list(book) == list(result["sheets"]) == ["Summary", "Commit_Now", "Policy_sS", "Decisions", "FillRates",
-                                                   "Stock_Waste", "Bands", "KPIs"]          # engine contract v2
+                                                   "Stock_Waste", "Bands", "KPIs"]          # engine contract v4
     for name, df in book.items():
         t = result["sheets"][name]
         assert list(map(str, df.columns)) == t["columns"], name
@@ -263,9 +283,9 @@ def test_every_number_shown_equals_the_results_workbook(done, api, tmp_path):
 
 
 def test_column_lookup_refuses_ambiguity():
-    df = pd.DataFrame(columns=["P(FR ≥ target) (60 fresh)", "P(FR ≥ target) (61 fresh)"])
+    df = pd.DataFrame(columns=["Expected FR (60 fresh)", "Expected FR (61 fresh)"])
     with pytest.raises(KeyError):
-        worker.column(df, "P(FR ≥ target) (")
+        worker.column(df, "Expected FR (")
 
 
 def test_cells_become_plain_json():
@@ -377,7 +397,7 @@ def test_a_new_run_can_start_as_soon_as_the_last_one_is_finished(api, monkeypatc
 
 
 def test_a_run_far_over_its_expected_time_is_stopped(api, monkeypatch):
-    monkeypatch.setattr(server, "expected_seconds", lambda settings: 0.5)
+    monkeypatch.setattr(server, "expected_seconds", lambda *args, **kwargs: 0.5)
     monkeypatch.setattr(server, "WATCHDOG_FACTOR", 1.0)
     st = wait(api, start(api, time_limit=60))
     assert st["state"] == "failed" and "far longer" in st["message"]
@@ -525,9 +545,11 @@ def test_master_data_is_exactly_what_the_engine_read(api, done):
     st = inp["settings"]
     assert (st["horizon_weeks"], st["review_period_weeks"], st["scenarios"], st["random_seed"]) == \
         (d.horizon, d.review_period, d.n_scenarios, d.seed)
-    assert st["chance_level"] == d.chance_level and st["start_date"] == "2026-11-09"
-    assert [(c["id"], c["serving_order"], c["target_fill_rate"]) for c in inp["channels"]] == \
-        [(c.id, i + 1, c.target) for i, c in enumerate(d.channels)]
+    assert st["start_date"] == "2026-11-09" and "chance_level" not in st          # no chance level since v18.0
+    assert inp["product"]["fill_rate_target"] == d.fill_rate_target == 0.95     # one target per product (H04)
+    assert [(c["id"], c["serving_order"]) for c in inp["channels"]] == [(c.id, c.priority) for c in d.channels] == \
+        [("D2C", 1), ("B2B", 2), ("AMZ", 3)]                                    # ShortagePriority is an input (H02)
+    assert all("target_fill_rate" not in c for c in inp["channels"])
     for ci, c in enumerate(d.channels):                                     # every quantile, every week
         assert inp["demand"]["quantiles"][c.id] == d.demand_q[ci, 1:].tolist()
     assert inp["demand"]["quantile_levels"] == d.levels.tolist()
@@ -538,7 +560,7 @@ def test_master_data_is_exactly_what_the_engine_read(api, done):
     assert prod["cost_tiers"]["tiers"][-1]["to"] is None                       # last tier: no upper limit
     assert inp["initial_stock"]["FG1"] == [{"remaining_shelf_life": a, "quantity": q} for a, q in d.init_fg]
     assert len(inp["open_orders"]["production"]) == len(d.open_prod) and inp["warnings"] == d.warnings
-    assert len(inp["tables"]["Model_Assumptions"]["rows"]) == 82
+    assert len(inp["tables"]["Model_Assumptions"]["rows"]) == 85
     src = inp["tables"]["Sourcing"]                                            # which supplier delivers which material
     item, supplier = src["columns"].index("ItemID"), src["columns"].index("SupplierID")
     assert [(r[item], r[supplier]) for r in src["rows"]] == [("RM1", "SUP_VPL"), ("RM2", "SUP_VPL"),
@@ -550,7 +572,7 @@ def test_master_data_is_exactly_what_the_engine_read(api, done):
 
 def test_run_settings_reach_the_engine_and_are_recorded(api):
     form = {"time_limit": "1", "out_of_sample_scenarios": "600", "feasibility_check": "false",
-            "start_policy_out_of_sample": "true", "optimization_chance_level": "0.995", "num_scenarios": "100",
+            "start_policy_out_of_sample": "true", "optimization_fill_rate": "0.9", "num_scenarios": "100",
             "random_seed": "43", "label": "seed 43", "note": "robustness check"}
     r = api.post("/runs", files=upload(TEMPLATE), data=form)
     assert r.status_code == 202, r.text
@@ -560,7 +582,14 @@ def test_run_settings_reach_the_engine_and_are_recorded(api):
     info = res["run_info"]
     assert (info["scenarios_out_of_sample"], info["feasibility_check"], info["start_policy_out_of_sample"]) == \
         (600, False, True)
-    assert (info["scenarios_in_sample"], info["random_seed"], info["optimization_chance_level"]) == (100, 43, 0.995)
+    assert (info["scenarios_in_sample"], info["random_seed"]) == (100, 43)
+    assert (info["fill_rate_target"], info["fill_rate_target_excel"], info["optimization_fill_rate"]) == \
+        (0.9, 0.95, 0.9)                                                     # the run's own target (K08)
+    h = res["headline"]
+    assert (h["fill_rate_target"], h["fill_rate_target_excel"]) == (0.9, 0.95)
+    assert h["fill_rate_target_source"] == "section 0 OPTIMIZATION_FILL_RATE; Excel 95.0%"
+    fr = res["sheets"]["FillRates"]
+    assert {row[fr["columns"].index("Target")] for row in fr["rows"]} == {0.9}  # every cell judged at the run target
     assert info["overrides"] == {"NumScenarios": 100, "RandomSeed": 43}
     assert res["headline"]["feasibility"] == "not run"
     kpi_items = [row[0] for row in res["sheets"]["KPIs"]["rows"]]
@@ -571,26 +600,29 @@ def test_run_settings_reach_the_engine_and_are_recorded(api):
                           "bytes": TEMPLATE.stat().st_size}
 
 
-def test_a_chance_level_below_the_excel_rule_is_refused(api):
-    st = wait(api, start_with(api, {"optimization_chance_level": "0.95"}))
-    assert st["state"] == "invalid"
-    assert st["errors"] == ["Optimization chance level 0.95 is below the Excel FillRateChanceLevel 0.99; "
-                            "it may only be equal or higher (stricter)."]
-    assert not any("Seeker optimization" in ln for ln in st["log_tail"])
+def test_the_run_target_is_reset_after_the_run_so_it_never_leaks(monkeypatch):
+    monkeypatch.setattr(te.ms, "OPTIMIZATION_FILL_RATE", None)
+    previous = worker.apply_settings(te.ms, {"optimization_fill_rate": 0.9, "feasibility_check": False})
+    assert (te.ms.OPTIMIZATION_FILL_RATE, te.ms.FEASIBILITY_CHECK) == (0.9, False)
+    worker.restore_settings(te.ms, previous)
+    assert (te.ms.OPTIMIZATION_FILL_RATE, te.ms.FEASIBILITY_CHECK) == (None, True)
 
 
-def test_an_invalid_override_is_rejected_with_the_engines_words(api):
-    d = te.ms.load_data(str(TEMPLATE))
-    te.ms.apply_overrides(d, {"NumScenarios": 50})
-    with pytest.raises(ValueError) as e:
-        te.ms.validate(d)
-    expected = [ln.strip()[2:] for ln in str(e.value).splitlines()[1:]]
-    st = wait(api, start_with(api, {"num_scenarios": "50"}))
-    assert st["state"] == "invalid" and st["errors"] == expected and expected
+def test_the_pc_is_kept_awake_during_a_run_and_released_after(monkeypatch):
+    calls = []
+    kernel32 = type("K", (), {"SetThreadExecutionState": staticmethod(calls.append)})
+    monkeypatch.setattr(worker.ctypes, "windll", type("W", (), {"kernel32": kernel32}), raising=False)
+    with worker.keep_awake():
+        assert calls == [worker.ES_CONTINUOUS | worker.ES_SYSTEM_REQUIRED]
+    assert calls[-1] == worker.ES_CONTINUOUS                     # cleared again
+    monkeypatch.delattr(worker.ctypes, "windll")
+    with worker.keep_awake():                                    # Linux / CI: nothing to call
+        pass
 
 
-@pytest.mark.parametrize("field, value", [("out_of_sample_scenarios", "100"), ("optimization_chance_level", "1.5"),
-                                          ("num_scenarios", "0"), ("random_seed", "-1"), ("label", "x" * 81)])
+@pytest.mark.parametrize("field, value", [("out_of_sample_scenarios", "100"), ("optimization_fill_rate", "1.5"),
+                                          ("optimization_fill_rate", "0"), ("num_scenarios", "0"),
+                                          ("random_seed", "-1"), ("label", "x" * 81)])
 def test_settings_outside_their_limits_are_refused(api, field, value):
     r = api.post("/runs", files=upload(TEMPLATE), data={field: value})
     assert r.status_code == 422
@@ -599,20 +631,46 @@ def test_settings_outside_their_limits_are_refused(api, field, value):
 def test_label_and_note_can_be_changed_later(api, done):
     run_id = done[0]
     assert api.patch(f"/runs/{run_id}", json={"label": "Baseline"}).json()["label"] == "Baseline"
-    r = api.patch(f"/runs/{run_id}", json={"note": "first v17 run"}).json()
-    assert (r["label"], r["note"]) == ("Baseline", "first v17 run")             # one field changes, the other stays
+    r = api.patch(f"/runs/{run_id}", json={"note": "first v18 run"}).json()
+    assert (r["label"], r["note"]) == ("Baseline", "first v18 run")             # one field changes, the other stays
     assert next(x for x in api.get("/runs").json() if x["id"] == run_id)["label"] == "Baseline"
     assert api.patch(f"/runs/{run_id}", json={"label": "x" * 81}).status_code == 422
     assert api.patch("/runs/20991231-235959-ffff", json={"label": "a"}).status_code == 404
 
 
-def test_the_time_estimate_matches_the_measured_run():
+def scenarios(n, t):
+    return server.expected_seconds({"time_limit": t, "overrides": {"NumScenarios": n}})
+
+
+def test_the_time_estimate_matches_the_measured_runs():
+    assert scenarios(120, 120) == pytest.approx(290, rel=0.2)    # user's PC 13.11., v18.1: ≈ 290 s, 3 z steps
+    assert scenarios(200, 300) == pytest.approx(600, rel=0.1)    # engine session: ≈ 10 min
+    assert scenarios(500, 700) == pytest.approx(1140, rel=0.1)   # engine session: ≈ 19 min
     default = server.expected_seconds({})
-    assert default == pytest.approx(407, abs=3)            # user's PC, engine v17.1, 08.11.: 407 s at the defaults
-    assert server.expected_seconds({"time_limit": 30}) == pytest.approx(default - 220)       # 54 s search at 30 s
     assert server.expected_seconds({"feasibility_check": False}) == pytest.approx(default - 21)
     assert server.expected_seconds({"start_policy_out_of_sample": True}) == pytest.approx(default + 82.5)
-    assert server.expected_seconds({"out_of_sample_scenarios": 5000}) == pytest.approx(default + 82.5)
+    assert server.expected_seconds({}, z_steps=0) < default < server.expected_seconds({}, repair=True)
+
+
+def test_the_estimate_follows_the_start_check_in_the_log():
+    z = server.Z_STEP_PHASE
+    assert server.start_check_course([], []) == (3, False)                       # nothing seen yet: 3 steps
+    assert server.start_check_course([f"{z} = 1.50", f"{z} = 2.00", f"{z} = 2.50"], []) == (4, False)  # still raising
+    done = ["Start check: Seeker starts from z = 2.50"]
+    assert server.start_check_course([f"{z} = 1.50", f"{z} = 2.00"], done) == (2, False)
+    assert server.start_check_course(["5. Seeker optimization (time limit 1 s)"], []) == (0, False)  # no check needed
+    assert server.start_check_course([f"{z} = 4.00", "4c. Start repair R1: Seeker evaluates"], done) == (1, True)
+
+
+def test_runs_of_older_engines_are_not_shown(api, tmp_path, monkeypatch, done):
+    old = server.RUNS_DIR / "20261108-203843-160f"
+    old.mkdir()
+    server.write_json(old / "status.json", {"id": old.name, "state": "done", "created": "x", "finished": "x",
+                                             "time_limit": 250, "message": "Finished.", "errors": []})  # no api_version
+    ids = [r["id"] for r in api.get("/runs").json()]
+    assert old.name not in ids and done[0] in ids
+    assert api.get(f"/runs/{old.name}").status_code == 404
+    assert "older engine" in api.get(f"/runs/{old.name}/result").json()["detail"]
 
 
 def start_with(client, form):
