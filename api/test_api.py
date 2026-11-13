@@ -824,3 +824,38 @@ def test_the_app_rules_are_served_in_the_model_assumptions_columns(api):
     assert rules["columns"] == ["ID", "Topic", "Title", "Rule / mechanic", "Source", "Status", "Where"]
     assert [r[0] for r in rules["rows"]] == ["W01", "W02", "W03", "W04", "W05", "W06", "W07"]
     assert all(len(r) == len(rules["columns"]) and all(r) for r in rules["rows"])
+
+
+def test_lots_orders_and_lead_time_branches_can_be_added_and_removed(api, done):
+    rm4_lot = next(r["row"] for r in api.get(f"/runs/{done[0]}/sheets").json()["sheets"]["Init_Inventory"]["rows"]
+                   if r["key"] == "RMW · RM4" and r["values"][3] == 38)                       # the 400 kg lot
+    lt_rm3 = row_of(api, done[0], "LeadTimeDist", "LT_RM3")
+    edits = [
+        {"sheet": "Init_Inventory", "add": {"LocationID": "RMW", "ItemID": "RM3", "Quantity [UoM]": 500,
+                                            "RemainingShelfLife [periods]": 50}},
+        {"sheet": "Open_Orders", "add": {"OrderID": "WIF-RM4-01", "OrderType": "Purchase", "ItemID": "RM4",
+                                         "FromID": "SUP_ACR", "ToID": "RMW", "Quantity [UoM]": 1000,
+                                         "PlacedInPeriod": -1, "ExpectedArrivalPeriod": 11, "ArrivalCertain": "Yes"}},
+        {"sheet": "LeadTimeDist", "row": lt_rm3, "column": "Probability", "value": 0.8},      # 8 weeks: 80 %
+        {"sheet": "LeadTimeDist", "add": {"DistID": "LT_RM3", "Value [periods]": 10, "Probability": 0.2}},
+        {"sheet": "Init_Inventory", "row": rm4_lot, "delete": True}]
+    r = api.post("/whatif/validate", json={"base_run": done[0], "edits": edits}).json()
+    assert r["valid"] is True, r["errors"]
+    inp = r["input"]
+    assert {"remaining_shelf_life": 50, "quantity": 500.0} in inp["initial_stock"]["RM3"]
+    assert inp["initial_stock"]["RM4"] == [{"remaining_shelf_life": 45, "quantity": 900.0}]  # the 400 kg lot is gone
+    assert any(o["qty"] == 1000 and o["arrival"] == 11 for o in inp["open_orders"]["RM4"])
+    rm3 = next(m for m in inp["raw_materials"] if m["id"] == "RM3")
+    assert rm3["lead_time"] == {"weeks": [8, 10], "probabilities": [0.8, 0.2]}                # now stochastic
+    added = {c["row"] for c in r["changes"] if c["sheet"] == "Init_Inventory" and c["old"] is None}
+    assert added == {14}                                        # the first row without data (it keeps its RowCheck)
+
+
+@pytest.mark.parametrize("edit, words", [
+    ({"sheet": "Sourcing", "add": {"ItemID": "RM9"}}, "rows can only be added"),
+    ({"sheet": "Open_Orders", "add": {"OrderID": "X", "Notes": "no"}}, "a new row takes only"),
+    ({"sheet": "Items", "row": 5, "delete": True}, "rows can only be removed"),
+])
+def test_rows_are_added_or_removed_only_where_allowed(api, done, edit, words):
+    r = api.post("/whatif/validate", json={"base_run": done[0], "edits": [edit]}).json()
+    assert r["valid"] is False and words in r["errors"][0]

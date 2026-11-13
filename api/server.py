@@ -100,12 +100,13 @@ APP_RULES = [
      "The original upload is never changed; its sha256 fingerprint stays the same. The engine checks the "
      "copy exactly like an uploaded workbook (K19).",
      "User decision 13.11.", "Decided", "api/worker.py write_copy"],
-    ["W02", "What-if", "Only input cells",
+    ["W02", "What-if", "Only input cells; rows only for stock, open orders and lead times",
      "Only input cells of the template's input sheets can be edited. Key columns (IDs), cells Excel "
      "calculates (RowCheck, MeanApprox, FreshLotSales, WeeksLate …) and, in Settings, everything except "
-     "PlanningStartDate, HorizonPeriods and ReviewPeriod stay read-only. Rows cannot be added or deleted "
-     "yet.",
-     "User decision 13.11.", "Decided", "api/worker.py editable"],
+     "PlanningStartDate, HorizonPeriods and ReviewPeriod stay read-only. Rows can be added or removed only "
+     "for initial stock lots, open orders and lead-time branches (one row per possible lead time with its "
+     "probability); a new row takes only its input columns and goes into the first empty row of the sheet.",
+     "User decisions 13.11. and 14.11.", "Decided", "api/worker.py editable, add_row, delete_row"],
     ["W03", "Demand", "Shifting a forecast week",
      "A shift of x units on one channel and week adds x to all 10 quantiles (Q05 … Q95) of that row: the "
      "forecast keeps its shape and moves up (or down for a negative x). The quantiles can also be edited "
@@ -459,12 +460,15 @@ class Validation(BaseModel):
 
 
 class Edit(BaseModel):
-    """One what-if edit: a new value for one input cell, or a shift of all 10 quantiles of one Demand row (W03)."""
+    """One what-if edit: a new value for one input cell, a shift of all 10 quantiles of one Demand row (W03), or a
+    row added to / removed from Init_Inventory, Open_Orders or LeadTimeDist (W02)."""
     sheet: str                            # e.g. "Sourcing"
-    row: int                              # Excel row number, as GET /runs/{id}/sheets gives it
+    row: int | None = None                # Excel row number, as GET /runs/{id}/sheets gives it (not with add)
     column: str | None = None             # header of the cell's column, e.g. "MaxOrderQty"
     value: Any = None                     # the new value (with column)
     shift: float | None = None            # Demand only: units added to Q05 … Q95 of that row
+    add: dict[str, Any] | None = None     # a new row: {column header: value} (input columns only)
+    delete: bool = False                  # remove the row (true)
 
 
 class WhatIf(BaseModel):

@@ -80,6 +80,12 @@ EDIT_SHEETS = {"Settings": ["Parameter"], "Items": ["ItemID"], "Channels": ["Cha
 # fixed by the engine: one place per input (user decision 13.11.).
 SETTINGS_EDITABLE = ("PlanningStartDate", "HorizonPeriods", "ReviewPeriod")
 DEMAND_QUANTILES = ("Q05", "Q15", "Q25", "Q35", "Q45", "Q55", "Q65", "Q75", "Q85", "Q95")
+# Rows that a what-if may add or remove (W02): initial stock lots, open orders and lead-time branches (one row per
+# possible lead time of a distribution). A new row takes only these columns; a removed row is cleared completely.
+ROW_SHEETS = {"Init_Inventory": ("LocationID", "ItemID", "Quantity [UoM]", "RemainingShelfLife [periods]"),
+              "Open_Orders": ("OrderID", "OrderType", "ItemID", "FromID", "ToID", "Quantity [UoM]", "PlacedInPeriod",
+                              "ExpectedArrivalPeriod", "ArrivalCertain", "RemainingShelfLifeAtArrival [periods]"),
+              "LeadTimeDist": ("DistID", "Value [periods]", "Probability")}
 
 
 # ============================================================================
@@ -280,10 +286,54 @@ def check_target(wb, edit):
     return ws, sheet, row
 
 
+def free(ws, row, width):
+    """A row without data: every cell empty or a formula (the template prepares rows with check formulas)."""
+    return all(ws.cell(row, c).value is None or is_formula(ws.cell(row, c)) for c in range(1, width + 1))
+
+
+def add_row(wb, edit):
+    """{"sheet", "add": {column: value}}: a new lot, open order or lead-time branch in the first empty row below the
+    data (W02). Only the columns of ROW_SHEETS; the engine checks the row like any other."""
+    sheet, values = edit.get("sheet"), edit.get("add") or {}
+    if sheet not in ROW_SHEETS:
+        raise EditError(f"{sheet}: rows can only be added to {', '.join(ROW_SHEETS)}.")
+    unknown = [c for c in values if c not in ROW_SHEETS[sheet]]
+    if unknown or not values:
+        raise EditError(f"{sheet}: a new row takes only {', '.join(ROW_SHEETS[sheet])} (not {', '.join(unknown)}).")
+    ws, names = wb[sheet], headers(wb[sheet])
+    used = data_rows(ws, EDIT_SHEETS[sheet])
+    row = (max(used) if used else HEADER_ROW) + 1
+    while not free(ws, row, len(names)):
+        row += 1                                    # leave filled rows alone (a row added earlier in this what-if)
+    for column, value in values.items():
+        ws.cell(row, names.index(column) + 1).value = value
+    key = row_key(ws, sheet, row)
+    return [{"sheet": sheet, "row": row, "key": key, "column": c, "old": None, "new": cell(v)}
+            for c, v in values.items()]
+
+
+def delete_row(ws, sheet, row):
+    """{"sheet", "row", "delete": true}: clears the whole row (inputs and formulas); the engine no longer reads it."""
+    if sheet not in ROW_SHEETS:
+        raise EditError(f"{sheet}: rows can only be removed from {', '.join(ROW_SHEETS)}.")
+    names, key = headers(ws), row_key(ws, sheet, row)
+    changes = [{"sheet": sheet, "row": row, "key": key, "column": n, "old": cell(ws.cell(row, i + 1).value),
+                "new": None} for i, n in enumerate(names)
+               if n in ROW_SHEETS[sheet] and ws.cell(row, i + 1).value is not None]
+    for c in range(1, len(names) + 1):
+        ws.cell(row, c).value = None
+    return changes
+
+
 def apply_edit(wb, edit):
-    """One edit → its changes. {"shift": x} on a Demand row adds x units to all 10 quantiles (W03); otherwise
-    {"column", "value"} sets one input cell. The values themselves are checked by the engine afterwards."""
+    """One edit → its changes. {"shift": x} on a Demand row adds x units to all 10 quantiles (W03); {"add": {...}} adds
+    and {"delete": true} removes a row (W02); otherwise {"column", "value"} sets one input cell. The values themselves
+    are checked by the engine afterwards."""
+    if edit.get("add") is not None:
+        return add_row(wb, edit)
     ws, sheet, row = check_target(wb, edit)
+    if edit.get("delete"):
+        return delete_row(ws, sheet, row)
     if edit.get("shift") is not None:
         if sheet != "Demand":
             raise EditError(f"{sheet} row {row}: a shift is only possible on Demand rows.")
