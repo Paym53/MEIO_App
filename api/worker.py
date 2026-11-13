@@ -6,8 +6,13 @@ Started by api/server.py, never imported by it. This is the ONLY app file that i
 
   python -u api/worker.py validate <input.xlsx> <answer.json>
   python -u api/worker.py run <run folder> <license file>          (settings in <run folder>/request.json)
+  python -u api/worker.py sheets <input.xlsx> <answer.json>        (the editable sheets, for what-if editing)
+  python -u api/worker.py whatif <original.xlsx> <edits.json> <copy.xlsx> <answer.json>
 
   validate : engine.load_data() + engine.validate()  → answer.json {"valid", "errors", "warnings", "input"}
+  sheets   : the template's input sheets with Excel row numbers and which cells may be edited
+  whatif   : the edits written into a COPY of the original workbook (openpyxl, values only; the original is never
+             changed), then validate → answer.json {"valid", "errors", "warnings", "input", "changes"}
   run      : engine.load_data()                      → input.json   (the master data as the engine reads it)
              engine.run()                            → result.json  (the API's result contract)
                                                        results.xlsx (the engine's own workbook, engine.write_report)
@@ -21,6 +26,7 @@ Every number in input.json and result.json is copied from the engine; nothing is
   2. DATA SOURCE ..... where the input workbook comes from (Excel now; a database later)
   3. VALIDATE ........ data checks only
   4. INPUT ........... the master data as the engine read it → JSON (Master data page)
+  4b. WHAT-IF ........ editable sheets; edits → a copy of the original workbook (app rules W01–W03)
   5. RESULT .......... RunResult → result.json (contract version 4 = engine contract 4, v18.1)
   6. RUN ............. the whole engine pipeline for one run folder (the PC is kept awake meanwhile)
   7. MAIN
@@ -38,6 +44,7 @@ import traceback
 from pathlib import Path
 
 import numpy as np
+import openpyxl
 
 # ============================================================================
 # 0. SETTINGS
@@ -49,14 +56,30 @@ EXIT_DONE, EXIT_FAILED, EXIT_INVALID = 0, 1, 2
 # run setting (request.json) → engine module constant (CLAUDE.md §6 "Settings"); None = keep the engine's default
 SETTING_CONSTANTS = {"out_of_sample_scenarios": "OUT_OF_SAMPLE_SCENARIOS",
                      "feasibility_check": "FEASIBILITY_CHECK",
-                     "start_policy_out_of_sample": "START_POLICY_OUT_OF_SAMPLE",
-                     "optimization_fill_rate": "OPTIMIZATION_FILL_RATE"}   # K08: replaces Items!TargetFillRate
+                     "start_policy_out_of_sample": "START_POLICY_OUT_OF_SAMPLE"}
+# The fill-rate target and the review period come only from the workbook (Items!TargetFillRate, Settings!ReviewPeriod;
+# what-if edits change them): the engine's OPTIMIZATION_FILL_RATE stays None (app rule W04, user decision 13.11.).
 # Windows SetThreadExecutionState flags: keep the PC awake during a run (a sleeping PC stretched a 300 s search to
 # 12,100 s on 12.11.); the flags are cleared when the run ends (and by Windows when the process exits)
 ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
 RAW_TABLES = ("Locations", "Lanes", "Items", "Sourcing", "Model_Assumptions")   # template sheets shown as they are
 EXCEL_ONLY_COLUMNS = ["RowCheck", "EffectiveMaxOrderQty"]   # Excel formulas (empty in edited copies); engine values
                                                             # are in raw_materials[] (max_order)
+# What-if editing (API update 2). Every input sheet of the template has its headers in row 4 and data from row 5.
+# Key columns identify a row (shown in the change list) and are not editable: renaming would break the links between
+# sheets. Formula cells (RowCheck, MeanApprox, FreshLotSales, WeeksLate, …) are calculated by Excel: never editable.
+HEADER_ROW = 4
+EDIT_SHEETS = {"Settings": ["Parameter"], "Items": ["ItemID"], "Channels": ["ChannelID"],
+               "Demand": ["ChannelID", "Period"], "Init_Inventory": ["LocationID", "ItemID"],
+               "Open_Orders": ["OrderID"],
+               "Sourcing": ["ItemID"], "LeadTimeDist": ["DistID"], "Production": ["ItemID"],
+               "BOM": ["ParentItemID", "ComponentItemID"], "Costs": ["ItemID", "LocationID"],
+               "CostTiers": ["TierTableID", "TierNo"], "Lanes": ["LaneID"], "Locations": ["LocationID"]}
+# Settings: only these rows (column Value) are master data. Solver settings (NumScenarios, RandomSeed,
+# SolverTimeLimit) are set per run in the Run dialog, and the model-structure texts (PolicyType, IssuingRule, …) are
+# fixed by the engine: one place per input (user decision 13.11.).
+SETTINGS_EDITABLE = ("PlanningStartDate", "HorizonPeriods", "ReviewPeriod")
+DEMAND_QUANTILES = ("Q05", "Q15", "Q25", "Q35", "Q45", "Q55", "Q65", "Q75", "Q85", "Q95")
 
 
 # ============================================================================
@@ -189,6 +212,120 @@ def describe_input(engine, d, path):
 
 
 # ============================================================================
+# 4b. WHAT-IF — the editable sheets and edits into a copy of the original workbook (app rules W01–W03)
+# ============================================================================
+class EditError(ValueError):
+    """An edit that addresses a cell the app does not let anyone change (the engine checks the values themselves)."""
+
+
+def headers(ws):
+    return [ws.cell(HEADER_ROW, c).value for c in range(1, ws.max_column + 1)]
+
+
+def data_rows(ws, keys):
+    """Excel row numbers of the data rows: rows below the header whose key cells are filled."""
+    cols = [headers(ws).index(k) + 1 for k in keys]
+    return [r for r in range(HEADER_ROW + 1, ws.max_row + 1) if all(ws.cell(r, c).value is not None for c in cols)]
+
+
+def is_formula(c):
+    return c.data_type == "f" or (isinstance(c.value, str) and c.value.startswith("="))
+
+
+def editable(ws, sheet, row, column):
+    """May the cell (row, column name) be edited? Formula cells and key columns never; Settings: SETTINGS_EDITABLE."""
+    names = headers(ws)
+    if column not in names or column in EDIT_SHEETS[sheet] or column in EXCEL_ONLY_COLUMNS:
+        return False
+    if sheet == "Settings" and (column != "Value" or ws.cell(row, 1).value not in SETTINGS_EDITABLE):
+        return False
+    return not is_formula(ws.cell(row, names.index(column) + 1))
+
+
+def row_key(ws, sheet, row):
+    names = headers(ws)
+    return " · ".join(str(cell(ws.cell(row, names.index(k) + 1).value)) for k in EDIT_SHEETS[sheet])
+
+
+def describe_sheets(path):
+    """The editable sheets: columns, key columns and per data row its Excel row number, key, values and editable flags.
+    Formula cells show the value Excel last calculated (empty in a copy saved by the app)."""
+    wb, values = openpyxl.load_workbook(path), openpyxl.load_workbook(path, data_only=True)
+    out = {}
+    for sheet, keys in EDIT_SHEETS.items():
+        ws, wv = wb[sheet], values[sheet]
+        names = headers(ws)
+        out[sheet] = {"columns": [str(n) for n in names], "key_columns": keys, "rows": [
+            {"row": r, "key": row_key(ws, sheet, r),
+             "values": [cell(wv.cell(r, c).value) for c in range(1, len(names) + 1)],
+             "editable": [editable(ws, sheet, r, n) for n in names]} for r in data_rows(ws, keys)]}
+    return {"sheets": out}
+
+
+def change(ws, sheet, row, column, new):
+    c = ws.cell(row, headers(ws).index(column) + 1)
+    old = cell(c.value)
+    c.value = new
+    return {"sheet": sheet, "row": row, "key": row_key(ws, sheet, row), "column": column, "old": old, "new": cell(new)}
+
+
+def check_target(wb, edit):
+    """The sheet and row an edit points at, or EditError with a plain message."""
+    sheet, row = edit.get("sheet"), edit.get("row")
+    if sheet not in EDIT_SHEETS:
+        raise EditError(f"{sheet}: this sheet cannot be edited in the app.")
+    ws = wb[sheet]
+    if row not in data_rows(ws, EDIT_SHEETS[sheet]):
+        raise EditError(f"{sheet} row {row}: there is no data row with this number.")
+    return ws, sheet, row
+
+
+def apply_edit(wb, edit):
+    """One edit → its changes. {"shift": x} on a Demand row adds x units to all 10 quantiles (W03); otherwise
+    {"column", "value"} sets one input cell. The values themselves are checked by the engine afterwards."""
+    ws, sheet, row = check_target(wb, edit)
+    if edit.get("shift") is not None:
+        if sheet != "Demand":
+            raise EditError(f"{sheet} row {row}: a shift is only possible on Demand rows.")
+        names = headers(ws)
+        return [change(ws, sheet, row, q, ws.cell(row, names.index(q) + 1).value + edit["shift"])
+                for q in DEMAND_QUANTILES]
+    column = edit.get("column")
+    if not editable(ws, sheet, row, column):
+        raise EditError(f"{sheet} row {row}: {column!r} cannot be edited (a key, a formula calculated by Excel, "
+                        "or a setting that is set elsewhere).")
+    return [change(ws, sheet, row, column, edit.get("value"))]
+
+
+def merged(changes):
+    """One entry per cell: the original value and the last new value (an edited cell may be edited again)."""
+    out = {}
+    for ch in changes:
+        k = (ch["sheet"], ch["row"], ch["column"])
+        out[k] = {**ch, "old": out[k]["old"]} if k in out else ch
+    return [ch for ch in out.values() if ch["old"] != ch["new"]]
+
+
+def write_copy(original, edits, copy):
+    """Writes the edits into a copy of the original (openpyxl keeps formulas; Excel recalculates them on opening, the
+    engine runs every check in Python, K19). The original file is only read. Returns the change list."""
+    wb = openpyxl.load_workbook(original)
+    changes = []
+    for edit in edits:
+        changes += apply_edit(wb, edit)
+    wb.save(copy)
+    return merged(changes)
+
+
+def whatif(engine, original, edits, copy):
+    try:
+        changes = write_copy(original, edits, copy)
+    except EditError as e:
+        return {"valid": False, "errors": [str(e)], "warnings": [], "input": None, "changes": []}
+    return {**validate(engine, copy), "changes": changes}
+
+
+# ============================================================================
 # 5. RESULT — RunResult → result.json. Copies only; the comments name the engine source of every field.
 # ============================================================================
 def column(df, prefix):
@@ -267,7 +404,6 @@ def run_info(engine, res, settings):
             "start_date": d.start_date.date().isoformat(), "time_limit_seconds": cell(settings["time_limit"]),
             "scenarios_in_sample": d.n_scenarios, "random_seed": d.seed,
             "fill_rate_target": float(d.fill_rate_target), "fill_rate_target_excel": float(excel_target(d)),
-            "optimization_fill_rate": cell(settings.get("optimization_fill_rate")),
             "scenarios_out_of_sample": int(res.oos["n"]), "feasibility_check": bool(engine.FEASIBILITY_CHECK),
             "start_policy_out_of_sample": bool(engine.START_POLICY_OUT_OF_SAMPLE),
             "overrides": res.overrides, "warnings": list(d.warnings or [])}
@@ -374,6 +510,13 @@ def main(argv, environ):
     engine, skr, test_double = load_engine(environ)
     if len(argv) == 3 and argv[0] == "validate":
         write_json(argv[2], validate(engine, argv[1]))
+        return EXIT_DONE
+    if len(argv) == 3 and argv[0] == "sheets":
+        write_json(argv[2], describe_sheets(argv[1]))
+        return EXIT_DONE
+    if len(argv) == 5 and argv[0] == "whatif":
+        edits = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
+        write_json(argv[4], whatif(engine, argv[1], edits, argv[3]))
         return EXIT_DONE
     if len(argv) == 3 and argv[0] == "run":
         try:

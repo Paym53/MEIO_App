@@ -21,6 +21,8 @@ These scenarios are the contract. Each one becomes an automated test.
 4. **Fair comparison:** two runs are compared on cost only if they meet the same number of rules; otherwise the app shows a warning.
 5. **Protected PC:** a request without the right token is refused (401) and does nothing.
 6. **One run at a time:** while a run is in progress, a second one is refused.
+7. **Safe what-ifs:** a what-if changes only a copy of the original upload, never the upload itself. The engine checks
+   the copy like any workbook, invalid edits are refused in the engine's words, and every what-if run lists what it changed.
 
 ## What is in this repo
 
@@ -35,7 +37,7 @@ These scenarios are the contract. Each one becomes an automated test.
 | `.gitignore`, `.gitattributes` | keep secrets, data and runs out of git; keep files byte-exact on Windows |
 | `api/server.py` | the local API: endpoints, token check, run history; starts one worker per run |
 | `api/worker.py` | runs the engine once (validate or optimize) and writes the results; the only file that uses the engine |
-| `api/test_api.py` | the app's tests: the six scenarios above, end to end |
+| `api/test_api.py` | the app's tests: the seven scenarios above, end to end |
 | `api/openapi.json` | the frozen API contract (what the Lovable UI is built against) |
 | `start_worker.bat` | double-click: starts the API and the ngrok tunnel |
 | `local_settings.example.bat` | template for your settings (token, ngrok domain); your copy `local_settings.bat` stays private |
@@ -78,6 +80,11 @@ in `engine\MEIO_Data_Template.xlsx` and writes `engine\MEIO_Results_stochastic.x
 
 - **Keep the PC on:** the app keeps it awake during a run. Don't shut the lid of a laptop or turn the PC off: a sleeping PC stretched a 5-minute search to over 3 hours (12.11.).
 - **Silence is normal:** Seeker can print nothing for minutes while it searches.
+
+**What-ifs (from the Master data pages):** pick a run made from an uploaded workbook, change values (any input cell;
+for demand either single quantiles or a shift such as "+2,000 units" for one channel and week), check, then run. A
+what-if always starts from the original upload, never from another what-if. The fill-rate target and the review period
+are changed only here, not in the run dialog. The app's own rules for this (W01–W07) are listed on Explainability.
 
 **Since engine v18.1 (13.11.):**
 - **Workbooks:** workbooks made for the old engine are refused. Copy your values by hand into the new
@@ -134,5 +141,5 @@ Each run is kept in `runs\<id>\` (input, log, results; gitignored). Runs of olde
 | Check | Command | What it guarantees |
 |---|---|---|
 | Lint | `python -m ruff check .` | no likely bugs, sorted imports, no function more complex than 10 branches |
-| Tests | `python -m pytest` | engine = independent reference in every scenario, frozen output tables, engine files unchanged; the app's six scenarios end to end; at least 90 % of the app's code tested |
+| Tests | `python -m pytest` | engine = independent reference in every scenario, frozen output tables, engine files unchanged; the app's seven scenarios end to end; at least 90 % of the app's code tested |
 | Secret scan | CI only (gitleaks) | no token, key or password in the git history |

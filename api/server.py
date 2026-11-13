@@ -10,9 +10,12 @@ each validation or run is one api/worker.py process (one engine run per process,
 it returns was written by that worker from the engine's RunResult.
 
 Run folder  runs/<id>/ :  input.xlsx · request.json (settings) · status.json · label.json · log.txt · input.json ·
-                          result.json · results.xlsx
+                          result.json · results.xlsx · changes.json (what-if runs) · sheets.json (cache)
 
-  0. SETTINGS ........ environment variables (set in local_settings.bat) and named constants
+What-if (API update 2): edits always go into a copy of an ORIGINAL upload (never of another what-if); the worker writes
+the copy, the engine checks it, and the run keeps the change list. The app's own rules are APP_RULES (/app-rules).
+
+  0. SETTINGS ........ environment variables (set in local_settings.bat), named constants, the app's rules
   1. SECURITY ........ token check
   2. RUN FILES ....... status.json read/write, run ids
   3. PROGRESS ........ current phase, time left, log tail (from the worker's log)
@@ -63,8 +66,7 @@ DEFAULT_TIME_LIMIT, MAX_TIME_LIMIT = 250, 3600                             # See
 DEFAULT_OOS, MIN_OOS, MAX_OOS = 2500, 500, 20000                           # fresh scenarios for the check
 MAX_SCENARIOS = 2000                                                       # NumScenarios override (optimizer)
 DEFAULT_SETTINGS = {"time_limit": DEFAULT_TIME_LIMIT, "out_of_sample_scenarios": DEFAULT_OOS,
-                    "feasibility_check": True, "start_policy_out_of_sample": False,
-                    "optimization_fill_rate": None, "overrides": None}
+                    "feasibility_check": True, "start_policy_out_of_sample": False, "overrides": None}
 API_VERSION = 3                       # recorded in every run's status.json; runs of older APIs (engine before v18.1,
                                       # other result layout) are not listed or served (user decision 13.11.)
 VALIDATE_TIMEOUT_SECONDS = 120
@@ -87,6 +89,49 @@ PHASE_START = re.compile(r"^\[\d\d:\d\d:\d\d\] (.+) \.\.\.$")              # eng
 Z_STEP_PHASE = "4. Start check: Seeker evaluates the start with z"             # one per z step (phase names repeat:
 REPAIR_PHASE = "4c. Start repair"                                              # lines are counted, never keyed)
 START_CHECK_DONE = "Start check: Seeker starts from z"
+MAX_EDITS = 5000                                                           # edits per what-if (one request)
+
+# The app's own rules (what-if editing, run settings, comparisons), shown on Explainability next to the engine's
+# Model_Assumptions and in the same columns. The engine's rules live in the template; these belong to the app.
+APP_RULE_COLUMNS = ["ID", "Topic", "Title", "Rule / mechanic", "Source", "Status", "Where"]
+APP_RULES = [
+    ["W01", "What-if", "Edits go into a copy",
+     "Every what-if edit is written into a copy of the original uploaded workbook (openpyxl, values only). "
+     "The original upload is never changed; its sha256 fingerprint stays the same. The engine checks the "
+     "copy exactly like an uploaded workbook (K19).",
+     "User decision 13.11.", "Decided", "api/worker.py write_copy"],
+    ["W02", "What-if", "Only input cells",
+     "Only input cells of the template's input sheets can be edited. Key columns (IDs), cells Excel "
+     "calculates (RowCheck, MeanApprox, FreshLotSales, WeeksLate …) and, in Settings, everything except "
+     "PlanningStartDate, HorizonPeriods and ReviewPeriod stay read-only. Rows cannot be added or deleted "
+     "yet.",
+     "User decision 13.11.", "Decided", "api/worker.py editable"],
+    ["W03", "Demand", "Shifting a forecast week",
+     "A shift of x units on one channel and week adds x to all 10 quantiles (Q05 … Q95) of that row: the "
+     "forecast keeps its shape and moves up (or down for a negative x). The quantiles can also be edited "
+     "one by one. The engine then checks the row like any workbook (for example no negative or falling "
+     "quantiles).",
+     "User decision 13.11.", "Decided", "api/worker.py apply_edit"],
+    ["W04", "What-if", "Target and review period only in the master data",
+     "The fill-rate target (Items!TargetFillRate) and the review period (Settings!ReviewPeriod) are "
+     "changed only as master data (a what-if edit), never per run; the engine's OPTIMIZATION_FILL_RATE "
+     "stays off.",
+     "User decision 13.11.", "Decided", "api/worker.py SETTING_CONSTANTS"],
+    ["W05", "What-if", "Always based on an original",
+     "A what-if always starts from an originally uploaded workbook, never from another what-if. Its change "
+     "list holds every difference to that original (sheet, row, key, field, original value, new value).",
+     "User decision 13.11.", "Decided", "api/server.py create_run"],
+    ["W06", "Comparison", "Fair comparison",
+     "Costs of two runs are compared only when both meet the same number of rules and use the same "
+     "fill-rate target: there is no lost-sales cost, so a plan that misses rules or aims lower always "
+     "looks cheaper.",
+     "User decisions 07.11. and 13.11.", "Decided", "dashboard Scenario comparison"],
+    ["W07", "Run settings", "Solver settings are set per run",
+     "Search time, optimizer scenarios, random seed, fresh scenarios, the feasibility check and the start "
+     "policy on fresh scenarios are set per run in the Run dialog, not in the master data. Optimizer "
+     "scenarios and random seed replace the Excel values for that run only (engine K20).",
+     "User decision 09.11.", "Decided", "Run dialog; api/server.py"],
+]
 
 
 # ============================================================================
@@ -120,6 +165,11 @@ def write_json(path, obj):
             if attempt == 19:
                 raise
             time.sleep(0.05)
+
+
+def is_original(folder):
+    """A run made from an uploaded workbook (not a what-if): only these can be the base of a what-if (W05)."""
+    return read_status(folder).get("base_run") is None
 
 
 def current_api(folder):
@@ -278,7 +328,8 @@ def watch(run_id, proc, folder, settings):
             CURRENT.update(id=None, proc=None, thread=None, cancelled=False)
 
 
-def start_run(data, file_name, settings, label_and_note=None):
+def start_run(data, file_name, settings, label_and_note=None, origin=None):
+    """origin = {"base_run": id, "changes": [...]} for a what-if (its input.xlsx is the checked copy)."""
     with LOCK:
         if busy():
             raise HTTPException(409, f"A run is already in progress ({CURRENT['id']}).")
@@ -289,11 +340,15 @@ def start_run(data, file_name, settings, label_and_note=None):
         (folder / "input.xlsx").write_bytes(data)
         write_json(folder / "request.json", settings)
         write_json(folder / "label.json", label_and_note or {})
+        if origin:
+            write_json(folder / "changes.json", origin["changes"])
         file = {"name": file_name, "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
         write_json(folder / "status.json", {"id": run_id, "api_version": API_VERSION, "state": "running",
                                             "created": now(), "started": now(),
                                             "finished": None, "time_limit": settings["time_limit"],
-                                            "settings": settings, "file": file, "message": "Running.", "errors": []})
+                                            "settings": settings, "file": file, "message": "Running.", "errors": [],
+                                            "base_run": origin["base_run"] if origin else None,
+                                            "changes": len(origin["changes"]) if origin else 0})
         cmd = [sys.executable, "-u", str(WORKER), "run", str(folder), str(LICENSE_FILE)]
         with open(folder / "log.txt", "wb") as log:
             proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, cwd=str(ROOT), env=worker_env())
@@ -311,16 +366,48 @@ def recover_interrupted_runs():
                           message="Interrupted: the API stopped during this run.")
 
 
+def worker_call(args, answer):
+    """One short worker process (validate, sheets, whatif); its JSON answer, or 500 with the worker's output."""
+    done = subprocess.run([sys.executable, "-u", str(WORKER), *map(str, args)], cwd=str(ROOT), env=worker_env(),
+                          capture_output=True, timeout=VALIDATE_TIMEOUT_SECONDS)
+    if not Path(answer).exists():
+        tail = done.stdout.decode("utf-8", "replace")[-2000:] + done.stderr.decode("utf-8", "replace")[-2000:]
+        raise HTTPException(500, f"The worker failed: {tail}")
+    return json.loads(Path(answer).read_text(encoding="utf-8"))
+
+
 def validate_upload(data):
     with tempfile.TemporaryDirectory() as tmp:
         src, answer = Path(tmp) / "input.xlsx", Path(tmp) / "answer.json"
         src.write_bytes(data)
-        done = subprocess.run([sys.executable, "-u", str(WORKER), "validate", str(src), str(answer)], cwd=str(ROOT),
-                              env=worker_env(), capture_output=True, timeout=VALIDATE_TIMEOUT_SECONDS)
-        if not answer.exists():
-            tail = done.stdout.decode("utf-8", "replace")[-2000:] + done.stderr.decode("utf-8", "replace")[-2000:]
-            raise HTTPException(500, f"The validation worker failed: {tail}")
-        return json.loads(answer.read_text(encoding="utf-8"))
+        return worker_call(["validate", src, answer], answer)
+
+
+def sheets_of(folder):
+    """The run's editable sheets (worker 'sheets'), cached in the run folder: input.xlsx never changes."""
+    cache = Path(folder) / "sheets.json"
+    if not cache.exists():
+        worker_call(["sheets", Path(folder) / "input.xlsx", cache], cache)
+    return json.loads(cache.read_text(encoding="utf-8"))
+
+
+def original_base(base_run):
+    folder = run_dir(base_run)
+    if not is_original(folder):
+        raise HTTPException(409, f"Run {base_run!r} is itself a what-if. A what-if always starts from the original "
+                                 f"upload: use run {read_status(folder)['base_run']!r} as the base.")
+    return folder
+
+
+def whatif_copy(base_run, edits):
+    """(answer, bytes of the checked copy or None): the worker writes the edits into a copy of the original run's
+    workbook and runs the engine's checks on it. The original input.xlsx is only read (W01)."""
+    folder = original_base(base_run)
+    with tempfile.TemporaryDirectory() as tmp:
+        edits_file, copy, answer = Path(tmp) / "edits.json", Path(tmp) / "input.xlsx", Path(tmp) / "answer.json"
+        edits_file.write_text(json.dumps(edits, ensure_ascii=False), encoding="utf-8")
+        result = worker_call(["whatif", folder / "input.xlsx", edits_file, copy, answer], answer)
+        return result, (copy.read_bytes() if result["valid"] and copy.exists() else None)
 
 
 # ============================================================================
@@ -371,6 +458,50 @@ class Validation(BaseModel):
     input: InputData | None = None        # the master data, when the workbook is valid
 
 
+class Edit(BaseModel):
+    """One what-if edit: a new value for one input cell, or a shift of all 10 quantiles of one Demand row (W03)."""
+    sheet: str                            # e.g. "Sourcing"
+    row: int                              # Excel row number, as GET /runs/{id}/sheets gives it
+    column: str | None = None             # header of the cell's column, e.g. "MaxOrderQty"
+    value: Any = None                     # the new value (with column)
+    shift: float | None = None            # Demand only: units added to Q05 … Q95 of that row
+
+
+class WhatIf(BaseModel):
+    base_run: str                         # an ORIGINAL run (made from an upload), never a what-if (W05)
+    edits: list[Edit] = Field(max_length=MAX_EDITS)
+
+
+class Change(BaseModel):
+    sheet: str
+    row: int
+    key: str                              # the row's key cells, e.g. "AMZ · 12" (channel · week)
+    column: str
+    old: Any                              # value in the original upload
+    new: Any
+
+
+class WhatIfValidation(Validation):
+    changes: list[Change] = []            # every difference to the original upload
+
+
+class EditRow(BaseModel):
+    row: int                              # Excel row number
+    key: str
+    values: list[Any]                     # in column order; cells Excel calculates show its last value (or null)
+    editable: list[bool]                  # in column order
+
+
+class EditSheet(BaseModel):
+    columns: list[str]
+    key_columns: list[str]
+    rows: list[EditRow]
+
+
+class Sheets(BaseModel):
+    sheets: dict[str, EditSheet]          # Settings, Items, Channels, Demand, Init_Inventory, Open_Orders, Sourcing, …
+
+
 class RunSummary(BaseModel):
     id: str
     state: str                            # running | done | invalid | failed | cancelled
@@ -382,6 +513,8 @@ class RunSummary(BaseModel):
     test_double: bool = False             # True = run on the Seeker test double (development only)
     settings: dict[str, Any] | None = None  # the run settings (see POST /runs)
     file: dict[str, Any] | None = None    # uploaded workbook: name, sha256 fingerprint, bytes
+    base_run: str | None = None           # what-if runs: the original run it was made from (W05)
+    changes: int = 0                      # what-if runs: number of changed cells (GET /runs/{id}/changes)
     label: str = ""
     note: str = ""
 
@@ -454,8 +587,7 @@ class RunInfo(BaseModel):
     scenarios_in_sample: int
     random_seed: int
     fill_rate_target: float               # the target used in this run
-    fill_rate_target_excel: float         # Items!TargetFillRate
-    optimization_fill_rate: float | None  # the run's own target, if one was set
+    fill_rate_target_excel: float         # Items!TargetFillRate (= the target used: no run's own target, W04)
     scenarios_out_of_sample: int
     feasibility_check: bool
     start_policy_out_of_sample: bool
@@ -505,26 +637,52 @@ def validate(file: Annotated[UploadFile, File()]):
     return validate_upload(read_upload(file))
 
 
+@app.post("/whatif/validate", response_model=WhatIfValidation)
+def validate_whatif(body: WhatIf):
+    """Writes the edits into a copy of the original run's workbook and checks the copy with the engine's own checks.
+    Nothing is stored; the original is only read (W01). Errors are the engine's words (sheet, row, field)."""
+    answer, _ = whatif_copy(body.base_run, [e.model_dump() for e in body.edits])
+    return answer
+
+
 @app.post("/runs", response_model=RunStatus, status_code=202)
-def create_run(file: Annotated[UploadFile, File()],
+def create_run(file: Annotated[UploadFile | None, File()] = None,
+               base_run: Annotated[str | None, Form()] = None,
+               edits: Annotated[str | None, Form()] = None,
                time_limit: Annotated[int, Form(ge=1, le=MAX_TIME_LIMIT)] = DEFAULT_TIME_LIMIT,
                out_of_sample_scenarios: Annotated[int, Form(ge=MIN_OOS, le=MAX_OOS)] = DEFAULT_OOS,
                feasibility_check: Annotated[bool, Form()] = True,
                start_policy_out_of_sample: Annotated[bool, Form()] = False,
-               optimization_fill_rate: Annotated[float | None, Form(gt=0, le=1)] = None,
                num_scenarios: Annotated[int | None, Form(ge=1, le=MAX_SCENARIOS)] = None,
                random_seed: Annotated[int | None, Form(ge=0)] = None,
                label: Annotated[str, Form(max_length=80)] = "",
                note: Annotated[str, Form(max_length=1000)] = ""):
-    """Starts an optimization run in the background (refused while another run is in progress).
-    num_scenarios / random_seed replace the Excel NumScenarios / RandomSeed for this run only (engine rule K20);
-    optimization_fill_rate replaces the product's fill-rate target (Items!TargetFillRate) for this run only (K08)."""
-    data = read_upload(file)
+    """Starts an optimization run in the background (refused while another run is in progress), either on an uploaded
+    workbook (file) or as a what-if: base_run = an original run, edits = JSON list of edits (see POST /whatif/validate);
+    an invalid what-if is refused with the engine's errors (422) and starts nothing.
+    num_scenarios / random_seed replace the Excel NumScenarios / RandomSeed for this run only (engine rule K20).
+    The fill-rate target and the review period come from the workbook only (W04)."""
+    if (file is None) == (base_run is None):
+        raise HTTPException(400, "Send either a workbook (file) or a what-if (base_run and edits), not both.")
     overrides = {k: v for k, v in (("NumScenarios", num_scenarios), ("RandomSeed", random_seed)) if v is not None}
     settings = {"time_limit": time_limit, "out_of_sample_scenarios": out_of_sample_scenarios,
                 "feasibility_check": feasibility_check, "start_policy_out_of_sample": start_policy_out_of_sample,
-                "optimization_fill_rate": optimization_fill_rate, "overrides": overrides or None}
-    return get_run(start_run(data, file.filename, settings, {"label": label, "note": note}))
+                "overrides": overrides or None}
+    label_and_note = {"label": label, "note": note}
+    if file is not None:
+        return get_run(start_run(read_upload(file), file.filename, settings, label_and_note))
+    try:
+        parsed = [Edit.model_validate(e).model_dump() for e in json.loads(edits or "[]")]
+    except (ValueError, TypeError) as e:
+        raise HTTPException(422, f"edits must be a JSON list of edits: {e}") from e
+    answer, data = whatif_copy(base_run, parsed)
+    if data is None:
+        raise HTTPException(422, {"message": "The what-if did not pass the engine's checks.",
+                                  "errors": answer["errors"]})
+    base_file = read_status(RUNS_DIR / base_run).get("file") or {}
+    name = f"What-if of {base_file.get('name', base_run)}"
+    origin = {"base_run": base_run, "changes": answer["changes"]}
+    return get_run(start_run(data, name, settings, label_and_note, origin))
 
 
 @app.get("/runs", response_model=list[RunSummary])
@@ -557,6 +715,26 @@ def get_input(run_id: str):
     if not (folder / "input.json").exists():
         raise HTTPException(409, "The run has no master data (the workbook could not be read).")
     return json.loads((folder / "input.json").read_text(encoding="utf-8"))
+
+
+@app.get("/runs/{run_id}/sheets", response_model=Sheets)
+def get_sheets(run_id: str):
+    """The run's input sheets for what-if editing: per data row its Excel row number, key, values and which cells may
+    be edited (W02). Edits are always made on an original run (W05)."""
+    return sheets_of(run_dir(run_id))
+
+
+@app.get("/runs/{run_id}/changes", response_model=list[Change])
+def get_changes(run_id: str):
+    """A what-if run's changes against its original (empty for a run made from an upload)."""
+    path = run_dir(run_id) / "changes.json"
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+
+
+@app.get("/app-rules", response_model=Table)
+def app_rules():
+    """The app's own rules (what-if editing, run settings, comparisons), in the columns of Model_Assumptions."""
+    return {"columns": APP_RULE_COLUMNS, "rows": APP_RULES}
 
 
 @app.get("/runs/{run_id}/result", response_model=Result)

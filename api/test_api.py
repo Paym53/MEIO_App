@@ -14,9 +14,11 @@ are real model numbers, the search is trivial.
   6. ONE RUN AT A TIME (AC6) .... second run refused; cancel; watchdog; crash and restart recovery
   7. ARCHITECTURE & CONTRACT .... server never imports the engine; frozen API contract; result model = worker output
   8. START SCRIPT .............. settings template complete, secrets gitignored; the .bat checks (Windows)
-  9. SETTINGS, MASTER DATA ..... run settings reach the engine; the run's own fill-rate target is used and reset;
-                                 overrides; master data = engine's reading; label/note; time estimate = measured
-                                 runs incl. the start check; keep-awake; runs of older engines are not shown
+  9. SETTINGS, MASTER DATA ..... run settings reach the engine; no run target (only the workbook's, W04); overrides;
+                                 master data = engine's reading; label/note; time estimate = measured runs incl. the
+                                 start check; keep-awake; runs of older engines are not shown
+ 10. WHAT-IF ................... edits go into a copy (original byte-identical); engine's words; demand shift exact;
+                                 formula/key/solver cells refused; target and review period edits; no chaining (W05)
 ================================================================================
 """
 import ast
@@ -250,8 +252,8 @@ def test_result_json_is_an_exact_copy_of_the_run_result(tmp_path, monkeypatch):
     assert set(h["expected_waste"]) == {"FG1", "RM3", "RM4"}                   # FG1 and the perishable materials
     info = out["run_info"]
     assert (info["horizon_weeks"], info["review_period_weeks"], info["first_rule_week"]) == (36, 1, 7)
-    assert (info["fill_rate_target"], info["fill_rate_target_excel"], info["optimization_fill_rate"]) == \
-        (0.95, 0.95, None)
+    assert (info["fill_rate_target"], info["fill_rate_target_excel"]) == (0.95, 0.95) and "optimization_fill_rate" \
+        not in info
     assert info["warnings"] == res.data.warnings and info["product_id"] == "FG1" and info["overrides"] is None
 
 
@@ -317,7 +319,7 @@ def test_history_lists_cost_next_to_the_rules_met_newest_first(done, api):
 def test_every_endpoint_refuses_requests_without_the_token(api, auth):
     headers = {"Authorization": auth} if auth else {}
     routes = [r for r in server.app.routes if isinstance(r, APIRoute)]
-    assert len(routes) == 10
+    assert len(routes) == 14                    # incl. the what-if endpoints (sheets, changes, validate, app rules)
     before = sorted(p.name for p in server.RUNS_DIR.iterdir())
     for route in routes:
         path = route.path.replace("{run_id}", "20261107-000000-abcd")
@@ -572,7 +574,7 @@ def test_master_data_is_exactly_what_the_engine_read(api, done):
 
 def test_run_settings_reach_the_engine_and_are_recorded(api):
     form = {"time_limit": "1", "out_of_sample_scenarios": "600", "feasibility_check": "false",
-            "start_policy_out_of_sample": "true", "optimization_fill_rate": "0.9", "num_scenarios": "100",
+            "start_policy_out_of_sample": "true", "optimization_fill_rate": "0.9", "num_scenarios": "100",  # ignored
             "random_seed": "43", "label": "seed 43", "note": "robustness check"}
     r = api.post("/runs", files=upload(TEMPLATE), data=form)
     assert r.status_code == 202, r.text
@@ -583,13 +585,9 @@ def test_run_settings_reach_the_engine_and_are_recorded(api):
     assert (info["scenarios_out_of_sample"], info["feasibility_check"], info["start_policy_out_of_sample"]) == \
         (600, False, True)
     assert (info["scenarios_in_sample"], info["random_seed"]) == (100, 43)
-    assert (info["fill_rate_target"], info["fill_rate_target_excel"], info["optimization_fill_rate"]) == \
-        (0.9, 0.95, 0.9)                                                     # the run's own target (K08)
-    h = res["headline"]
-    assert (h["fill_rate_target"], h["fill_rate_target_excel"]) == (0.9, 0.95)
-    assert h["fill_rate_target_source"] == "section 0 OPTIMIZATION_FILL_RATE; Excel 95.0%"
-    fr = res["sheets"]["FillRates"]
-    assert {row[fr["columns"].index("Target")] for row in fr["rows"]} == {0.9}  # every cell judged at the run target
+    h = res["headline"]                                  # no run target: an old client's field has no effect (W04)
+    assert (h["fill_rate_target"], h["fill_rate_target_excel"], info["fill_rate_target"]) == (0.95, 0.95, 0.95)
+    assert h["fill_rate_target_source"] == "Excel Items!TargetFillRate of FG1"
     assert info["overrides"] == {"NumScenarios": 100, "RandomSeed": 43}
     assert res["headline"]["feasibility"] == "not run"
     kpi_items = [row[0] for row in res["sheets"]["KPIs"]["rows"]]
@@ -600,12 +598,12 @@ def test_run_settings_reach_the_engine_and_are_recorded(api):
                           "bytes": TEMPLATE.stat().st_size}
 
 
-def test_the_run_target_is_reset_after_the_run_so_it_never_leaks(monkeypatch):
+def test_run_settings_are_restored_and_the_target_is_never_set_per_run(monkeypatch):
     monkeypatch.setattr(te.ms, "OPTIMIZATION_FILL_RATE", None)
     previous = worker.apply_settings(te.ms, {"optimization_fill_rate": 0.9, "feasibility_check": False})
-    assert (te.ms.OPTIMIZATION_FILL_RATE, te.ms.FEASIBILITY_CHECK) == (0.9, False)
+    assert (te.ms.OPTIMIZATION_FILL_RATE, te.ms.FEASIBILITY_CHECK) == (None, False)       # W04: workbook only
     worker.restore_settings(te.ms, previous)
-    assert (te.ms.OPTIMIZATION_FILL_RATE, te.ms.FEASIBILITY_CHECK) == (None, True)
+    assert te.ms.FEASIBILITY_CHECK is True
 
 
 def test_the_pc_is_kept_awake_during_a_run_and_released_after(monkeypatch):
@@ -620,8 +618,7 @@ def test_the_pc_is_kept_awake_during_a_run_and_released_after(monkeypatch):
         pass
 
 
-@pytest.mark.parametrize("field, value", [("out_of_sample_scenarios", "100"), ("optimization_fill_rate", "1.5"),
-                                          ("optimization_fill_rate", "0"), ("num_scenarios", "0"),
+@pytest.mark.parametrize("field, value", [("out_of_sample_scenarios", "100"), ("num_scenarios", "0"),
                                           ("random_seed", "-1"), ("label", "x" * 81)])
 def test_settings_outside_their_limits_are_refused(api, field, value):
     r = api.post("/runs", files=upload(TEMPLATE), data={field: value})
@@ -695,3 +692,135 @@ def test_a_worker_called_the_old_way_tells_the_user_to_restart(tmp_path, capsys)
     assert worker.main(["run", str(folder), "lic", "250"], {worker.TEST_DOUBLE_ENV: "1"}) == worker.EXIT_FAILED
     assert "start_worker.bat again" in capsys.readouterr().err
     assert "restart" in json.loads((folder / "status.json").read_text(encoding="utf-8"))["message"]
+
+
+# ============================================================================
+# 10. WHAT-IF (API update 2, app rules W01–W05)
+# ============================================================================
+def row_of(api, run_id, sheet, key):
+    """Excel row number of the data row with this key (as the sheets endpoint names it, e.g. "AMZ · 12")."""
+    rows = api.get(f"/runs/{run_id}/sheets").json()["sheets"][sheet]["rows"]
+    return next(r["row"] for r in rows if r["key"] == key)
+
+
+def test_the_sheets_say_which_cells_may_be_edited(api, done):
+    sheets = api.get(f"/runs/{done[0]}/sheets").json()["sheets"]
+    st = sheets["Settings"]
+    assert [r["key"] for r in st["rows"] if any(r["editable"])] == list(worker.SETTINGS_EDITABLE)  # not NumScenarios …
+    demand = sheets["Demand"]
+    week12 = next(r for r in demand["rows"] if r["key"] == "AMZ · 12")
+    editable = {c for c, e in zip(demand["columns"], week12["editable"], strict=True) if e}
+    assert set(worker.DEMAND_QUANTILES) <= editable
+    assert not {"ChannelID", "Period", "MeanApprox", "RowCheck", "PeriodStart"} & editable        # keys and formulas
+    items = sheets["Items"]
+    fg1 = next(r for r in items["rows"] if r["key"] == "FG1")
+    assert dict(zip(items["columns"], fg1["editable"], strict=True))["TargetFillRate"] is True      # W04
+    assert {k: len(v["rows"]) for k, v in sheets.items()}["Demand"] == 108                         # 3 channels × 36
+
+
+def test_a_whatif_changes_only_a_copy_and_the_engine_checks_it(api, done):
+    original = server.RUNS_DIR / done[0] / "input.xlsx"
+    before = hashlib.sha256(original.read_bytes()).hexdigest()
+    fg1, rm3 = row_of(api, done[0], "Items", "FG1"), row_of(api, done[0], "Sourcing", "RM3")
+    review = row_of(api, done[0], "Settings", "ReviewPeriod")
+    edits = [{"sheet": "Items", "row": fg1, "column": "TargetFillRate", "value": 0.9},
+             {"sheet": "Sourcing", "row": rm3, "column": "MaxOrderQty", "value": 1500},
+             {"sheet": "Settings", "row": review, "column": "Value", "value": 2}]
+    r = api.post("/whatif/validate", json={"base_run": done[0], "edits": edits}).json()
+    assert r["valid"] is True and r["errors"] == []
+    assert r["input"]["product"]["fill_rate_target"] == 0.9 and r["input"]["settings"]["review_period_weeks"] == 2
+    assert next(m for m in r["input"]["raw_materials"] if m["id"] == "RM3")["max_order"] == 1500
+    assert [(c["sheet"], c["key"], c["column"], c["old"], c["new"]) for c in r["changes"]] == [
+        ("Items", "FG1", "TargetFillRate", 0.95, 0.9), ("Sourcing", "RM3", "MaxOrderQty", 1000, 1500),
+        ("Settings", "ReviewPeriod", "Value", 1, 2)]
+    assert hashlib.sha256(original.read_bytes()).hexdigest() == before                             # W01
+
+
+def test_a_demand_shift_moves_all_ten_quantiles_of_one_week_and_channel(api, done):
+    row = row_of(api, done[0], "Demand", "AMZ · 12")
+    r = api.post("/whatif/validate", json={"base_run": done[0], "edits": [
+        {"sheet": "Demand", "row": row, "shift": 2000}]}).json()
+    assert r["valid"] is True
+    old = api.get(f"/runs/{done[0]}/input").json()["demand"]["quantiles"]
+    new = r["input"]["demand"]["quantiles"]
+    assert new["AMZ"][11] == [q + 2000 for q in old["AMZ"][11]]                                    # W03, exact
+    assert all(new[c][w] == old[c][w] for c in old for w in range(36) if (c, w) != ("AMZ", 11))  # nothing else
+    assert [c["column"] for c in r["changes"]] == list(worker.DEMAND_QUANTILES)
+
+
+def test_an_invalid_whatif_is_refused_in_the_engines_words(api, done, tmp_path):
+    rm3 = row_of(api, done[0], "Sourcing", "RM3")
+    edit = {"sheet": "Sourcing", "row": rm3, "column": "MOQ", "value": 5000}
+    wb = openpyxl.load_workbook(TEMPLATE)
+    wb["Sourcing"].cell(rm3, 4).value = 5000                                       # the same edit by hand
+    wb.save(tmp_path / "by_hand.xlsx")
+    expected = engine_errors(tmp_path / "by_hand.xlsx")
+    r = api.post("/whatif/validate", json={"base_run": done[0], "edits": [edit]}).json()
+    assert r["valid"] is False and r["errors"] == expected and expected
+    started = api.post("/runs", data={"base_run": done[0], "edits": json.dumps([edit]), "time_limit": "1"})
+    assert started.status_code == 422 and started.json()["detail"]["errors"] == expected          # nothing starts
+
+
+@pytest.mark.parametrize("edit, words", [
+    ({"sheet": "Demand", "key": "AMZ · 12", "column": "MeanApprox", "value": 1}, "cannot be edited"),     # formula
+    ({"sheet": "Items", "key": "FG1", "column": "ItemID", "value": "FG9"}, "cannot be edited"),           # key
+    ({"sheet": "Settings", "key": "NumScenarios", "column": "Value", "value": 50}, "cannot be edited"),   # W07
+    ({"sheet": "Items", "key": "FG1", "shift": 5}, "only possible on Demand"),
+    ({"sheet": "Checks", "key": None, "column": "x", "value": 1}, "cannot be edited"),
+])
+def test_cells_the_app_does_not_let_anyone_change_are_refused(api, done, edit, words):
+    row = row_of(api, done[0], edit["sheet"], edit["key"]) if edit["key"] else 5
+    e = {k: v for k, v in edit.items() if k != "key"} | {"row": row}
+    r = api.post("/whatif/validate", json={"base_run": done[0], "edits": [e]}).json()
+    assert r["valid"] is False and words in r["errors"][0] and r["changes"] == []
+
+
+def test_a_row_that_does_not_exist_is_refused(api, done):
+    r = api.post("/whatif/validate", json={"base_run": done[0], "edits": [
+        {"sheet": "Demand", "row": 999, "shift": 1}]}).json()
+    assert r["valid"] is False and "no data row" in r["errors"][0]
+
+
+def test_a_whatif_run_records_its_original_and_changes(api, done):
+    row = row_of(api, done[0], "Items", "FG1")
+    edits = [{"sheet": "Items", "row": row, "column": "TargetFillRate", "value": 0.92},
+             {"sheet": "Items", "row": row, "column": "TargetFillRate", "value": 0.9}]       # edited twice: one change
+    r = api.post("/runs", data={"base_run": done[0], "edits": json.dumps(edits), "time_limit": "1",
+                                "label": "target 90 %"})
+    assert r.status_code == 202, r.text
+    st = wait(api, r.json()["id"])
+    assert st["state"] == "done", st
+    assert (st["base_run"], st["changes"], st["label"]) == (done[0], 1, "target 90 %")
+    assert st["file"]["name"] == f"What-if of {TEMPLATE.name}"
+    assert st["file"]["sha256"] != done[1]["file"]["sha256"]                                       # a different file
+    changes = api.get(f"/runs/{st['id']}/changes").json()
+    assert [(c["key"], c["old"], c["new"]) for c in changes] == [("FG1", 0.95, 0.9)]
+    res = api.get(f"/runs/{st['id']}/result").json()
+    assert res["headline"]["fill_rate_target"] == res["run_info"]["fill_rate_target"] == 0.9     # W04
+    assert api.get(f"/runs/{st['id']}/input").json()["product"]["fill_rate_target"] == 0.9
+    assert api.get(f"/runs/{done[0]}/changes").json() == []                                        # the original
+
+
+def test_a_whatif_is_never_the_base_of_another_whatif(api, done):
+    row = row_of(api, done[0], "Items", "FG1")
+    edit = [{"sheet": "Items", "row": row, "column": "TargetFillRate", "value": 0.9}]
+    first = wait(api, api.post("/runs", data={"base_run": done[0], "edits": json.dumps(edit),
+                                              "time_limit": "1"}).json()["id"])
+    r = api.post("/whatif/validate", json={"base_run": first["id"], "edits": edit})
+    assert r.status_code == 409 and done[0] in r.json()["detail"]                    # W05: use the original instead
+    assert api.post("/runs", data={"base_run": first["id"], "edits": "[]"}).status_code == 409
+
+
+def test_a_run_needs_either_a_file_or_a_whatif(api, done):
+    assert api.post("/runs", data={"time_limit": "1"}).status_code == 400
+    both = api.post("/runs", files=upload(TEMPLATE), data={"base_run": done[0], "edits": "[]"})
+    assert both.status_code == 400
+    assert api.post("/runs", data={"base_run": done[0], "edits": "not json"}).status_code == 422
+    assert api.post("/whatif/validate", json={"base_run": "20991231-235959-ffff", "edits": []}).status_code == 404
+
+
+def test_the_app_rules_are_served_in_the_model_assumptions_columns(api):
+    rules = api.get("/app-rules").json()
+    assert rules["columns"] == ["ID", "Topic", "Title", "Rule / mechanic", "Source", "Status", "Where"]
+    assert [r[0] for r in rules["rows"]] == ["W01", "W02", "W03", "W04", "W05", "W06", "W07"]
+    assert all(len(r) == len(rules["columns"]) and all(r) for r in rules["rows"])

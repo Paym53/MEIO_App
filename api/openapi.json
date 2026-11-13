@@ -72,6 +72,50 @@
     ]
    }
   },
+  "/whatif/validate": {
+   "post": {
+    "summary": "Validate Whatif",
+    "description": "Writes the edits into a copy of the original run's workbook and checks the copy with the engine's own checks.\nNothing is stored; the original is only read (W01). Errors are the engine's words (sheet, row, field).",
+    "operationId": "validate_whatif_whatif_validate_post",
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/WhatIf"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/WhatIfValidation"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Validation Error",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      }
+     }
+    },
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ]
+   }
+  },
   "/runs": {
    "get": {
     "summary": "List Runs",
@@ -101,7 +145,7 @@
    },
    "post": {
     "summary": "Create Run",
-    "description": "Starts an optimization run in the background (refused while another run is in progress).\nnum_scenarios / random_seed replace the Excel NumScenarios / RandomSeed for this run only (engine rule K20);\noptimization_fill_rate replaces the product's fill-rate target (Items!TargetFillRate) for this run only (K08).",
+    "description": "Starts an optimization run in the background (refused while another run is in progress), either on an uploaded\nworkbook (file) or as a what-if: base_run = an original run, edits = JSON list of edits (see POST /whatif/validate);\nan invalid what-if is refused with the engine's errors (422) and starts nothing.\nnum_scenarios / random_seed replace the Excel NumScenarios / RandomSeed for this run only (engine rule K20).\nThe fill-rate target and the review period come from the workbook only (W04).",
     "operationId": "create_run_runs_post",
     "requestBody": {
      "content": {
@@ -110,8 +154,7 @@
         "$ref": "#/components/schemas/Body_create_run_runs_post"
        }
       }
-     },
-     "required": true
+     }
     },
     "responses": {
      "202": {
@@ -285,6 +328,124 @@
     }
    }
   },
+  "/runs/{run_id}/sheets": {
+   "get": {
+    "summary": "Get Sheets",
+    "description": "The run's input sheets for what-if editing: per data row its Excel row number, key, values and which cells may\nbe edited (W02). Edits are always made on an original run (W05).",
+    "operationId": "get_sheets_runs__run_id__sheets_get",
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ],
+    "parameters": [
+     {
+      "name": "run_id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "title": "Run Id"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Sheets"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Validation Error",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/runs/{run_id}/changes": {
+   "get": {
+    "summary": "Get Changes",
+    "description": "A what-if run's changes against its original (empty for a run made from an upload).",
+    "operationId": "get_changes_runs__run_id__changes_get",
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ],
+    "parameters": [
+     {
+      "name": "run_id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "title": "Run Id"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "array",
+         "items": {
+          "$ref": "#/components/schemas/Change"
+         },
+         "title": "Response Get Changes Runs  Run Id  Changes Get"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Validation Error",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/app-rules": {
+   "get": {
+    "summary": "App Rules",
+    "description": "The app's own rules (what-if editing, run settings, comparisons), in the columns of Model_Assumptions.",
+    "operationId": "app_rules_app_rules_get",
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Table"
+        }
+       }
+      }
+     }
+    },
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ]
+   }
+  },
   "/runs/{run_id}/result": {
    "get": {
     "summary": "Get Result",
@@ -418,9 +579,38 @@
    "Body_create_run_runs_post": {
     "properties": {
      "file": {
-      "type": "string",
-      "contentMediaType": "application/octet-stream",
+      "anyOf": [
+       {
+        "type": "string",
+        "contentMediaType": "application/octet-stream"
+       },
+       {
+        "type": "null"
+       }
+      ],
       "title": "File"
+     },
+     "base_run": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Base Run"
+     },
+     "edits": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Edits"
      },
      "time_limit": {
       "type": "integer",
@@ -445,19 +635,6 @@
       "type": "boolean",
       "title": "Start Policy Out Of Sample",
       "default": false
-     },
-     "optimization_fill_rate": {
-      "anyOf": [
-       {
-        "type": "number",
-        "maximum": 1.0,
-        "exclusiveMinimum": 0.0
-       },
-       {
-        "type": "null"
-       }
-      ],
-      "title": "Optimization Fill Rate"
      },
      "num_scenarios": {
       "anyOf": [
@@ -498,9 +675,6 @@
      }
     },
     "type": "object",
-    "required": [
-     "file"
-    ],
     "title": "Body_create_run_runs_post"
    },
    "Body_validate_validate_post": {
@@ -516,6 +690,150 @@
      "file"
     ],
     "title": "Body_validate_validate_post"
+   },
+   "Change": {
+    "properties": {
+     "sheet": {
+      "type": "string",
+      "title": "Sheet"
+     },
+     "row": {
+      "type": "integer",
+      "title": "Row"
+     },
+     "key": {
+      "type": "string",
+      "title": "Key"
+     },
+     "column": {
+      "type": "string",
+      "title": "Column"
+     },
+     "old": {
+      "title": "Old"
+     },
+     "new": {
+      "title": "New"
+     }
+    },
+    "type": "object",
+    "required": [
+     "sheet",
+     "row",
+     "key",
+     "column",
+     "old",
+     "new"
+    ],
+    "title": "Change"
+   },
+   "Edit": {
+    "properties": {
+     "sheet": {
+      "type": "string",
+      "title": "Sheet"
+     },
+     "row": {
+      "type": "integer",
+      "title": "Row"
+     },
+     "column": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Column"
+     },
+     "value": {
+      "title": "Value"
+     },
+     "shift": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Shift"
+     }
+    },
+    "type": "object",
+    "required": [
+     "sheet",
+     "row"
+    ],
+    "title": "Edit",
+    "description": "One what-if edit: a new value for one input cell, or a shift of all 10 quantiles of one Demand row (W03)."
+   },
+   "EditRow": {
+    "properties": {
+     "row": {
+      "type": "integer",
+      "title": "Row"
+     },
+     "key": {
+      "type": "string",
+      "title": "Key"
+     },
+     "values": {
+      "items": {},
+      "type": "array",
+      "title": "Values"
+     },
+     "editable": {
+      "items": {
+       "type": "boolean"
+      },
+      "type": "array",
+      "title": "Editable"
+     }
+    },
+    "type": "object",
+    "required": [
+     "row",
+     "key",
+     "values",
+     "editable"
+    ],
+    "title": "EditRow"
+   },
+   "EditSheet": {
+    "properties": {
+     "columns": {
+      "items": {
+       "type": "string"
+      },
+      "type": "array",
+      "title": "Columns"
+     },
+     "key_columns": {
+      "items": {
+       "type": "string"
+      },
+      "type": "array",
+      "title": "Key Columns"
+     },
+     "rows": {
+      "items": {
+       "$ref": "#/components/schemas/EditRow"
+      },
+      "type": "array",
+      "title": "Rows"
+     }
+    },
+    "type": "object",
+    "required": [
+     "columns",
+     "key_columns",
+     "rows"
+    ],
+    "title": "EditSheet"
    },
    "HTTPValidationError": {
     "properties": {
@@ -1035,17 +1353,6 @@
       "type": "number",
       "title": "Fill Rate Target Excel"
      },
-     "optimization_fill_rate": {
-      "anyOf": [
-       {
-        "type": "number"
-       },
-       {
-        "type": "null"
-       }
-      ],
-      "title": "Optimization Fill Rate"
-     },
      "scenarios_out_of_sample": {
       "type": "integer",
       "title": "Scenarios Out Of Sample"
@@ -1092,7 +1399,6 @@
      "random_seed",
      "fill_rate_target",
      "fill_rate_target_excel",
-     "optimization_fill_rate",
      "scenarios_out_of_sample",
      "feasibility_check",
      "start_policy_out_of_sample",
@@ -1204,6 +1510,22 @@
        }
       ],
       "title": "File"
+     },
+     "base_run": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Base Run"
+     },
+     "changes": {
+      "type": "integer",
+      "title": "Changes",
+      "default": 0
      },
      "label": {
       "type": "string",
@@ -1341,6 +1663,22 @@
       ],
       "title": "File"
      },
+     "base_run": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Base Run"
+     },
+     "changes": {
+      "type": "integer",
+      "title": "Changes",
+      "default": 0
+     },
      "label": {
       "type": "string",
       "title": "Label",
@@ -1362,6 +1700,22 @@
      "message"
     ],
     "title": "RunSummary"
+   },
+   "Sheets": {
+    "properties": {
+     "sheets": {
+      "additionalProperties": {
+       "$ref": "#/components/schemas/EditSheet"
+      },
+      "type": "object",
+      "title": "Sheets"
+     }
+    },
+    "type": "object",
+    "required": [
+     "sheets"
+    ],
+    "title": "Sheets"
    },
    "StartCheck": {
     "properties": {
@@ -1507,6 +1861,75 @@
      "type"
     ],
     "title": "ValidationError"
+   },
+   "WhatIf": {
+    "properties": {
+     "base_run": {
+      "type": "string",
+      "title": "Base Run"
+     },
+     "edits": {
+      "items": {
+       "$ref": "#/components/schemas/Edit"
+      },
+      "type": "array",
+      "maxItems": 5000,
+      "title": "Edits"
+     }
+    },
+    "type": "object",
+    "required": [
+     "base_run",
+     "edits"
+    ],
+    "title": "WhatIf"
+   },
+   "WhatIfValidation": {
+    "properties": {
+     "valid": {
+      "type": "boolean",
+      "title": "Valid"
+     },
+     "errors": {
+      "items": {
+       "type": "string"
+      },
+      "type": "array",
+      "title": "Errors"
+     },
+     "warnings": {
+      "items": {
+       "type": "string"
+      },
+      "type": "array",
+      "title": "Warnings",
+      "default": []
+     },
+     "input": {
+      "anyOf": [
+       {
+        "$ref": "#/components/schemas/InputData"
+       },
+       {
+        "type": "null"
+       }
+      ]
+     },
+     "changes": {
+      "items": {
+       "$ref": "#/components/schemas/Change"
+      },
+      "type": "array",
+      "title": "Changes",
+      "default": []
+     }
+    },
+    "type": "object",
+    "required": [
+     "valid",
+     "errors"
+    ],
+    "title": "WhatIfValidation"
    }
   },
   "securitySchemes": {
