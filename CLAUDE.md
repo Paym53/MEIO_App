@@ -417,25 +417,29 @@ lint, build) **and** the full UI test suite, added together once all screens exi
   progress steps from `phase`; time left from `seconds_left` only; cancel; end states done/invalid/failed/cancelled.
 - Results (next): headline = out-of-sample cost + "N of M rules met"; feasibility line and bound NOTE above the fold;
   missed rules listed; every table cell = API value (no computed numbers); workbook download.
-- Runs/compare (AC4): costs compared only when rules_met_out_of_sample is equal; otherwise a warning, no difference.
+- Runs/compare (AC4): costs compared only when rules_met_out_of_sample AND fill_rate_target are equal; otherwise a
+  warning, no difference.
 - Overview: KPI strip = headline fields; fresh saving from KPIs row when present, else in-sample (labelled); heatmap
   status from FillRates "Status out-of-sample", fixed weeks before run_info.first_rule_week; KPIs rows by name.
   Fixed weeks (Status "info") show their share in grey without ✓/✕. Feasibility "not run" → "Not checked".
-  Decisions to take now: Commit_Now columns When / Decision / "Quantity / rule" / Note (week from "Week 1"); cards only
-  for week-1 quantity > 0; why = Bands "position" week 1 Mean vs Policy_sS s/S + input order limits; week-2 rules
-  listed only when P(order) > 0 (Decisions). Channel rows from FillRates (serving order), never a fixed list.
+  Decisions to take now (contract 4): Commit_Now columns When / Decision / Quantity / Note, one block per committed
+  week 1..R; cards for every quantity > 0; why in week 1 = Bands "position" week 1 Mean vs Policy_sS s/S + input order
+  limits; later committed weeks = planned position (A03), no position number. Channel rows from FillRates (serving
+  order), never a fixed list. Service grid: value = "Expected FR (" (fresh), status OK / BELOW TARGET, not judged before
+  first_rule_week, end of horizon from the first "FG active" = "fixed 0" week, tooltip = §8 one-cell explanation.
 - Supply-chain map (React Flow): nodes = input.tables.Locations (LocationID, Type) only; supplier edges from Sourcing
   (SupplierID → DestinationID, label "RMx · LT"), others from Lanes; runs without Sourcing show a hint. Panels:
   bars only for order_qty and receipts, other series as band/line charts; open orders keys qty/placed/arrival;
-  channel fill rate from the column "P(FR ≥ target) (" (fresh, not the in-sample one that comes first); "fixed weeks"
-  shading only on DC and channel charts; KPI unit "share of scenarios" shown as %.
+  channel fill rate from the column "Expected FR (" (fresh, not "Expected FR in-sample ("); target = the product's
+  (headline.fill_rate_target); "fixed weeks" shading only on DC and channel charts; KPI unit "share of scenarios" as %.
 - Orders: rows = (stream, week) with P(order) > 0 + open orders; quantity labelled "avg. over all futures (incl. no
   order)"; arrival P50 (P05–P95) only over futures that order; open orders "before W1 (week −3)"; review cards
   formatted with the item unit.
 - Decisions/Orders: (s,S) from wide Policy_sS (`FG s`/`FG S` exact case, production point "FG"); badges only from
   Decisions.Status ("—" otherwise); units from KPIs "Average end stock <item>," Unit; arrival from Bands
   arrival_week ("never ordered" when empty); grey only rows where every "<point> active" is "fixed 0".
-- Run dialog: optional form fields never sent when empty (null, undefined or "").
+- Run dialog: optional form fields never sent when empty (null, undefined or ""); presets Decision run (500 / 700 s,
+  default) and Quick what-if (100 / 150 s); fill-rate target entered in %, sent as a share; empty = Excel.
 - Inventory: s/S only on Bands series "position"; served/lost/eligible_next_week read per channel (Item = channel id);
   units from the engine; no_stock_share = Mean only.
 - Master data: demand bands by level position in demand.quantiles[channel][week][level] (Q05–Q95, Q25–Q75, Q45–Q55,
@@ -532,7 +536,15 @@ futures that order** (like arrival_week), so Orders can show "if ordered: …" i
   weeks or channels (only Mean adds up; totals with P10/P90 are in KPIs).
 - **Verified 13.11. (cloud, test double):** 141 engine + 51 app tests, coverage 98 %; the worker's missed rules on the
   user's real v18.1 FillRates = B2B and AMZ week 36, 88/90, as the engine's Summary.
-- **Next:** dashboard update to contract 4 (every renamed field, the new notices, presets), then API update 2.
+- **Verified 13.11. on the user's PC:** all tests pass on Windows (197, coverage 98 %); first real Seeker run through
+  API 3 (`curl`, 120 scenarios, 120 s): €105,847.76 and 88/90 on fresh scenarios = the F5 workbook exactly; 4 min 52 s
+  (estimate 5.6 min). MEIO_App PR #10 and dashboard PR #12 (contract 4) merged; the user checked the dashboard: OK.
+- **Dashboard on contract 4 (PR #12):** Overview status line (target + source, scenarios, engine review-period text),
+  notices (start repair, waste warning, data warnings), decisions for every committed week 1..R, service grid on the
+  expected FR with "not judged" weeks and end-of-horizon weeks = from the first Policy_sS `FG active` = "fixed 0" week
+  (W31 on the template; Claude's choice, the engine defines no number); run presets; cost comparison only at the same
+  target and the same rules met; localStorage key `meio.nextRunSettings.v2`.
+- **Next:** API update 2 (what-if editing); its spec waits for the user's OK (13.11.).
 **API update 2 (after the dashboard update):** what-if edits written into a copy of the uploaded workbook (openpyxl,
 values only; engine K19 checks it), with an original-vs-changed list per run.
 
