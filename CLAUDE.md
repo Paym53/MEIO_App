@@ -544,9 +544,26 @@ futures that order** (like arrival_week), so Orders can show "if ordered: …" i
   expected FR with "not judged" weeks and end-of-horizon weeks = from the first Policy_sS `FG active` = "fixed 0" week
   (W31 on the template; Claude's choice, the engine defines no number); run presets; cost comparison only at the same
   target and the same rules met; localStorage key `meio.nextRunSettings.v2`.
-- **Next:** API update 2 (what-if editing); its spec waits for the user's OK (13.11.).
-**API update 2 (after the dashboard update):** what-if edits written into a copy of the uploaded workbook (openpyxl,
-values only; engine K19 checks it), with an original-vs-changed list per run.
+- **Next:** API update 2 (what-if editing), see below.
+**API update 2 (13.11., what-if editing; user decisions 13.11.):**
+- **Rules (app rules W01–W07, `api/server.py` `APP_RULES`, served at `GET /app-rules`, shown on Explainability under
+  the engine's Model_Assumptions; keep them current with every app change):** edits go into a copy of the ORIGINAL
+  upload (openpyxl, values only; the original's sha256 never changes); only input cells (no keys, no formulas; Settings
+  only PlanningStartDate, HorizonPeriods, ReviewPeriod); demand per channel and week either single quantiles or a shift
+  that adds x units to all 10 quantiles; fill-rate target (Items!TargetFillRate) and review period (Settings!ReviewPeriod)
+  only as master data, the run target field is gone (`OPTIMIZATION_FILL_RATE` stays None); **no chaining**: a what-if
+  always starts from an original upload (409 otherwise, naming the original); costs compared only at the same target
+  and rules met; solver settings only per run. No adding/deleting rows yet.
+- **Worker:** `sheets <xlsx> <answer>` (editable sheets: header row 4, data from row 5, key columns per sheet in
+  `EDIT_SHEETS`, Excel row numbers, editable flags, formula cells with Excel's last value) and
+  `whatif <original> <edits.json> <copy> <answer>` (edits → copy → engine validate; answer + change list, one entry per
+  cell with the original value). Edit = `{sheet, row, column, value}` or `{sheet: "Demand", row, shift}`.
+- **API:** `GET /runs/{id}/sheets` (cached in `sheets.json`), `POST /whatif/validate` {base_run, edits} → valid, errors,
+  warnings, input, changes; `POST /runs` with `base_run` + `edits` (JSON) instead of `file` (invalid → 422 with the
+  engine's errors, nothing starts); status.json `base_run`, `changes` (count); `GET /runs/{id}/changes`.
+- **Verified 13.11. (cloud, test double):** 204 tests (141 engine + 63 app), coverage 98.5 %; engine refusal of an
+  invalid edit = the engine's words for the same edit made by hand; a +2,000 shift changes exactly the 10 quantiles of
+  one channel and week. Next: dashboard edit screens (Lovable prompt), then the user's check on Windows.
 
 **Plan:** PR 1 foundation → user runs tests + one real F5 run from the repo → PR 2 local API → one real run via
 `localhost:8000/docs` → PR 3 ngrok → test from the phone → Lovable UI (prompt pack from Claude, one screen at a time)
