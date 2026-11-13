@@ -21,11 +21,13 @@ Every number in input.json and result.json is copied from the engine; nothing is
   2. DATA SOURCE ..... where the input workbook comes from (Excel now; a database later)
   3. VALIDATE ........ data checks only
   4. INPUT ........... the master data as the engine read it → JSON (Master data page)
-  5. RESULT .......... RunResult → result.json (contract version 2)
-  6. RUN ............. the whole engine pipeline for one run folder
+  5. RESULT .......... RunResult → result.json (contract version 4 = engine contract 4, v18.1)
+  6. RUN ............. the whole engine pipeline for one run folder (the PC is kept awake meanwhile)
   7. MAIN
 ================================================================================
 """
+import contextlib
+import ctypes
 import datetime as dt
 import json
 import math
@@ -42,13 +44,16 @@ import numpy as np
 # ============================================================================
 ENGINE_DIR = Path(__file__).resolve().parent.parent / "engine"
 TEST_DOUBLE_ENV = "MEIO_TEST_DOUBLE"      # "1" = use the Seeker test double from engine/test_engine.py (tests only!)
-RESULT_CONTRACT_VERSION = 2               # bump on any change to the result.json layout (and to api/openapi.json)
+RESULT_CONTRACT_VERSION = 4               # bump on any change to the result.json layout (and to api/openapi.json)
 EXIT_DONE, EXIT_FAILED, EXIT_INVALID = 0, 1, 2
 # run setting (request.json) → engine module constant (CLAUDE.md §6 "Settings"); None = keep the engine's default
 SETTING_CONSTANTS = {"out_of_sample_scenarios": "OUT_OF_SAMPLE_SCENARIOS",
                      "feasibility_check": "FEASIBILITY_CHECK",
                      "start_policy_out_of_sample": "START_POLICY_OUT_OF_SAMPLE",
-                     "optimization_chance_level": "OPTIMIZATION_CHANCE_LEVEL"}
+                     "optimization_fill_rate": "OPTIMIZATION_FILL_RATE"}   # K08: replaces Items!TargetFillRate
+# Windows SetThreadExecutionState flags: keep the PC awake during a run (a sleeping PC stretched a 300 s search to
+# 12,100 s on 12.11.); the flags are cleared when the run ends (and by Windows when the process exits)
+ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
 RAW_TABLES = ("Locations", "Lanes", "Items", "Sourcing", "Model_Assumptions")   # template sheets shown as they are
 EXCEL_ONLY_COLUMNS = ["RowCheck", "EffectiveMaxOrderQty"]   # Excel formulas (empty in edited copies); engine values
                                                             # are in raw_materials[] (max_order)
@@ -148,23 +153,31 @@ def raw_material(k, unit):
             "order_variable_cost": cell(k.var_cost), "holding_cost": cell(k.holding), "waste_cost": cell(k.waste)}
 
 
+def excel_target(d):
+    """The product's fill-rate target as entered in Items!TargetFillRate (the engine keeps it apart from a run's own
+    target, K08; right after load_data() only fill_rate_target is set)."""
+    excel = getattr(d, "fill_rate_target_excel", None)
+    return d.fill_rate_target if excel is None else excel
+
+
 def describe_input(engine, d, path):
     unit = d.uom or {}
     with engine.pd.ExcelFile(str(path)) as xls:                    # the engine's own sheet reader (_sheet)
         raw = {s: table(engine._sheet(xls, s).drop(columns=EXCEL_ONLY_COLUMNS, errors="ignore")) for s in RAW_TABLES}
     return {
         "settings": {"horizon_weeks": d.horizon, "review_period_weeks": d.review_period,
-                     "start_date": d.start_date.date().isoformat(), "chance_level": cell(d.chance_level),
+                     "start_date": d.start_date.date().isoformat(),
                      "scenarios": d.n_scenarios, "random_seed": d.seed, "time_limit_seconds": cell(d.time_limit),
                      "rules_from_first_controllable_week": d.enforce_from_first_controllable},
         "product": {"id": d.fg_id, "unit": unit.get(d.fg_id), "shelf_life_weeks": d.fg_shelf_life,
+                    "fill_rate_target": cell(excel_target(d)),                 # Items!TargetFillRate (H04)
                     "holding_cost": cell(d.fg_holding), "waste_cost": cell(d.fg_waste),
                     "production": {"moq": cell(d.prod_moq), "batch": cell(d.prod_batch), "max": cell(d.prod_max),
                                    "lead_time": lead_time(d.prod_lead_time), "fixed_cost": cell(d.prod_fixed),
                                    "cost_tiers": tiers(d.prod_tiers), "transport_tiers": tiers(d.transport_tiers)}},
         "raw_materials": [raw_material(k, unit.get(k.id)) for k in d.rms],
-        "channels": [{"id": c.id, "serving_order": i + 1, "target_fill_rate": cell(c.target),
-                      "min_remaining_shelf_life": c.min_remaining} for i, c in enumerate(d.channels)],
+        "channels": [{"id": c.id, "serving_order": int(c.priority),          # Channels!ShortagePriority (H02)
+                      "min_remaining_shelf_life": c.min_remaining} for c in d.channels],
         "demand": {"quantile_levels": [cell(x) for x in d.levels],          # weeks 1..H, one list per channel
                    "quantiles": {c.id: [[cell(q) for q in d.demand_q[ci, t]] for t in range(1, d.horizon + 1)]
                                  for ci, c in enumerate(d.channels)}},
@@ -187,16 +200,34 @@ def column(df, prefix):
 
 
 def missed_rules(fill_rates):
-    """Constrained rules the engine marks BELOW LEVEL on the fresh scenarios (FillRates sheet)."""
-    share = column(fill_rates, "P(FR ≥ target) (")
-    rows = fill_rates[(fill_rates["Constrained"] == "yes") & (fill_rates["Status out-of-sample"] == "BELOW LEVEL")]
-    return [{"channel": r["Channel"], "week": int(r["Week"]), "target": float(r["Target"]), "share": float(r[share])}
-            for _, r in rows.iterrows()]
+    """Constrained cells the engine marks BELOW TARGET on the fresh scenarios (FillRates sheet, contract 3): the
+    expected fill rate (the number rule H05 judges) and the tail columns that show how deep the bad futures go."""
+    cols = {"expected_fill_rate": column(fill_rates, "Expected FR ("),
+            "fully_served": column(fill_rates, "Fully served ("),
+            "bad_scenario_p10": column(fill_rates, "FR in a bad scenario, P10 ("),
+            "worst_5pct_average": column(fill_rates, "Worst 5% of futures, average FR (")}
+    rows = fill_rates[(fill_rates["Constrained"] == "yes") & (fill_rates["Status out-of-sample"] == "BELOW TARGET")]
+    return [{"channel": r["Channel"], "week": int(r["Week"]), "target": float(r["Target"]),
+             **{k: float(r[c]) for k, c in cols.items()}} for _, r in rows.iterrows()]
+
+
+def summary_rows(res):
+    """Summary sheet as {Item: Value}. Phase rows ('Time: …') repeat; nothing here is keyed by them (handover B5)."""
+    return {str(k): v for k, v in res.sheets["Summary"].values}
+
+
+def start_record(ins):
+    """Start check (K07): z₀ from the target, the z it was raised to, and every evaluated step."""
+    z = ins.get("start_z") or {}
+    steps = [{"z": cell(s.get("z")), "met": int(s["met"]), "cost": cell(s.get("cost"))} for s in z.get("steps", [])]
+    return {"z0": cell(z.get("z0")), "z": cell(z.get("z")), "steps": steps}
 
 
 def headline(engine, res):
-    ins, oos, fr = res.ins, res.oos, res.sheets["FillRates"]
-    summary = dict(res.sheets["Summary"].values)
+    ins, oos, fr, d = res.ins, res.oos, res.sheets["FillRates"], res.data
+    summary = summary_rows(res)
+    waste = {k[len("Expected waste "):].split(" (")[0]: str(v) for k, v in summary.items()
+             if k.startswith("Expected waste ")}                               # FG1 and each perishable RM (L10)
     return {
         "cost_out_of_sample": float(oos["cost"]),                              # the headline (CLAUDE.md §2)
         "rules_total": int(len(ins["constrained"])),
@@ -204,6 +235,19 @@ def headline(engine, res):
         "rules_missed_out_of_sample": missed_rules(fr),
         "feasibility": str(ins["feasibility"]),                                # one line, section 4b
         "bound_note": str(engine.bound_note(res.layout, res.x)),               # "none" or which setting to raise
+        "weakest_cell": str(summary.get("Weakest cell (out-of-sample)", "")),  # tail of the weakest cell (L04)
+        "fill_rate_target": float(d.fill_rate_target),                         # the target used in this run (K08)
+        "fill_rate_target_excel": float(excel_target(d)),                      # Items!TargetFillRate
+        "fill_rate_target_source": engine.target_source(d),                    # Excel or the run's own target
+        "review_period": str(summary.get("Review period (A03)", "")),          # which weeks this run commits
+        "start_policy": str(summary.get("Start policy (warm start)", "")),
+        "start_check": start_record(ins),
+        "start_repair_used": bool((ins.get("repair") or {}).get("used")),      # K21: show as a notice, not an error
+        "start_repair": str(summary.get("Start repair (section 4c, K21)", "")),
+        "start_policy_before_repair": (str(summary["Start policy before repair"])
+                                       if "Start policy before repair" in summary else None),
+        "expected_waste": waste,
+        "waste_warning": str(summary.get("Waste warning (L10)", "")),          # "none" or the warning (L10)
         "cost_in_sample": float(ins["cost"]),
         "rules_met_in_sample": int(ins["met"]),
         "start_policy_cost": float(ins["start"]["cost"]),
@@ -221,8 +265,9 @@ def run_info(engine, res, settings):
     return {"product_id": d.fg_id, "horizon_weeks": d.horizon, "review_period_weeks": d.review_period,
             "first_rule_week": min((t for _, t in res.ins["constrained"]), default=None),
             "start_date": d.start_date.date().isoformat(), "time_limit_seconds": cell(settings["time_limit"]),
-            "scenarios_in_sample": d.n_scenarios, "random_seed": d.seed, "chance_level": cell(d.chance_level),
-            "optimization_chance_level": cell(engine.OPTIMIZATION_CHANCE_LEVEL or d.chance_level),
+            "scenarios_in_sample": d.n_scenarios, "random_seed": d.seed,
+            "fill_rate_target": float(d.fill_rate_target), "fill_rate_target_excel": float(excel_target(d)),
+            "optimization_fill_rate": cell(settings.get("optimization_fill_rate")),
             "scenarios_out_of_sample": int(res.oos["n"]), "feasibility_check": bool(engine.FEASIBILITY_CHECK),
             "start_policy_out_of_sample": bool(engine.START_POLICY_OUT_OF_SAMPLE),
             "overrides": res.overrides, "warnings": list(d.warnings or [])}
@@ -265,15 +310,32 @@ def set_status(run_dir, **fields):
     write_json(path, status)
 
 
-def apply_settings(engine, d, settings):
-    """Run settings → engine constants. The optimization chance level may never be below the Excel rule."""
-    level = settings.get("optimization_chance_level")
-    if level is not None and level < d.chance_level:
-        raise ValueError(f"Data validation failed:\n  - Optimization chance level {level:g} is below the Excel "
-                         f"FillRateChanceLevel {d.chance_level:g}; it may only be equal or higher (stricter).")
+def apply_settings(engine, settings):
+    """Run settings → engine constants. Returns the previous values, so restore_settings() can put them back: the
+    target (OPTIMIZATION_FILL_RATE) must never leak into a later run (one run per process anyway)."""
+    previous = {c: getattr(engine, c) for c in SETTING_CONSTANTS.values()}
     for key, constant in SETTING_CONSTANTS.items():
         if settings.get(key) is not None:
             setattr(engine, constant, settings[key])
+    return previous
+
+
+def restore_settings(engine, previous):
+    for constant, value in previous.items():
+        setattr(engine, constant, value)
+
+
+@contextlib.contextmanager
+def keep_awake():
+    """Windows: the PC must not sleep while Seeker runs. Elsewhere (tests, CI on Linux) nothing happens."""
+    kernel32 = getattr(getattr(ctypes, "windll", None), "kernel32", None)
+    if kernel32 is not None:
+        kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+    try:
+        yield
+    finally:
+        if kernel32 is not None:
+            kernel32.SetThreadExecutionState(ES_CONTINUOUS)
 
 
 def run(engine, skr, test_double, run_dir, license_file):
@@ -282,9 +344,14 @@ def run(engine, skr, test_double, run_dir, license_file):
     try:
         d = engine.load_data(str(input_workbook(run_dir)))
         write_json(run_dir / "input.json", describe_input(engine, d, input_workbook(run_dir)))
-        apply_settings(engine, d, settings)
-        res = engine.run(str(input_workbook(run_dir)), str(license_file), time_limit=float(settings["time_limit"]),
-                         skr=skr, overrides=settings.get("overrides"))
+        previous = apply_settings(engine, settings)
+        try:
+            with keep_awake():
+                res = engine.run(str(input_workbook(run_dir)), str(license_file),
+                                 time_limit=float(settings["time_limit"]), skr=skr, overrides=settings.get("overrides"))
+            result = build_result(engine, res, test_double, settings)      # target_source() reads the run's target
+        finally:
+            restore_settings(engine, previous)
     except ValueError as e:
         set_status(run_dir, state="invalid", message="The data did not pass the engine's checks.",
                    errors=error_lines(e))
@@ -292,7 +359,6 @@ def run(engine, skr, test_double, run_dir, license_file):
     except (FileNotFoundError, ImportError) as e:
         set_status(run_dir, state="failed", message=str(e), errors=[])
         return EXIT_FAILED
-    result = build_result(engine, res, test_double, settings)
     write_json(run_dir / "result.json", result)
     engine.write_report(res.sheets, run_dir / "results.xlsx")
     h = result["headline"]

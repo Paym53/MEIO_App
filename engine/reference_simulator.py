@@ -7,7 +7,7 @@ MEIO_model_spec.md). The test suite runs the engine (Seeker Terms, via the test 
 simulator on the SAME scenarios and requires identical cost, cost parts, fill rates, orders, arrivals,
 stock, waste and holding in every scenario. Frozen: change it only together with a rule change.
 
-Contents: 1 data loading & validation · 2 scenario generation · 3 simulator (E1–E6) + chance statistic ·
+Contents: 1 data loading & validation · 2 scenario generation · 3 simulator (E1–E6) + expected fill rate ·
           4 the formula start policy (to check the engine's start policy)
 """
 import math
@@ -81,8 +81,9 @@ class RawMaterial:
 @dataclass
 class Channel:
     id: str
-    target: float            # fill-rate target β_c
+    target: float            # fill-rate target of the cell = the product's target (H04)
     min_remaining: int       # rest shelf life needed ρ_c
+    priority: int = 0        # ShortagePriority, 1 = served first (H02)
 
 
 @dataclass
@@ -90,7 +91,7 @@ class ModelData:
     horizon: int
     review_period: int
     start_date: pd.Timestamp
-    chance_level: float
+    fill_rate_target: float
     enforce_from_first_controllable: bool
     n_scenarios: int
     seed: int
@@ -109,7 +110,7 @@ class ModelData:
     fg_waste: float
     # other entities
     rms: list
-    channels: list           # sorted by priority (highest fill-rate target first)
+    channels: list           # sorted by ShortagePriority (1 = served first)
     levels: np.ndarray       # quantile probability levels
     demand_q: np.ndarray     # (C, H+1, 10) quantiles, index t = 1..H
     init_fg: list            # [(remaining shelf life, qty)]
@@ -197,11 +198,12 @@ def load_data(path):
             holding=_num(c[_col(costs.reset_index(), "HoldingCost")], 0.0),
             waste=_num(c[_col(costs.reset_index(), "WasteCost")], 0.0)))
 
-    # --- channels, sorted by fill-rate target (highest first = served first, H02)
+    # --- one target per product (H04); channels sorted by ShortagePriority (1 = served first, H02)
+    target = float(items.loc[fg_id, _col(items.reset_index(), "TargetFillRate")])
     ch = _sheet(xls, "Channels")
-    channels = [Channel(r["ChannelID"], float(r["TargetFillRate"]), int(r[_col(ch, "MinRemainingShelfLife")]))
+    channels = [Channel(r["ChannelID"], target, int(r[_col(ch, "MinRemainingShelfLife")]), int(r["ShortagePriority"]))
                 for _, r in ch.iterrows()]
-    channels = sorted(channels, key=lambda c: -c.target)  # stable: ties keep sheet order
+    channels = sorted(channels, key=lambda c: c.priority)
 
     # --- demand quantiles
     H = int(st["HorizonPeriods"])
@@ -252,7 +254,7 @@ def load_data(path):
 
     return ModelData(
         horizon=H, review_period=int(st["ReviewPeriod"]), start_date=pd.Timestamp(st["PlanningStartDate"]),
-        chance_level=float(st["FillRateChanceLevel"]),
+        fill_rate_target=target,
         enforce_from_first_controllable=str(st["FillRateEnforcementStart"]) == "FirstControllablePeriod",
         n_scenarios=int(st["NumScenarios"]), seed=int(st["RandomSeed"]), time_limit=float(st["SolverTimeLimit"]),
         fg_id=fg_id, fg_shelf_life=int(items.loc[fg_id, _col(items.reset_index(), "ShelfLife")]),
@@ -295,11 +297,11 @@ def validate(d):
     for a, _ in d.init_fg:
         if a > d.fg_shelf_life:
             errors.append("Initial FG lot has more remaining shelf life than the FG shelf life.")
+    if not 0 < d.fill_rate_target <= 1:
+        errors.append("TargetFillRate must be in (0, 1].")
     for c in d.channels:
-        if not 0 < c.target <= 1 or c.min_remaining > d.fg_shelf_life:
-            errors.append(f"Channel {c.id}: target in (0,1] and shelf-life need ≤ FG shelf life.")
-    if d.n_scenarios * (1 - d.chance_level) < 1 - EPS and d.chance_level < 1:
-        errors.append("NumScenarios too small for FillRateChanceLevel (need ≥ 1/(1−level)).")
+        if c.min_remaining > d.fg_shelf_life:
+            errors.append(f"Channel {c.id}: shelf-life need ≤ FG shelf life.")
     if errors:
         raise ValueError("Data validation failed:\n  - " + "\n  - ".join(errors))
 
@@ -465,7 +467,14 @@ class MEIOSimulator:
             rec["eligible_next_week"] = np.zeros((N, C, H + 1))     # end of week, still sellable to c next week
             rec["rsl_num"] = np.zeros((N, H + 1))                   # Σ rest shelf life × quantity at week end
 
+        # planned positions between runs (A03, C08): position at the last run + orders since − expected demand since
+        exp_dem = np.concatenate(([0.0], d.demand_q[:, 1:, :].mean(axis=2).sum(axis=0)))
+        plan_fg, plan_order_fg = np.zeros(N), np.zeros(N)
+        plan_rm = {k.id: np.zeros(N) for k in d.rms}
+        plan_order_rm = {k.id: np.zeros(N) for k in d.rms}
+
         for t in range(1, H + 1):
+            is_run = (t - 1) % d.review_period == 0              # weeks 1, 1+R, 1+2R, …
             # ---- E1: receipts (full shelf life, F01) ------------------------------------
             got = arr_fg[:, t].copy()
             X[:, SLf] += got
@@ -491,9 +500,11 @@ class MEIOSimulator:
 
             # ---- E2: FG review at DC → production order (C01, C06, D02, D03, E04) -------
             s_t, S_t = policy["FG"][0][t], policy["FG"][1][t]
-            ip_fg = X[:, rho_min:].sum(1) + pipe_fg              # sellable stock + pipeline
-            trigger = ip_fg < s_t                                # strict trigger (C06)
-            q_hat = np.minimum(d.prod_max, np.maximum(d.prod_moq, round_up(S_t - ip_fg, d.prod_batch)))
+            ip_fg = X[:, rho_min:].sum(1) + pipe_fg              # sellable stock + pipeline (actual)
+            ip_use = ip_fg if is_run else np.maximum(0.0, plan_fg + plan_order_fg - exp_dem[t - 1])
+            trigger = ip_use < s_t                               # strict trigger (C06)
+            q_hat = np.minimum(d.prod_max, np.maximum(d.prod_moq, round_up(S_t - ip_use, d.prod_batch)))
+            plan_fg, plan_order_fg = ip_use, np.where(trigger, q_hat, 0.0)
             cap = np.full(N, np.inf)                             # raw material availability (D02)
             for k in d.rms:
                 avail = R[k.id][:, k.min_remaining:].sum(1) if k.perishable else R[k.id][:, 0]
@@ -524,10 +535,12 @@ class MEIOSimulator:
             ip_fg_after = ip_fg + q_p
             for k in d.rms:
                 usable_next = R[k.id][:, k.min_remaining + 1:].sum(1) if k.perishable else R[k.id][:, 0]
-                ip_k = usable_next + pipe_rm[k.id] + k.bom * ip_fg_after
+                ip_k = usable_next + pipe_rm[k.id] + k.bom * ip_fg_after                 # actual echelon
+                ip_k_use = ip_k if is_run else np.maximum(0.0, plan_rm[k.id] + plan_order_rm[k.id] - k.bom * exp_dem[t - 1])
                 s_k, S_k = policy[k.id][0][t], policy[k.id][1][t]
-                q_k = np.minimum(k.max_order, np.maximum(k.moq, round_up(S_k - ip_k, k.multiple)))
-                q_k = np.where(ip_k < s_k, q_k, 0.0)
+                q_k = np.minimum(k.max_order, np.maximum(k.moq, round_up(S_k - ip_k_use, k.multiple)))
+                q_k = np.where(ip_k_use < s_k, q_k, 0.0)
+                plan_rm[k.id], plan_order_rm[k.id] = ip_k_use, q_k
                 placed_k = q_k > 0
                 arr_k = np.maximum(t + sc.lt_rm[k.id][:, t], last_rm[k.id])
                 arr_rm[k.id][rows[placed_k], arr_k[placed_k]] += q_k[placed_k]
@@ -585,12 +598,9 @@ class MEIOSimulator:
         return res
 
 
-def chance_stat(fill_rate, chance_level):
-    """(v+1)-th smallest fill rate across scenarios, v = ⌊(1−α)·N⌋ (H07).
-    'At most v scenarios below target' ⇔ this value ≥ target."""
-    n = fill_rate.shape[0]
-    v = int(math.floor((1 - chance_level) * n + EPS))
-    return np.partition(fill_rate, v, axis=0)[v]
+def expected_fill_rate(fill_rate):
+    """H05: expected fill rate per channel and week = mean over the scenarios (axis 0) of served ÷ demand."""
+    return fill_rate.mean(axis=0)
 
 
 # ============================================================================

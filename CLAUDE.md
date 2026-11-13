@@ -12,12 +12,15 @@ The engine bundle lives in `engine/`, byte-exact. A new engine version replaces 
 | File | What it is | You may edit? |
 |---|---|---|
 | `CLAUDE.md` | this file: everything you need to know | yes (keep it current) |
-| `engine/meio_seeker_stochastic.py` | **the engine** (v17.1, contract version 2): every rule, written once, as Seeker Terms | **no** |
+| `engine/meio_seeker_stochastic.py` | **the engine** (v18.1, contract version 4): every rule, written once, as Seeker Terms | **no** |
 | `engine/reference_simulator.py` | independent second implementation of the rules, used only by the tests | **no** |
 | `engine/meio_stress_tests.py` | 26 data-change scenarios run through the engine (needs Seeker) | **no** |
-| `engine/test_engine.py` | **the engine test suite**: input control, physics & dynamics, model functionality, output control, stress cases, engine fingerprint; includes a Seeker test double, so no license needed | **no** |
-| `engine/MEIO_Data_Template.xlsx` | the input file (template v1.1, **example data**; the tests depend on it) incl. sheet `Model_Assumptions` | **no** (real data goes in `data/`, gitignored) |
-| `engine/MEIO_model_spec.md` | the dynamics/assumptions list: all 82 rules (IDs like C03, H05, K17), same as the Excel sheet | **no** |
+| `engine/test_engine.py` | **the engine test suite** (141 tests): input control, physics & dynamics, model functionality, output control, stress cases, engine fingerprint; includes a Seeker test double, so no license needed | **no** |
+| `engine/MEIO_Data_Template.xlsx` | the input file (v18.1 layout, **example data**; the tests depend on it) incl. sheet `Model_Assumptions`; workbooks from v17.x are rejected (handover B1) | **no** (real data goes in `data/`, gitignored) |
+| `engine/MEIO_model_spec.md` | the dynamics/assumptions list: all 85 rules (IDs like C03, H05, K17), same as the Excel sheet | **no** |
+| `engine/MEIO_math_model.md` | the formal model: sets, dynamics, objective, fill-rate rule, Seeker mapping | **no** |
+| `engine/MEIO_shelf_life_aware_policies.md` | archived design of age-aware positions (rejected, K22); the waste warning (L10) refers to it | **no** |
+| `engine/ENGINE_v18_1_HANDOVER.md` | the record of every engine change since v17.1 and why, what the app had to adapt, and the open proposals (section G) | **no** |
 | `MEIO_Results_stochastic.xlsx` | results of a real Seeker run (sheet layout = engine output); on the user's PC only, gitignored | no |
 
 The app's own files are listed in §9. Don't add files or docs beyond that list unless the user asks.
@@ -39,8 +42,8 @@ into CRLF on checkout and the engine fingerprint test would fail on the user's P
   - Show the feasibility line and the bound NOTE prominently.
   - Show the rules missed on fresh scenarios.
   - Compare costs only between plans that meet the same number of rules (there is no lost-sales cost, so a plan that misses rules looks cheaper).
-- **Checks stay green:** `python -m ruff check .` and `python -m pytest` from the repo root (117 engine tests,
-  about 90 s, plus the app's own tests) on every change. CI runs both on Linux and Windows, plus a secret scan.
+- **Checks stay green:** `python -m ruff check .` and `python -m pytest` from the repo root (141 engine tests,
+  about 2.5 min, plus the app's own tests) on every change. CI runs both on Linux and Windows, plus a secret scan.
 
 ## 3. How to work (the user's method) and the user
 
@@ -71,8 +74,9 @@ RM1 can, RM2 tray: non-perishable, lead time 4 wk
 RM3 strawberry: shelf life 52 wk, usable only with ≥ 36 wk left, LT 8 wk, max 1,000 kg/wk = 2,000 cans/wk (bottleneck)
 RM4 pineapple: shelf life 52 wk, same freshness rule, LT 12 wk
 FG1: shelf life 36 wk; production LT 6 wk; MOQ 6,000, batch 100, max 50,000; one start per week; price tiers
-Channels, served in this order: D2C target 98% (needs ≥ 16 wk left) → B2B 95% (≥ 24) → AMZ 90% (≥ 24)
-Demand: 10 forecast quantiles per channel and week, ~1,400 cans/wk. Horizon 36 weeks, re-planned every 2 weeks.
+Fill-rate target: one per product, 95% for FG1, the same for every channel (Items!TargetFillRate)
+Channels, served in this order (Channels!ShortagePriority): D2C (needs ≥ 16 wk left) → B2B (≥ 24) → AMZ (≥ 24)
+Demand: 10 forecast quantiles per channel and week, ~1,400 cans/wk. Horizon 36 weeks, re-planned every ReviewPeriod weeks (template: 1).
 ```
 
 The example data is generated; real data comes later.
@@ -80,7 +84,7 @@ The example data is generated; real data comes later.
 **Outputs:**
 - (s,S) per stock point and week
 - the derived orders, transfers and production
-- **commit now:** week 1 exact, week 2 as a rule; later weeks are indicative
+- **commit now:** every decision of weeks 1..R (R = review period) as exact quantities; later weeks are indicative
 - fill rates, stock, waste and cost
 
 ## 5. The model in one page
@@ -97,12 +101,18 @@ The example data is generated; real data comes later.
   5. holding cost
   6. ageing, then scrapping what no one can use
   - Lead times are fixed or random; orders never overtake.
+- **Review period R (Settings!ReviewPeriod, default 1, A03):** the model is run every R weeks. A run commits every decision
+  of weeks 1..R as exact quantities. Between runs the (s,S) rules use the *planned* position (position at the last run +
+  orders planned since − expected demand since), so nothing inside a cycle reacts to the actual demand. R = 1 = weekly.
 - **Objective:** minimize expected total cost: raw materials + production + transport + holding + waste. There is no lost-sales cost and no
-  end-of-horizon value (user decision).
-- **Constraints:** from week 7 (the first week a new decision can reach), per channel and week, at least 99% of scenarios must meet the
-  fill-rate target. That gives 90 chance constraints.
-- **Solving:** Seeker searches the (s,S) values on 200 demand scenarios drawn from the forecast. Then the same model is evaluated on
-  2,500 fresh scenarios (out-of-sample check).
+  end-of-horizon value (user decision, A05): stock left after the last week is worth nothing, so plans run stock down near the end.
+  Act only on the committed weeks; read the last weeks as indicative and total cost as spending within the horizon.
+- **Constraints:** from week 7 (the first week a new decision can reach), per channel and week (a "cell"), the **expected fill rate**
+  (mean over the scenarios of served ÷ demand) must reach the product's target. That gives 90 cell rules. There is no chance level.
+- **Solving:** Seeker searches the (s,S) values on `NumScenarios` demand scenarios drawn from the forecast (template 200; use 500 for runs
+  the user acts on). Then the same model is evaluated on 2,500 fresh scenarios (out-of-sample check).
+- **Two modelling assumptions to keep in mind:** inventory positions are age-blind (K22: they count lots that expire before they are
+  sold), and the futures are drawn independently per channel and week (G02: no correlation over weeks or across channels).
 - **Classification:** a stochastic-service-type network (no guaranteed service times) solved by simulation-optimization. This is
   the right fit for perishability, lost sales, MOQs, capacity limits and per-week fill-rate rules; the classic formula methods can't handle these together.
 
@@ -121,8 +131,8 @@ res = engine.run(data_file="MEIO_Data_Template.xlsx", license_file="license.sio"
 | `data` | validated input. `data.channels` is sorted by priority; map channel index `ci` with `data.channels[ci].id` |
 | `layout`, `x` | decision variables and the optimized values (`layout.index` = (stock point, week, "sigma"/"delta")) |
 | `policy` | `{"FG", "RM1".."RM4": (s, S)}`, arrays indexed by week 1..H (index 0 unused) |
-| `ins` | Seeker's own scenarios: `cost`, `parts`, `fr_share[(ci,t)]`, `met`, `start{cost, met}`, `status`, `feasibility` (one line) … |
-| `oos` | fresh scenarios: `cost`, `("fr_mean"/"fr_share", ci, t)`, `(item, "mean"/"p10"/"p90"/"p_order", t)`, stock, waste; and `("band", series, item, week, stat)`, `("kpi", name, item, stat)` |
+| `ins` | Seeker's own scenarios: `cost`, `parts`, `fr_mean[(ci,t)]` (expected fill rate per cell), `met`, `start{cost, met}`, `start_z{z0, z, steps}`, `status`, `feasibility` (one line), `repair` (`{"used": False}` or the repair record: steps, chosen step, `formula_start{cost, met}`) … |
+| `oos` | fresh scenarios: `cost`, `("fr_mean"/"fr_full"/"fr_p10"/"fr_tail", ci, t)`, `(item, "mean"/"p10"/"p90"/"p_order", t)`, stock, waste; and `("band", series, item, week, stat)`, `("kpi", name, item, stat)` |
 | `sheets` | report tables: `Summary`, `Commit_Now`, `Policy_sS`, `Decisions`, `FillRates`, `Stock_Waste`, `Bands`, `KPIs` (columns frozen in `test_engine.py`) |
 | `timings` | (phase, seconds) |
 | `overrides` | the run overrides applied, or None |
@@ -168,16 +178,36 @@ start-policy cost and rules met on the same fresh seeds and the fresh-vs-fresh s
 | `OUT_OF_SAMPLE_SCENARIOS` | 2500 | fresh scenarios for the check |
 | `FEASIBILITY_CHECK` | True | about 25 s |
 | `START_POLICY_OUT_OF_SAMPLE` | False | also evaluate the start policy on the same fresh seeds (+~75 s) |
-| `OPTIMIZATION_CHANCE_LEVEL` | None | None = Excel level 0.99; never set it lower |
+| `OPTIMIZATION_FILL_RATE` | None | None = Items!TargetFillRate; a number replaces it for the whole run (search, start, checks, report; K08). `res.data.fill_rate_target` is the target used, `res.data.fill_rate_target_excel` the Excel value |
+| `START_Z` | None | None = start safety factor from the target (normal loss function), raised by the start check; a number fixes it (K07) |
+| `START_REPAIR` | True | repair an infeasible start before the search (K21); runs only when needed |
+| `FILL_RATE_CONSTRAINT_FORM` | "mean" | "mean" = rule E (H05); "none" switches the rules off (diagnostic). Use only these two values |
+| `WASTE_WARNING_SHARE` | 0.05 | waste warning limit (L10) |
+| `HORIZON_MARGIN_WEEKS` | 8 | input warning X10 if horizon < echelon lead time + R + this (A02); the Excel Checks row X10 uses the same number |
 | `EXTRA_COVER_WEEKS` | | upper bounds of the reorder points; raise the one named in a bound NOTE |
 
 **Two lines the user must always see:**
 - **Feasibility check:** "OK", or "N rule(s) fail whatever we decide: …". These are weeks the supply physically cannot reach.
 - **Bound NOTE:** "none", or which setting to raise because a reorder point hit its upper bound.
 
-**Runtime:** a default run takes about 6.5 min on the user's PC (feasibility 25 s, build 11 s, search 250 s + ~15%, out-of-sample 75 s in v16;
-v17 builds about 8,600 more single numbers in the out-of-sample check, the extra time on Seeker is measured on the user's PC).
-Run it as a background job and stream its stdout (phase lines `[hh:mm:ss] …` and Seeker's progress every 30 s) as progress.
+**More things to show when they occur:**
+- **Start repair (K21):** normally "not needed". If the console says `START REPAIR USED`, the formula start missed rules that
+  can be met and Seeker started from a repaired, feasible but expensive plan; the Summary rows "Start repair" and "Start
+  policy before repair" say which step was used. Show it as a notice, not an error.
+- **Waste warning (L10):** `WARNING (L10)` / Summary row "Waste warning" when expected waste exceeds 5% of expected demand.
+  The Summary also has "Expected waste <item>" rows for FG1 and each perishable raw material.
+- **Data warnings X08/X09/X10 (K19):** open orders that arrive later than their lead time allows, MOQs larger than one fresh
+  lot can sell/use before it expires, and (X10) a horizon too short for the review period and lead times. They are in
+  `res.data.warnings` with the other warnings and never stop a run.
+
+**Runtime on the user's PC (v18.1):**
+- **Fixed parts:** feasibility check 20–30 s, model build 8–13 s, out-of-sample check 70–95 s.
+- **Start check:** each z step costs 20–25 s with 200 scenarios and 30–40 s with 500.
+- **Search:** the time limit + 4–15%.
+- **Totals:** 200 scenarios with 300 s search ≈ 10 min; 500 scenarios with 700 s ≈ 19 min.
+- **Progress:** run it as a background job and stream its stdout as progress: phase lines `[hh:mm:ss] …` and Seeker's
+  `At time …` lines, which come irregularly and can pause for minutes.
+- **The worker machine must not sleep:** one 300 s search ran 12,100 s on 12.11., most likely because the PC slept.
 
 **License:** the Seeker license is bound to one machine, so the optimization worker must run there. Settle the deployment with the user first.
 
@@ -199,17 +229,26 @@ When the app needs something from the engine (a rule, an output, a setting, a bu
 
 ## 8. Status, decisions, known facts
 
-**Latest numbers (user's PC, engine v17, 250 s, 08.11.):**
-- start policy €119,981
-- Seeker in-sample €111,784 with 90/90 rules (8,450 evaluations)
-- fresh scenarios (2,500) €112,128 with 88/90 rules (the misses are usually the week-36 Amazon/B2B rules at the end of the horizon; this is accepted, because the end weeks are indicative)
-- Week-1 decision: no production; a 1,000 kg strawberry order arriving in week 9.
-- Phase times: feasibility check 20 s, model build 8 s, search 268 s (limit 250), out-of-sample check 78 s, about 6.5 min in total.
-  Short time limits overrun more: a 30 s search took 54 s, so plan short what-if runs with about 25 s fixed overhead.
-- **Through the local API (07.11., v16, real Seeker):** €112,128.16 and 88/90 on fresh scenarios, identical to F5; 377 s in
-  total. **Same run on v17.1 through the API (08.11.):** €112,128.16, 88/90, 407 s; search 273.4 s for 250 s
-  (= limit + 24 s, as the engine session's 30 s → 54 s), out-of-sample 82.5 s. The API's time estimate (`api/server.py`):
-  30 s + 21 s feasibility + 0.033 s per fresh scenario (twice with the start policy on fresh scenarios) + limit + 24 s.
+**Latest numbers (user's PC, template, target 95%, 12.11.):**
+
+| Engine and settings | Start | Seeker in-sample | Fresh (2,500) |
+|---|---|---|---|
+| v18.0, 500 scenarios, 700 s | z 1.22 → 3.00, €113,804 | €112,735, 90/90 | €112,753, **90/90**; weakest AMZ week 36 at 96.3% |
+| v18.1, R = 1, 200 scenarios, 300 s | z 2.50, €110,739 | €105,863, 90/90 | €105,878, 88/90; AMZ week 36 at 88.5% (fitted to the 200 planning futures, see 'How to read one fill-rate cell') |
+| v18.1, R = 2, 200 scenarios, 300 s | €110,422 | €104,935 | €105,033, 89/90 |
+| v18.1, R = 4, 200 scenarios, 300 s | z 3.00, €113,876 | €105,818 | €106,028, 89/90 |
+
+- **Week-1 decision in every run:** no production; a 1,000 kg strawberry order arriving in week 9.
+- **Seeker savings vs. the start:** small (0.9–7%). The search often stalls after 2–3 minutes. The large theoretical saving is
+  the end-of-horizon run-down (A05), which is not a real saving.
+- **Short runs:** about 25 s fixed overhead, so a 30 s search takes about 55 s.
+**Through the local API:** v16 (07.11.) and v17.1 (08.11.) gave €112,128.16 and 88/90 on fresh scenarios, identical
+to F5. **v18.1 (13.11., user's PC, 120 scenarios, 120 s, F5):** start z 1.22 → 2.50 in 3 steps of 12–14 s, €105,848 and
+88/90 on fresh scenarios (B2B and AMZ week 36; weakest AMZ week 36 at 89.0%), about 4.8 min in total. The API's time
+estimate (`api/server.py`): 20 s + 0.1 s per optimizer scenario + 21 s feasibility + 3 z steps of (8 s + 0.06 s per
+scenario) + 12 s second build (+ 6 steps if a repair runs) + limit × 1.1 + 10 s + 0.033 s per fresh scenario; it follows
+the `4. Start check … z = …` and `4c.` lines in the log (counted, never keyed by phase name: names repeat).
+
 
 **v17 (08.11., change request "uncertainty, flows and what-ifs"):** report series, arrival weeks given an order, KPIs,
 run overrides, optional start policy on fresh scenarios, and every Excel check in Python. The search model is unchanged:
@@ -220,35 +259,92 @@ Confirmed on real Seeker 2.1 on the user's PC: the same improvement path as v16 
 the stock balances on the means close exactly. v17.1 fixes a file lock: the engine now closes the workbook after
 reading, so the app can overwrite or delete its copies on Windows.
 
+**v17.2 (10.11., engine session; confirmed by the user's Seeker run 11.11.):**
+- Start policy (K07) with a lot cap (a lot never larger than one fresh lot can sell, unless the MOQ forces it) and a
+  raw-material lot guard (raw-material reorder point ≥ BOM × (FG reorder point + production MOQ)). On the template the guard
+  raises 4 raw-material reorder points in the last weeks, so the start and the saving baseline differ slightly from v17.1.
+- Start check and repair (K21): section 5 evaluates the start; only if it misses rules that can be met, section 4c makes it
+  feasible step by step (R1 bounds, R2 maximum supply before the missed weeks, R3 maximum supply everywhere) and Seeker
+  starts from that. Not used on the template.
+- Chance level (K08): a value in section 0 replaced the Excel level everywhere (superseded in v18.0 by `OPTIMIZATION_FILL_RATE`).
+- Input warnings X08/X09 (K19), expected waste rows and warning (L10).
+- Inventory positions stay age-blind (K22, user decision 10.11.); the shelf-life-aware design is parked in the project doc
+  `MEIO_shelf_life_aware_policies.md`.
+- The maximum-supply policy (K17) uses the smallest reorder point that still always orders the maximum; same decisions.
+- New template columns: Channels `FreshLotSales`, Open_Orders `WeeksLate` (formulas). Since v18.0, workbooks from v17.x are
+  rejected (Items!TargetFillRate missing); see `ENGINE_v18_1_HANDOVER.md`, B1.
+
+**v18.0 (12.11., engine session; contract version 3; confirmed by the user's Seeker runs 12.11.):**
+- **One fill-rate target per product** (Items!TargetFillRate, FG rows only), the same for every channel (H04).
+  Channels!TargetFillRate is gone; **Channels!ShortagePriority is now an input** (1 = served first, ranks 1…n once, H02).
+  Settings!FillRateChanceLevel is gone; `OPTIMIZATION_CHANCE_LEVEL` became `OPTIMIZATION_FILL_RATE`.
+- **Fill-rate rule E (H05):** per channel and week the expected fill rate (mean over the scenarios) ≥ target. Reason: with
+  the old chance rule a short week was nearly always empty, so lowering the target saved nothing. Re-optimized (NumPy):
+  98 / 95 / 90% → €107.6k / €105.5k / €99.6k.
+- **Target-aware start (K07):** z₀ from the target via the normal loss function; the start check raises z on a 0.5 grid
+  until every cell is met, then the repair (K21) only if needed. Template: z₀ 1.22 at 95% (0.86 at 90%, 1.63 at 98%).
+- **FillRates sheet (contract 3):** per cell `Target`, `Constrained`, `Expected FR in-sample (N Seeker scenarios)`,
+  `Status in-sample` (OK/VIOLATED), `Expected FR (N fresh scenarios)`, `Status out-of-sample` (OK/BELOW TARGET),
+  `Fully served (N fresh scenarios)`, `FR in a bad scenario, P10 (N fresh scenarios)`, `Worst 5% of futures, average FR (N fresh scenarios)`.
+- 13,099 Terms on the template (3 constants fewer than before).
+
+**v18.1 (12.11., engine session; contract version 4; confirmed by the user's Seeker run 12.11.): the review period is a real input (A03).**
+- **Settings!ReviewPeriod = R** (template default now 1): the model is run every R weeks; each run commits weeks 1..R.
+  In the weeks between runs the order rules use the planned position (see section 5). R = 1 reproduces v18.0 exactly
+  (regression test); with R = 2 the template results change against v18.0, because week 2 no longer reacts to week-1 demand.
+- **Commit_Now (contract 4):** columns `When`, `Decision`, `Quantity`, `Note` (was `Quantity / rule`). One block of rows per
+  week 1..R (production order, the RMW → KAJA transfers, supplier orders, with arrival weeks); all exact numbers, no more
+  `Rule …` rows. A production row can say "raw material permitting (P10 …, P90 …)" when uncertain lead times may cut it.
+- **Decisions sheet `Status`:** weeks 1..R `COMMIT NOW (exact)`; later run weeks `Indicative — re-optimized at the run in
+  week t`; weeks between runs `Indicative — planned at the run in week r`.
+- **Policy_sS:** new column `Planned at run week` (after `WeekStart`).
+- **Summary:** new row `Review period (A03)`, e.g. "R = 4 weeks: the model is run every 4 weeks; this run commits weeks 1–4
+  (…); next run in week 5". Show it next to the commit table.
+- **Input warning X10** (see above). The start policy's safety stock counts the uncertainty since the last run (K07).
+
+**How to read one fill-rate cell (show this in the app):** row AMZ, week 12, target 95%:
+- `Expected FR 96.4%` → averaged over all futures, Amazon gets 96.4% of its week-12 demand. The rule (H05) judges this
+  number: 96.4% ≥ 95% → `OK`. Example of how it arises with 100 futures: 94 fully served, 3 at 80%, 3 at 0%.
+- `Fully served 94%` → in 94 of 100 futures Amazon gets all of its week-12 demand; in the other 6 some of it is lost.
+- `FR in a bad scenario, P10 100%` → even the 10th-worst of 100 futures is fully served.
+- `Worst 5% of futures, average FR 32%` → in the worst 5 of 100 futures Amazon gets on average a third of its week-12
+  demand. The rule judges the average, so it does not limit this; the column shows how deep the bad futures go (typically
+  an empty DC before the next lot). The Summary row `Weakest cell (out-of-sample)` names the weakest cell with its tail.
+- The in-sample column is what Seeker optimized against (its own futures); the fresh column is the honest check on
+  futures Seeker never saw. Well below the target on fresh futures means the plan was fitted to the planning futures. On
+  the template this happens in the last weeks with 200 scenarios (AMZ week 36: 88.5–92.9%); with 500 scenarios it disappeared.
+- Weeks 1–6 are `Constrained = no (initial state)`: no decision can change them; they are shown, not judged.
+- All these figures assume futures drawn independently per channel and week (G02). If real demand moves together
+  over weeks or across channels, short weeks cluster and the true fill rates are lower; open topic for the forecasting tool.
+
 **Decisions and why:**
 - **Rules written once in Seeker; no second simulator in the engine** (the reference exists only for tests). This avoids errors from duplicate logic.
-- **One fixed formula start policy** (z = 4). Seeker 2.1's `set_value` re-evaluates the whole model per value, so testing many start policies was too slow.
+- **One formula start policy**, its z from the target (v18). Seeker 2.1's `set_value` re-evaluates the whole model per value, so only a few starts are tried (the z steps of the start check, 20–40 s each). A start that still misses reachable rules is repaired before the search (K21); a test of 73 data variants (12.11.) showed the z steps alone are not always enough, so the repair stays.
 - **Bounds come from the forecast and are easy to raise.** RM3 and FG were raised from 4 to 8 after they hit their bounds.
-- **No lost-sales cost and no end-of-horizon rule.** That is the user's choice.
+- **No lost-sales cost and no end-of-horizon rule.** That is the user's choice (A05, kept 12.11. for leanness; alternatives: an end-stock credit or an end-stock target).
 - **The feasibility check exists** because stress tests showed weeks the supply can't reach.
-- **Seeker settings:** speed 0 and the "frequency" constraint form tested best.
+- **Seeker settings:** speed 0 tested best; the fill-rate rule is one `aggregate_mean` per cell (v18).
 - **Multi-product is deferred but planned.** Don't hard-wire a single product in the app's data model.
-- **The engine session also has a solver-free NumPy optimizer** that was about 3.6% cheaper in benchmarks. It isn't part of this bundle; ask the user if you need it.
+- **The engine session also has a solver-free NumPy optimizer** (`meio_simopt.py`). It isn't part of this bundle and still uses the old chance rule of v17 (not updated to v18).
 
 **Seeker facts (2.1.0):**
 - Reading single numbers (aggregates) is instant; per-scenario lists cost 0.5–3 s each, so the engine never reads them.
 - Seeker reshuffles the demand samples across its scenarios, so its scenarios exist only inside Seeker.
 - From an infeasible start Seeker often makes no progress.
-- It overruns the time limit by about 7–15% (266.6 s for 250 s on 07.11.; short limits relatively more).
-- **The search is reproducible:** runs on 07.11. and 08.11. (v16 and v17) found the same improvements after the same
-  numbers of evaluations (5,126 → 112,013.35; 6,282 → 111,783.95). Results differ only when a different number of
-  evaluations fits into the time limit (machine load).
-- Its progress line `At time 134.5: Objective = 112013.35; Status = Feasible; Evaluations = 5126` appears only when the
-  search improves (3 lines in 267 s on 07.11.), not every 30 s: show progress from elapsed time, not from these lines.
+- It overruns the time limit by about 4–15%, and often stops improving after 2–3 minutes (12.11.: no improvement from 146 s to 788 s).
 - If the results file is open in Excel, the engine writes a time-stamped name.
 
 **Stress tests (06.11.):**
 - No dynamics bug was found.
 - Some cases are physically impossible in some weeks: demand +30%, cancelled strawberry orders, strawberry capacity 500 kg. The feasibility check now reports these.
 - Earlier red verdicts came from running at chance level 0.95 while judging at 0.99, and from comparing costs of plans that met different numbers of rules.
+- The stress tests search from the formula start (no repair), so their verdicts stay comparable with v17.1.
 
 **Open:**
-- Rules still "Proposed": A03, A04, D05, F02, G02, G03, H03, H06, I07, J03, K20, L05–L08 (see `MEIO_model_spec.md`).
+- Rules still "Proposed": A04, D05, F02, G02, G03, H03, H06, H07, I07, J03, K07, K20, K21, L05–L08, L10 (see `MEIO_model_spec.md`).
+- Engine proposals that the user hasn't signed off yet (none is built): see section G of `ENGINE_v18_1_HANDOVER.md`, e.g. a check
+  on `FILL_RATE_CONSTRAINT_FORM`, the K05 bound wording, an "unavoidable waste" row, the exact forecast mean, and a whole-unit check.
+- Correlated demand (G02) is open for the user's forecasting tool.
 - Known limitation J04: a lot that is already unusable when it enters (initial stock or open order) shows up for one week in
   end stock and holding before it is scrapped. It doesn't occur in practice.
 - Seeker 2.2 is untested.
@@ -415,8 +511,30 @@ run is made, so runs before 09.11. have no supplier arrows (start a new run).
 Lovable prompts A, B, map rebuild, Orders, Master data; Claude's review fixes in the same PRs). One place per input:
 solver settings only in the Run dialog. Open idea (not requested yet): engine output of the order quantity **only over
 futures that order** (like arrival_week), so Orders can show "if ordered: …" instead of only the all-futures mean.
-**API update 2 (next, before the Master data / scenario screens):** what-if edits written into a copy of the
-uploaded workbook (openpyxl, values only; engine K19 checks it), with an original-vs-changed list per run.
+**Engine v18.1 + API 3 (13.11.; handover `engine/ENGINE_v18_1_HANDOVER.md`):** result contract 4 = engine contract 4.
+- **User decisions 13.11.:** the run's own fill-rate target (`optimization_fill_rate`, any value in (0, 1], → engine
+  `OPTIMIZATION_FILL_RATE`, set before `run()` and restored afterwards); run-dialog presets "Decision run" (500 scenarios,
+  700 s, default) and "Quick what-if" (100 scenarios, 150 s; never act on it); runs of older engines are not shown
+  (`status.json` `api_version` ≥ 3; the user empties `runs\` once). Engine session (13.11.): keep the venv; don't expose
+  `FILL_RATE_CONSTRAINT_FORM` (any other value than "mean"/"none" silently runs "mean", proposal G1).
+- **Worker:** keeps Windows awake during a run (`SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)`, cleared
+  after); `/input`: `product.fill_rate_target` (Items!TargetFillRate), channels `serving_order` = ShortagePriority, no
+  `chance_level`/`target_fill_rate`; headline adds `fill_rate_target`, `_excel`, `_source` (engine `target_source`),
+  `weakest_cell`, `review_period`, `start_policy`, `start_check{z0, z, steps}`, `start_repair_used`, `start_repair`,
+  `start_policy_before_repair`, `expected_waste{item: text}`, `waste_warning` (engine Summary texts, copied);
+  missed rules carry `expected_fill_rate`, `fully_served`, `bad_scenario_p10`, `worst_5pct_average` (FillRates prefixes
+  "Expected FR (", "Fully served (", "FR in a bad scenario, P10 (", "Worst 5% of futures, average FR (", status
+  "BELOW TARGET"); run_info: `fill_rate_target`, `fill_rate_target_excel`, `optimization_fill_rate`.
+- **Display rules for the dashboard (handover E, C7):** fresh-scenario status as the headline; weeks before
+  `first_rule_week` "not judged" (H06); the last weeks "indicative (end of horizon)" (A05); the `Weakest cell` row and the
+  one-cell explanation of §8; target used + source + scenarios; commit table for weeks 1..R next to the `Review period`
+  row; notices: start repair, waste warning, data warnings X08–X10 (never errors); never add up Bands quantiles across
+  weeks or channels (only Mean adds up; totals with P10/P90 are in KPIs).
+- **Verified 13.11. (cloud, test double):** 141 engine + 51 app tests, coverage 98 %; the worker's missed rules on the
+  user's real v18.1 FillRates = B2B and AMZ week 36, 88/90, as the engine's Summary.
+- **Next:** dashboard update to contract 4 (every renamed field, the new notices, presets), then API update 2.
+**API update 2 (after the dashboard update):** what-if edits written into a copy of the uploaded workbook (openpyxl,
+values only; engine K19 checks it), with an original-vs-changed list per run.
 
 **Plan:** PR 1 foundation → user runs tests + one real F5 run from the repo → PR 2 local API → one real run via
 `localhost:8000/docs` → PR 3 ngrok → test from the phone → Lovable UI (prompt pack from Claude, one screen at a time)

@@ -8,7 +8,7 @@ shows the results: what to commit now, the (s,S) policy, fill rates, stock, wast
 Browser → Lovable web app → ngrok tunnel → local API on your PC → engine + Seeker license
 ```
 
-**Status:** foundation, local API and start script are in place. Next: the Lovable UI.
+**Status:** engine v18.1, local API v3, start script and the Lovable UI are in place. Next: what-if editing.
 
 ## What the app must do
 
@@ -56,7 +56,7 @@ These scenarios are the contract. Each one becomes an automated test.
    C:\Users\ruben\seeker_env\Scripts\python.exe -m pip install -r requirements.txt
    ```
 4. **License:** copy your `license.sio` into `C:\dev\MEIO_App\engine\` (it is gitignored).
-5. **Check:** run the tests. Every test must pass (`… passed`, no `failed`); the engine alone has 117 tests.
+5. **Check:** run the tests. Every test must pass (`… passed`, no `failed`); the engine alone has 141 tests (about 5 min in total).
    ```bat
    C:\Users\ruben\seeker_env\Scripts\python.exe -m pytest
    ```
@@ -68,6 +68,23 @@ in `engine\MEIO_Data_Template.xlsx` and writes `engine\MEIO_Results_stochastic.x
 
 **Your data:** keep real workbooks in `C:\dev\MEIO_App\data\` (gitignored) and run them through the app. Leave the template in
 `engine\` as it is: the tests depend on its example data, and GitHub Desktop would show any edit as a change.
+
+**Which run settings:**
+
+| Use | Scenarios | Search time | Takes about |
+|---|---|---|---|
+| Decisions you act on | 500 | 700 s | 18–19 min |
+| Quick what-if (never act on it) | 100 | 150 s | 6 min |
+
+- **Keep the PC on:** the app keeps it awake during a run. Don't shut the lid of a laptop or turn the PC off: a sleeping PC stretched a 5-minute search to over 3 hours (12.11.).
+- **Silence is normal:** Seeker can print nothing for minutes while it searches.
+
+**Since engine v18.1 (13.11.):**
+- **Workbooks:** workbooks made for the old engine are refused. Copy your values by hand into the new
+  `engine\MEIO_Data_Template.xlsx` layout; the app never converts them. Two new inputs:
+  - one fill-rate target per product (Items!TargetFillRate, 95 % in the template)
+  - the serving order of the channels (Channels!ShortagePriority, 1 = served first)
+- **Old runs:** runs made before the update are no longer shown. Empty the folder `runs\` once after updating.
 
 ## Put the app online (once)
 
@@ -103,7 +120,7 @@ The API runs on your PC; ngrok gives it a fixed internet address so the web app 
   start; `/health` shows `"restart_needed": true` (and the web app's status badge says so) until you restart.
 
 The `/docs` page is visible to anyone who knows the address, but it only describes the API: every action needs the token.
-Each run is kept in `runs\<id>\` (input, log, results; gitignored).
+Each run is kept in `runs\<id>\` (input, log, results; gitignored). Runs of older engine versions are not shown.
 
 ## Updating
 

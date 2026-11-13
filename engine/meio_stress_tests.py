@@ -27,8 +27,8 @@ HOW TO RUN (Spyder: open this file, F5)
   Runtime ≈ 1.5–2 min per case with the defaults; all 26 cases ≈ 45 min. Use CASES_TO_RUN for a subset.
 
 NOTE ON 60 SCENARIOS
-  With 60 scenarios and the 99% chance level, the rule allows 0 misses (⌊1% × 60⌋ = 0): every one of the
-  60 futures must meet the fill-rate target. That is stricter than with 200 scenarios (2 misses).
+  The fill-rate rule judges the expected fill rate per channel and week (mean over the scenarios, H05). With 60
+  scenarios that mean is noisier than with 200; the fresh-scenario check shows how well it holds.
 ================================================================================
 """
 import copy
@@ -74,15 +74,16 @@ def rm(d, rid):
     return next(k for k in d.rms if k.id == rid)
 
 
-def channel(d, cid, target=None, min_remaining=None):
-    """Change a channel; keeps the serving priority rule (highest target first, H02) and the demand rows aligned."""
+def channel(d, cid, min_remaining=None):
+    """Change a channel's freshness need (the serving order stays ShortagePriority, H02)."""
     for c in d.channels:
         if c.id == cid:
-            c.target = c.target if target is None else target
             c.min_remaining = c.min_remaining if min_remaining is None else min_remaining
-    order = sorted(range(len(d.channels)), key=lambda i: -d.channels[i].target)      # stable
-    d.channels = [d.channels[i] for i in order]
-    d.demand_q = d.demand_q[order]
+
+
+def target(d, value):
+    """One fill-rate target per product (H04): validate() copies it to every channel-week cell."""
+    d.fill_rate_target = d.fill_rate_target_excel = value
 
 
 def lead_time(ms, values, probs):
@@ -170,13 +171,9 @@ CASES = [
     ("O5", "Stock-out", "Impossible: strawberry capacity 500 kg/week (= 1,000 cans, below average demand)",
      lambda ms, d: setattr(rm(d, "RM3"), "max_order", 500.0), [("feasible", "no")]),
     # --- fill-rate targets
-    ("F1", "Fill-rate target", "All targets +1 point (D2C 99%, B2B 96%, AMZ 91%)",
-     lambda ms, d: [channel(d, c.id, target=min(1.0, round(c.target + 0.01, 4))) for c in list(d.channels)],
-     [("oos_cost", "up")]),
-    ("F2", "Fill-rate target", "Amazon target 90% → 97% (now served before B2B)",
-     lambda ms, d: channel(d, "AMZ", target=0.97), [("oos_cost", "up")]),
-    ("F3", "Fill-rate target", "Chance level 99% → 95% of scenarios", lambda ms, d: setattr(d, "chance_level", 0.95),
-     [("oos_cost", "down")]),
+    ("F1", "Fill-rate target", "Target +1 point (95% → 96%)", lambda ms, d: target(d, 0.96), [("oos_cost", "up")]),
+    ("F2", "Fill-rate target", "Target 95% → 98%", lambda ms, d: target(d, 0.98), [("oos_cost", "up")]),
+    ("F3", "Fill-rate target", "Target 95% → 90%", lambda ms, d: target(d, 0.90), [("oos_cost", "down")]),
     # --- freshness requirements
     ("R1", "Freshness rule", "Amazon and B2B need ≥ 28 weeks left (was 24)",
      lambda ms, d: [channel(d, "AMZ", min_remaining=28), channel(d, "B2B", min_remaining=28)], [("oos_cost", "up")]),
@@ -202,14 +199,14 @@ def run_case(ms, skr, base, case):
     x0 = layout.encode(pol0)
     ms.TIMINGS.clear()
     t0 = time.time()
-    x, ins = ms.optimize(skr, d, layout, x0, ms.LICENSE_FILE, TIME_LIMIT_SECONDS)
+    x, ins = ms.optimize(skr, d, layout, x0, ms.LICENSE_FILE, TIME_LIMIT_SECONDS, start_check=False)  # formula start, no repair (K21)
     oos = ms.out_of_sample(skr, d, layout, x, ms.LICENSE_FILE, detail=False)   # stress checks need no report series
     return kpis(ms, d, layout, x, ins, oos, time.time() - t0)
 
 
 def kpis(ms, d, layout, x, ins, oos, seconds):
-    H, lvl, con = d.horizon, d.chance_level, ins["constrained"]
-    shares = [oos[("fr_share", ci, t)] for ci, t in con]
+    H, lvl, con = d.horizon, d.fill_rate_target, ins["constrained"]
+    shares = [oos[("fr_mean", ci, t)] for ci, t in con]                 # expected fill rate per cell (H05)
     worst = min(range(len(con)), key=lambda i: shares[i])
     waste_units = sum(oos[("fg_waste", t)] for t in range(1, H + 1)) + \
         sum(oos[(k.id, "waste", t)] for k in d.rms if k.perishable for t in range(1, H + 1))

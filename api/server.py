@@ -64,18 +64,29 @@ DEFAULT_OOS, MIN_OOS, MAX_OOS = 2500, 500, 20000                           # fre
 MAX_SCENARIOS = 2000                                                       # NumScenarios override (optimizer)
 DEFAULT_SETTINGS = {"time_limit": DEFAULT_TIME_LIMIT, "out_of_sample_scenarios": DEFAULT_OOS,
                     "feasibility_check": True, "start_policy_out_of_sample": False,
-                    "optimization_chance_level": None, "overrides": None}
+                    "optimization_fill_rate": None, "overrides": None}
+API_VERSION = 3                       # recorded in every run's status.json; runs of older APIs (engine before v18.1,
+                                      # other result layout) are not listed or served (user decision 13.11.)
 VALIDATE_TIMEOUT_SECONDS = 120
-# Expected run time, fitted on the user's PC (engine v17.1, 08.11.: 407 s at the defaults):
-#   reading/build/gaps 30 s + feasibility check 21 s + 0.033 s per fresh scenario (82.5 s at 2,500; twice with the
-#   start policy on fresh scenarios) + search = time limit + 24 s (273 s at 250 s; 54 s at 30 s)
-ETA_BASE_SECONDS, ETA_FEASIBILITY_SECONDS = 30.0, 21.0
-ETA_OOS_SECONDS_PER_SCENARIO, ETA_SEARCH_OVERHEAD_SECONDS = 0.033, 24.0
+# Expected run time (engine v18.1, user's PC 12.–13.11.; engine-session figures in the hand-over note):
+#   reading/builds/gaps 20 s + 0.1 s per optimizer scenario, feasibility check 21 s,
+#   start check: ETA_Z_STEPS z steps of 8 s + 0.06 s per scenario each (≈ 15 s at 120, 20 s at 200, 38 s at 500)
+#     + one more build and start evaluation; a start repair (4c lines) adds up to 6 more evaluations,
+#   search = time limit + 10 % + 10 s, out-of-sample check 0.033 s per fresh scenario (twice with the start policy).
+#   Totals: 200 scenarios / 300 s ≈ 9.5 min, 500 / 700 s ≈ 18 min (engine session: ≈ 10 and 19 min).
+ETA_BASE_SECONDS, ETA_PER_SCENARIO_SECONDS, ETA_FEASIBILITY_SECONDS = 20.0, 0.1, 21.0
+ETA_Z_STEPS, ETA_STEP_SECONDS, ETA_STEP_PER_SCENARIO_SECONDS, ETA_SECOND_BUILD_SECONDS = 3, 8.0, 0.06, 12.0
+ETA_REPAIR_STEPS = 6
+ETA_ASSUMED_SCENARIOS = 200                                                # Excel NumScenarios of the template
+ETA_OOS_SECONDS_PER_SCENARIO, ETA_SEARCH_OVERRUN, ETA_SEARCH_OVERHEAD_SECONDS = 0.033, 0.10, 10.0
 WATCHDOG_FACTOR = 3.0                                                      # a run taking 3 × its estimate is stopped
 EXIT_WAIT_SECONDS = 30.0                                                   # a finished worker gets this to exit
 LOG_TAIL_LINES = 40
 RUN_ID = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{4}$")
 PHASE_START = re.compile(r"^\[\d\d:\d\d:\d\d\] (.+) \.\.\.$")              # engine phase lines: "[19:52:44] 5. … ..."
+Z_STEP_PHASE = "4. Start check: Seeker evaluates the start with z"             # one per z step (phase names repeat:
+REPAIR_PHASE = "4c. Start repair"                                              # lines are counted, never keyed)
+START_CHECK_DONE = "Start check: Seeker starts from z"
 
 
 # ============================================================================
@@ -111,9 +122,16 @@ def write_json(path, obj):
             time.sleep(0.05)
 
 
+def current_api(folder):
+    """Runs made by this API version (older runs have another result layout and are no longer shown)."""
+    return read_status(folder).get("api_version", 0) >= API_VERSION
+
+
 def run_dir(run_id):
     if not RUN_ID.match(run_id) or not (RUNS_DIR / run_id / "status.json").exists():
         raise HTTPException(404, f"No run with id {run_id!r}.")
+    if not current_api(RUNS_DIR / run_id):
+        raise HTTPException(404, f"Run {run_id!r} was made with an older engine and is no longer shown.")
     return RUNS_DIR / run_id
 
 
@@ -169,11 +187,29 @@ def settings_of(status):
     return {**DEFAULT_SETTINGS, "time_limit": status.get("time_limit", DEFAULT_TIME_LIMIT), **recorded}
 
 
-def expected_seconds(settings):
+def step_seconds(scenarios):
+    return ETA_STEP_SECONDS + ETA_STEP_PER_SCENARIO_SECONDS * scenarios
+
+
+def expected_seconds(settings, z_steps=ETA_Z_STEPS, repair=False):
+    """Expected run time. z_steps / repair: the start check's real course, once the log shows it."""
     s = {**DEFAULT_SETTINGS, **settings}
+    n = (s["overrides"] or {}).get("NumScenarios", ETA_ASSUMED_SCENARIOS)
     check = ETA_OOS_SECONDS_PER_SCENARIO * s["out_of_sample_scenarios"] * (2 if s["start_policy_out_of_sample"] else 1)
     feasibility = ETA_FEASIBILITY_SECONDS if s["feasibility_check"] else 0.0
-    return ETA_BASE_SECONDS + feasibility + check + float(s["time_limit"]) + ETA_SEARCH_OVERHEAD_SECONDS
+    start = z_steps * step_seconds(n) + (ETA_SECOND_BUILD_SECONDS if z_steps else 0.0) + \
+        (ETA_REPAIR_STEPS * step_seconds(n) if repair else 0.0)
+    search = float(s["time_limit"]) * (1 + ETA_SEARCH_OVERRUN) + ETA_SEARCH_OVERHEAD_SECONDS
+    return ETA_BASE_SECONDS + ETA_PER_SCENARIO_SECONDS * n + feasibility + start + search + check
+
+
+def start_check_course(phases, lines):
+    """(z steps to plan for, repair seen) from the log: every z step and repair step prints its own phase line; while
+    the check is still raising z, plan for at least one more step (the engine session's default: 3 steps)."""
+    seen = sum(p.startswith(Z_STEP_PHASE) for p in phases)
+    done = any(START_CHECK_DONE in ln for ln in lines) or any(p.startswith("5. Seeker optimization") for p in phases)
+    steps = seen if done else max(ETA_Z_STEPS, seen + 1)
+    return steps, any(p.startswith(REPAIR_PHASE) for p in phases)
 
 
 def progress(folder, status):
@@ -184,7 +220,8 @@ def progress(folder, status):
     left = None
     if status["state"] == "running":
         elapsed = (dt.datetime.now().astimezone() - dt.datetime.fromisoformat(status["started"])).total_seconds()
-        left = max(0.0, expected_seconds(settings_of(status)) - elapsed)
+        steps, repair = start_check_course(phases, lines)
+        left = max(0.0, expected_seconds(settings_of(status), steps, repair) - elapsed)
     return {"phase": phases[-1] if phases else None, "seconds_left": left, "log_tail": lines[-LOG_TAIL_LINES:]}
 
 
@@ -253,7 +290,8 @@ def start_run(data, file_name, settings, label_and_note=None):
         write_json(folder / "request.json", settings)
         write_json(folder / "label.json", label_and_note or {})
         file = {"name": file_name, "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
-        write_json(folder / "status.json", {"id": run_id, "state": "running", "created": now(), "started": now(),
+        write_json(folder / "status.json", {"id": run_id, "api_version": API_VERSION, "state": "running",
+                                            "created": now(), "started": now(),
                                             "finished": None, "time_limit": settings["time_limit"],
                                             "settings": settings, "file": file, "message": "Running.", "errors": []})
         cmd = [sys.executable, "-u", str(WORKER), "run", str(folder), str(LICENSE_FILE)]
@@ -307,7 +345,6 @@ class InputSettings(BaseModel):
     horizon_weeks: int
     review_period_weeks: int
     start_date: str
-    chance_level: float
     scenarios: int
     random_seed: int
     time_limit_seconds: float | None
@@ -317,9 +354,9 @@ class InputSettings(BaseModel):
 class InputData(BaseModel):
     """The master data exactly as the engine read it from the workbook (rows and fields named as in the template)."""
     settings: InputSettings
-    product: dict[str, Any]               # id, unit, shelf life, costs, production (MOQ, batch, max, lead time, tiers)
+    product: dict[str, Any]               # id, unit, shelf life, fill_rate_target (Items, H04), costs, production
     raw_materials: list[dict[str, Any]]   # per RM: BOM, shelf life, freshness rule, MOQ, multiple, max, LT, costs
-    channels: list[dict[str, Any]]        # id, serving_order, target_fill_rate, min_remaining_shelf_life
+    channels: list[dict[str, Any]]        # id, serving_order (ShortagePriority, 1 = first), min_remaining_shelf_life
     demand: dict[str, Any]                # quantile_levels; quantiles[channel][week 1..H] = 10 values
     initial_stock: dict[str, list[dict[str, Any]]]
     open_orders: dict[str, list[dict[str, Any]]]
@@ -365,7 +402,16 @@ class MissedRule(BaseModel):
     channel: str
     week: int
     target: float
-    share: float                          # share of fresh scenarios meeting the target
+    expected_fill_rate: float             # mean over the fresh scenarios of served ÷ demand: what rule H05 judges
+    fully_served: float                   # share of fresh scenarios with all of the week's demand served
+    bad_scenario_p10: float               # fill rate of a bad scenario (10th percentile)
+    worst_5pct_average: float             # average fill rate in the worst 5 % of fresh scenarios
+
+
+class StartCheck(BaseModel):
+    z0: float | None                      # start safety factor from the target (K07)
+    z: float | None                       # the z the search started from
+    steps: list[dict[str, Any]]           # every evaluated z: z, met, cost
 
 
 class Headline(BaseModel):
@@ -375,6 +421,18 @@ class Headline(BaseModel):
     rules_missed_out_of_sample: list[MissedRule]
     feasibility: str
     bound_note: str
+    weakest_cell: str                     # engine Summary "Weakest cell (out-of-sample)"
+    fill_rate_target: float               # the target used in this run (K08)
+    fill_rate_target_excel: float         # Items!TargetFillRate
+    fill_rate_target_source: str          # "Excel Items!TargetFillRate of FG1" or the run's own target
+    review_period: str                    # engine Summary "Review period (A03)": which weeks this run commits
+    start_policy: str                     # engine Summary "Start policy (warm start)"
+    start_check: StartCheck
+    start_repair_used: bool               # K21: show as a notice, not an error
+    start_repair: str                     # engine Summary "Start repair (section 4c, K21)"
+    start_policy_before_repair: str | None
+    expected_waste: dict[str, str]        # item → engine Summary text, e.g. "31 pcs = 0.1% of expected demand"
+    waste_warning: str                    # "none" or the L10 warning
     cost_in_sample: float
     rules_met_in_sample: int
     start_policy_cost: float
@@ -395,8 +453,9 @@ class RunInfo(BaseModel):
     time_limit_seconds: float
     scenarios_in_sample: int
     random_seed: int
-    chance_level: float
-    optimization_chance_level: float
+    fill_rate_target: float               # the target used in this run
+    fill_rate_target_excel: float         # Items!TargetFillRate
+    optimization_fill_rate: float | None  # the run's own target, if one was set
     scenarios_out_of_sample: int
     feasibility_check: bool
     start_policy_out_of_sample: bool
@@ -425,7 +484,8 @@ async def lifespan(_app):
     yield
 
 
-app = FastAPI(title="MEIO local API", version="2", lifespan=lifespan, dependencies=[Depends(require_token)])
+app = FastAPI(title="MEIO local API", version=str(API_VERSION), lifespan=lifespan,
+              dependencies=[Depends(require_token)])
 app.add_middleware(CORSMiddleware, allow_origin_regex=ALLOWED_ORIGINS, allow_methods=["GET", "POST", "PATCH"],
                    allow_headers=["Authorization", "Content-Type", "ngrok-skip-browser-warning"])
 
@@ -451,27 +511,27 @@ def create_run(file: Annotated[UploadFile, File()],
                out_of_sample_scenarios: Annotated[int, Form(ge=MIN_OOS, le=MAX_OOS)] = DEFAULT_OOS,
                feasibility_check: Annotated[bool, Form()] = True,
                start_policy_out_of_sample: Annotated[bool, Form()] = False,
-               optimization_chance_level: Annotated[float | None, Form(gt=0, lt=1)] = None,
+               optimization_fill_rate: Annotated[float | None, Form(gt=0, le=1)] = None,
                num_scenarios: Annotated[int | None, Form(ge=1, le=MAX_SCENARIOS)] = None,
                random_seed: Annotated[int | None, Form(ge=0)] = None,
                label: Annotated[str, Form(max_length=80)] = "",
                note: Annotated[str, Form(max_length=1000)] = ""):
     """Starts an optimization run in the background (refused while another run is in progress).
     num_scenarios / random_seed replace the Excel NumScenarios / RandomSeed for this run only (engine rule K20);
-    optimization_chance_level may only be equal to or stricter than the Excel FillRateChanceLevel."""
+    optimization_fill_rate replaces the product's fill-rate target (Items!TargetFillRate) for this run only (K08)."""
     data = read_upload(file)
     overrides = {k: v for k, v in (("NumScenarios", num_scenarios), ("RandomSeed", random_seed)) if v is not None}
     settings = {"time_limit": time_limit, "out_of_sample_scenarios": out_of_sample_scenarios,
                 "feasibility_check": feasibility_check, "start_policy_out_of_sample": start_policy_out_of_sample,
-                "optimization_chance_level": optimization_chance_level, "overrides": overrides or None}
+                "optimization_fill_rate": optimization_fill_rate, "overrides": overrides or None}
     return get_run(start_run(data, file.filename, settings, {"label": label, "note": note}))
 
 
 @app.get("/runs", response_model=list[RunSummary])
 def list_runs():
-    """Run history, newest first."""
+    """Run history, newest first (runs made with the current engine only)."""
     folders = sorted(RUNS_DIR.glob("*/status.json"), reverse=True) if RUNS_DIR.exists() else []
-    return [run_view(f.parent) for f in folders if RUN_ID.match(f.parent.name)]
+    return [run_view(f.parent) for f in folders if RUN_ID.match(f.parent.name) and current_api(f.parent)]
 
 
 @app.get("/runs/{run_id}", response_model=RunStatus)
