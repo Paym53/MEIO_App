@@ -734,7 +734,14 @@
       "title": "Sheet"
      },
      "row": {
-      "type": "integer",
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
       "title": "Row"
      },
      "column": {
@@ -761,15 +768,31 @@
        }
       ],
       "title": "Shift"
+     },
+     "add": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Add"
+     },
+     "delete": {
+      "type": "boolean",
+      "title": "Delete",
+      "default": false
      }
     },
     "type": "object",
     "required": [
-     "sheet",
-     "row"
+     "sheet"
     ],
     "title": "Edit",
-    "description": "One what-if edit: a new value for one input cell, or a shift of all 10 quantiles of one Demand row (W03)."
+    "description": "One what-if edit: a new value for one input cell, a shift of all 10 quantiles of one Demand row (W03), or a\nrow added to / removed from Init_Inventory, Open_Orders or LeadTimeDist (W02)."
    },
    "EditRow": {
     "properties": {
