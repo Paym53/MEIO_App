@@ -563,7 +563,18 @@ futures that order** (like arrival_week), so Orders can show "if ordered: …" i
   engine's errors, nothing starts); status.json `base_run`, `changes` (count); `GET /runs/{id}/changes`.
 - **Verified 13.11. (cloud, test double):** 204 tests (141 engine + 63 app), coverage 98.5 %; engine refusal of an
   invalid edit = the engine's words for the same edit made by hand; a +2,000 shift changes exactly the 10 quantiles of
-  one channel and week. Next: dashboard edit screens (Lovable prompt), then the user's check on Windows.
+  one channel and week.
+- **Row edits (14.11.):** `{sheet, add: {column: value}}` (first row without data, keeps the template's check formulas)
+  and `{sheet, row, delete: true}` (clears the row), only for Init_Inventory, Open_Orders, LeadTimeDist and their input
+  columns (`worker.ROW_SHEETS`); W02 updated. Tested: new lot, new open order, stochastic lead time (8 wk 80 %, 10 wk
+  20 %), removed lot; 208 tests, coverage 98.4 %.
+- **Dashboard edit mode (14.11., user notes; dashboard PR #14, built by Claude, no Lovable credits):** inline fields in
+  the normal Master data screens for only these values: horizon, review period; shelf lives, BOM quantity, usable-while
+  minimum; MOQ, order step, max per order, lead-time editor (weeks + probability per possibility, add/remove); target
+  (%), shortage priority, channel minimum shelf life; demand per channel and week (quantiles or shift; "check to see the
+  effect" = checked what-if bands + original Q05/Q95 dashed); lots and open orders (quantity, shelf life, arrival;
+  add/remove; route from Sourcing/Production); costs and cost tiers (explained in words). Network is not editable.
+  Field → cell lookups by row key in `src/lib/whatif-fields.ts`. The top-bar W1–W36 view filter is removed.
 
 **Plan:** PR 1 foundation → user runs tests + one real F5 run from the repo → PR 2 local API → one real run via
 `localhost:8000/docs` → PR 3 ngrok → test from the phone → Lovable UI (prompt pack from Claude, one screen at a time)

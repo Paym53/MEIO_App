@@ -81,8 +81,9 @@ in `engine\MEIO_Data_Template.xlsx` and writes `engine\MEIO_Results_stochastic.x
 - **Keep the PC on:** the app keeps it awake during a run. Don't shut the lid of a laptop or turn the PC off: a sleeping PC stretched a 5-minute search to over 3 hours (12.11.).
 - **Silence is normal:** Seeker can print nothing for minutes while it searches.
 
-**What-ifs (from the Master data pages):** pick a run made from an uploaded workbook, change values (any input cell;
-for demand either single quantiles or a shift such as "+2,000 units" for one channel and week), check, then run. A
+**What-ifs (from the Master data pages):** pick a run made from an uploaded workbook, switch on "Edit (what-if)" and
+change the values shown as fields (for demand either single quantiles or a shift such as "+2,000 units" for one channel
+and week; stock lots, open orders and possible lead times can also be added or removed), check, then run. A
 what-if always starts from the original upload, never from another what-if. The fill-rate target and the review period
 are changed only here, not in the run dialog. The app's own rules for this (W01–W07) are listed on Explainability.
 
