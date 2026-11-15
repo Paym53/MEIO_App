@@ -450,6 +450,8 @@ lint, build) **and** the full UI test suite, added together once all screens exi
 - Decisions/Orders: (s,S) from wide Policy_sS (`FG s`/`FG S` exact case, production point "FG"); badges only from
   Decisions.Status ("—" otherwise); units from KPIs "Average end stock <item>," Unit; arrival from Bands
   arrival_week ("never ordered" when empty); grey only rows where every "<point> active" is "fixed 0".
+- Baseline: card and page show cost only together with rules met and lost demand; cost difference (from the module's
+  "Optimized − baseline" column) only when rules met are equal; textbook s/S drawn fixed up to "Weeks with s,S", 0 after.
 - Run dialog: optional form fields never sent when empty (null, undefined or ""); presets Decision run (500 / 700 s,
   default) and Quick what-if (100 / 150 s); fill-rate target entered in %, sent as a share; empty = Excel.
 - Inventory: s/S only on Bands series "position"; served/lost/eligible_next_week read per channel (Item = channel id);
@@ -593,13 +595,22 @@ futures that order** (like arrival_week), so Orders can show "if ordered: …" i
   add/remove; route from Sourcing/Production); costs and cost tiers (explained in words). Network is not editable.
   Field → cell lookups by row key in `src/lib/whatif-fields.ts`. The top-bar W1–W36 view filter is removed.
 
-**Textbook baseline (15.11., engine session; later milestone, after the v18.2 PRs):** `engine/meio_baseline.py` +
-`test_baseline.py` are committed but not used by the app yet. Plan: in the same worker job, right after `engine.run()`,
-`tables = meio_baseline.run_baseline(res, license_file)` → DataFrames `Comparison`, `Baseline_sS`, `FillRates_Compare`
-(`write_baseline_report(tables, path)` writes them); uses the run's own data, overrides, target and fresh batches, so
-what-ifs get a matching baseline. Costs one more out-of-sample evaluation (~85 s at 2,500). Optional per run; shown as
-"what a standard textbook calculation would give", cost always together with rules met and lost demand in units (no
-lost-sales cost: the baseline usually looks cheaper because it misses rules).
+**Textbook baseline (15.11., engine session; integrated 15.11., app rule W09, result contract 5):**
+- **Worker** (`run_baseline`, section 5b): right after `engine.run()`, same job, run setting `baseline` (form field, default
+  true): `meio_baseline.run_baseline(res, license_file, skr)` (run's own data, overrides, target, fresh batches; one more
+  out-of-sample evaluation, ~85 s at 2,500) + `engine.band_and_kpi_tables(res.data, res.ins, tables["oos"])` for the
+  baseline's KPIs and Bands in the engine's layout. A failure never stops the run (`baseline.error`, traceback in log.txt).
+- **result.json `baseline`** (null = off or older run): `summary` (cost, rules met, lost demand + share for both plans,
+  copied from the Comparison rows), `comparison`, `policy` (Baseline_sS), `fill_rates` (FillRates_Compare), `kpis`,
+  `bands`, `scenarios_out_of_sample`. results.xlsx gets the sheets `Baseline_Comparison`, `Baseline_sS`,
+  `Baseline_FillRates`, `Baseline_KPIs`. The time estimate adds one fresh-scenario check. The last phase is now
+  `6. Baseline (textbook s,S) batch …`.
+- **Dashboard:** Overview KPI card "Textbook baseline · same futures" (cost, rules met, lost demand for both; cost
+  difference only at equal rules met, else the not-comparable notice), the saving vs start moved small under the cost;
+  page `/baseline` (sidebar under Solver settings): formulas, assumptions, fixed (s,S) vs optimized s/S per week per stock
+  point, cost per category, fill rate per channel and week, FG end stock + KPI pairs, all Comparison rows. Run dialog and
+  Solver settings: switch "Textbook baseline". Template (test double): optimized €113k, 90/90, 61 cans lost; textbook €101k,
+  50/90, 4,068 cans lost.
 
 **Plan:** PR 1 foundation → user runs tests + one real F5 run from the repo → PR 2 local API → one real run via
 `localhost:8000/docs` → PR 3 ngrok → test from the phone → Lovable UI (prompt pack from Claude, one screen at a time)
