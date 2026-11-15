@@ -21,6 +21,8 @@ The engine bundle lives in `engine/`, byte-exact. A new engine version replaces 
 | `engine/MEIO_math_model.md` | the formal model: sets, dynamics, objective, fill-rate rule, Seeker mapping | **no** |
 | `engine/MEIO_shelf_life_aware_policies.md` | archived design of age-aware positions (rejected, K22); the waste warning (L10) refers to it | **no** |
 | `engine/ENGINE_v18_1_HANDOVER.md` | the record of every engine change since v17.1 and why (v18.2 box at the top), what the app had to adapt, and the open proposals (section G) | **no** |
+| `engine/meio_baseline.py` | textbook (s,S) baseline for comparison only (formulas in its header): one fixed (s,S) per stock point, simulated with the engine's own out-of-sample check on the same fresh scenarios; never changes the engine | **no** |
+| `engine/test_baseline.py` | its 9 tests (Seeker test double, no license) | **no** |
 | `MEIO_Results_stochastic.xlsx` | results of a real Seeker run (sheet layout = engine output); on the user's PC only, gitignored | no |
 
 The app's own files are listed in §9. Don't add files or docs beyond that list unless the user asks.
@@ -590,6 +592,14 @@ futures that order** (like arrival_week), so Orders can show "if ordered: …" i
   effect" = checked what-if bands + original Q05/Q95 dashed); lots and open orders (quantity, shelf life, arrival;
   add/remove; route from Sourcing/Production); costs and cost tiers (explained in words). Network is not editable.
   Field → cell lookups by row key in `src/lib/whatif-fields.ts`. The top-bar W1–W36 view filter is removed.
+
+**Textbook baseline (15.11., engine session; later milestone, after the v18.2 PRs):** `engine/meio_baseline.py` +
+`test_baseline.py` are committed but not used by the app yet. Plan: in the same worker job, right after `engine.run()`,
+`tables = meio_baseline.run_baseline(res, license_file)` → DataFrames `Comparison`, `Baseline_sS`, `FillRates_Compare`
+(`write_baseline_report(tables, path)` writes them); uses the run's own data, overrides, target and fresh batches, so
+what-ifs get a matching baseline. Costs one more out-of-sample evaluation (~85 s at 2,500). Optional per run; shown as
+"what a standard textbook calculation would give", cost always together with rules met and lost demand in units (no
+lost-sales cost: the baseline usually looks cheaper because it misses rules).
 
 **Plan:** PR 1 foundation → user runs tests + one real F5 run from the repo → PR 2 local API → one real run via
 `localhost:8000/docs` → PR 3 ngrok → test from the phone → Lovable UI (prompt pack from Claude, one screen at a time)
