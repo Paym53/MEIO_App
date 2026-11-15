@@ -73,12 +73,12 @@ VALIDATE_TIMEOUT_SECONDS = 120
 # Expected run time (engine v18.1, user's PC 12.–13.11.; engine-session figures in the hand-over note):
 #   reading/builds/gaps 20 s + 0.1 s per optimizer scenario, feasibility check 21 s,
 #   start check: ETA_Z_STEPS z steps of 8 s + 0.06 s per scenario each (≈ 15 s at 120, 20 s at 200, 38 s at 500)
-#     + one more build and start evaluation; a start repair (4c lines) adds up to 6 more evaluations,
+#     + one more build and start evaluation; a start repair (4c lines) adds up to 7 more evaluations (v18.2: R1b),
 #   search = time limit + 10 % + 10 s, out-of-sample check 0.033 s per fresh scenario (twice with the start policy).
 #   Totals: 200 scenarios / 300 s ≈ 9.5 min, 500 / 700 s ≈ 18 min (engine session: ≈ 10 and 19 min).
 ETA_BASE_SECONDS, ETA_PER_SCENARIO_SECONDS, ETA_FEASIBILITY_SECONDS = 20.0, 0.1, 21.0
 ETA_Z_STEPS, ETA_STEP_SECONDS, ETA_STEP_PER_SCENARIO_SECONDS, ETA_SECOND_BUILD_SECONDS = 3, 8.0, 0.06, 12.0
-ETA_REPAIR_STEPS = 6
+ETA_REPAIR_STEPS = 7                                                       # v18.2: + R1b
 ETA_ASSUMED_SCENARIOS = 200                                                # Excel NumScenarios of the template
 ETA_OOS_SECONDS_PER_SCENARIO, ETA_SEARCH_OVERRUN, ETA_SEARCH_OVERHEAD_SECONDS = 0.033, 0.10, 10.0
 WATCHDOG_FACTOR = 3.0                                                      # a run taking 3 × its estimate is stopped

@@ -27,7 +27,7 @@ Every number in input.json and result.json is copied from the engine; nothing is
   3. VALIDATE ........ data checks only
   4. INPUT ........... the master data as the engine read it → JSON (Master data page)
   4b. WHAT-IF ........ editable sheets; edits → a copy of the original workbook (app rules W01–W03)
-  5. RESULT .......... RunResult → result.json (contract version 4 = engine contract 4, v18.1)
+  5. RESULT .......... RunResult → result.json (contract version 4 = engine contract 4, v18.1/v18.2)
   6. RUN ............. the whole engine pipeline for one run folder (the PC is kept awake meanwhile)
   7. MAIN
 ================================================================================

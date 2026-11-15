@@ -1,5 +1,18 @@
 # Engine v18.1: hand-over to the app session (everything since v17.1)
 
+> **Update v18.2 (13.11.) — if you already installed v18.1, this is the only change.**
+> - Engine `2026-11-13 v18.2 (Seeker-only)`; contract version **4 unchanged** (no sheet, column or `RunResult` change).
+> - **What:** one more start-repair step **R1b** between R1 and R2 (K21): if R1 leaves a cell missed, R1 is repeated in
+>   the same weeks from the start with z + 0.5 before R2 orders maximum supply. Skipped when z is already 4.
+> - **Why:** user run 13.11. (D2C week 14 + 4,000 cans, 80 scenarios): the start cannot cover week 14; R1 fixed it but
+>   left Amazon week 36 at about 95.0%; R2 then ordered raw materials that strawberry capacity can never use, so Seeker
+>   started at €359k instead of €129k and ended at €309k. Replay on the reference simulator, 20 draws of 500 scenarios:
+>   R2 in 7 of 20 runs without R1b, in none with it (start €128–132k). The 23 stress variants are unchanged.
+> - **For the app:** new texts only — console `  R1b: …`, phase row `Time: 4c. Start repair R1b: Seeker evaluates` (one
+>   more possible start-check phase for the time estimate), and the Summary row `Start repair (section 4c, K21)` can name
+>   R1b. Replace the engine files, the template (only the `Model_Assumptions` text of K21 changed) and the docs; run the
+>   tests: **142** (new: `test_start_repair_r1b_…`), fingerprints updated.
+
 Engine `2026-11-12 v18.1 (Seeker-only)`, **contract version 4**. Your last engine was v17.1 (08.11., contract version 2,
 note `ENGINE_v17_RESPONSE.md`). Between them: v17.2 (10.11.), v18.0 (12.11., contract 3), v18.1 (12.11., contract 4), plus
 decisions that only changed the documentation. This note lists **every** change, why it was made, and what the app must do.
@@ -15,7 +28,7 @@ below) and `MEIO_math_model.md`.
    - template: `MEIO_Data_Template.xlsx`
    - documents: `MEIO_model_spec.md`, `MEIO_math_model.md`, `CLAUDE.md`, `MEIO_shelf_life_aware_policies.md`
    - Delete `ENGINE_v17_RESPONSE.md`; this note replaces it.
-2. Run `python -m pytest -q test_engine.py`: **141 passed** (v17.1: 117), about 2.5 min.
+2. Run `python -m pytest -q test_engine.py`: **142 passed** with v18.2 (v18.1: 141; v17.1: 117), about 2.5 min.
 3. **`CLAUDE.md`:** if you edited your copy, merge §1, §4, §5, §6 and §8 instead of replacing it.
 4. **New files:**
    - `MEIO_math_model.md`: the formal model, now part of the bundle.
@@ -206,6 +219,7 @@ below) and `MEIO_math_model.md`.
   2. If it misses cells that the maximum-supply policy meets, z is raised on a fixed 0.5 grid up to 4.
   3. Only if cells are still missed, the repair runs, step by step (R1 → R2 → R3, below).
   - **R1:** s and S at their upper bounds in the 12 weeks before the missed week.
+  - **R1b (v18.2):** R1 again, same weeks, from the start with z + 0.5 (see the update box at the top).
   - **R2:** maximum supply in the 6, then 12 weeks before it.
   - **R3:** maximum supply everywhere.
   - Seeker starts from the cheapest step that meets the most cells.
@@ -318,8 +332,8 @@ below) and `MEIO_math_model.md`.
 
 | Check | Result |
 |---|---|
-| Test suite | 141 tests (v17.1: 117) |
-| Mutation test | 46/46 deliberate rule errors caught, 12 of them for the review period |
+| Test suite | 142 tests with v18.2 (v18.1: 141; v17.1: 117) |
+| Mutation test | 46/46 deliberate rule errors caught, 12 of them for the review period; v18.2: 49/49 (3 for R1b) |
 | Engine = reference simulator in every scenario | incl. R = 2, 3, 4 and uncertain lead times |
 | R = 1 = v18.0 exactly | ✓ |
 | Committed weeks identical in every future; cycles don't react to later demand | ✓ |

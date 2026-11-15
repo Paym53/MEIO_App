@@ -12,15 +12,15 @@ The engine bundle lives in `engine/`, byte-exact. A new engine version replaces 
 | File | What it is | You may edit? |
 |---|---|---|
 | `CLAUDE.md` | this file: everything you need to know | yes (keep it current) |
-| `engine/meio_seeker_stochastic.py` | **the engine** (v18.1, contract version 4): every rule, written once, as Seeker Terms | **no** |
+| `engine/meio_seeker_stochastic.py` | **the engine** (v18.2, contract version 4): every rule, written once, as Seeker Terms | **no** |
 | `engine/reference_simulator.py` | independent second implementation of the rules, used only by the tests | **no** |
 | `engine/meio_stress_tests.py` | 26 data-change scenarios run through the engine (needs Seeker) | **no** |
-| `engine/test_engine.py` | **the engine test suite** (141 tests): input control, physics & dynamics, model functionality, output control, stress cases, engine fingerprint; includes a Seeker test double, so no license needed | **no** |
+| `engine/test_engine.py` | **the engine test suite** (142 tests): input control, physics & dynamics, model functionality, output control, stress cases, engine fingerprint; includes a Seeker test double, so no license needed | **no** |
 | `engine/MEIO_Data_Template.xlsx` | the input file (v18.1 layout, **example data**; the tests depend on it) incl. sheet `Model_Assumptions`; workbooks from v17.x are rejected (handover B1) | **no** (real data goes in `data/`, gitignored) |
 | `engine/MEIO_model_spec.md` | the dynamics/assumptions list: all 85 rules (IDs like C03, H05, K17), same as the Excel sheet | **no** |
 | `engine/MEIO_math_model.md` | the formal model: sets, dynamics, objective, fill-rate rule, Seeker mapping | **no** |
 | `engine/MEIO_shelf_life_aware_policies.md` | archived design of age-aware positions (rejected, K22); the waste warning (L10) refers to it | **no** |
-| `engine/ENGINE_v18_1_HANDOVER.md` | the record of every engine change since v17.1 and why, what the app had to adapt, and the open proposals (section G) | **no** |
+| `engine/ENGINE_v18_1_HANDOVER.md` | the record of every engine change since v17.1 and why (v18.2 box at the top), what the app had to adapt, and the open proposals (section G) | **no** |
 | `MEIO_Results_stochastic.xlsx` | results of a real Seeker run (sheet layout = engine output); on the user's PC only, gitignored | no |
 
 The app's own files are listed in §9. Don't add files or docs beyond that list unless the user asks.
@@ -42,7 +42,7 @@ into CRLF on checkout and the engine fingerprint test would fail on the user's P
   - Show the feasibility line and the bound NOTE prominently.
   - Show the rules missed on fresh scenarios.
   - Compare costs only between plans that meet the same number of rules (there is no lost-sales cost, so a plan that misses rules looks cheaper).
-- **Checks stay green:** `python -m ruff check .` and `python -m pytest` from the repo root (141 engine tests,
+- **Checks stay green:** `python -m ruff check .` and `python -m pytest` from the repo root (142 engine tests,
   about 2.5 min, plus the app's own tests) on every change. CI runs both on Linux and Windows, plus a secret scan.
 
 ## 3. How to work (the user's method) and the user
@@ -246,7 +246,7 @@ When the app needs something from the engine (a rule, an output, a setting, a bu
 to F5. **v18.1 (13.11., user's PC, 120 scenarios, 120 s, F5):** start z 1.22 → 2.50 in 3 steps of 12–14 s, €105,848 and
 88/90 on fresh scenarios (B2B and AMZ week 36; weakest AMZ week 36 at 89.0%), about 4.8 min in total. The API's time
 estimate (`api/server.py`): 20 s + 0.1 s per optimizer scenario + 21 s feasibility + 3 z steps of (8 s + 0.06 s per
-scenario) + 12 s second build (+ 6 steps if a repair runs) + limit × 1.1 + 10 s + 0.033 s per fresh scenario; it follows
+scenario) + 12 s second build (+ 7 steps if a repair runs; v18.2) + limit × 1.1 + 10 s + 0.033 s per fresh scenario; it follows
 the `4. Start check … z = …` and `4c.` lines in the log (counted, never keyed by phase name: names repeat).
 
 
@@ -264,7 +264,8 @@ reading, so the app can overwrite or delete its copies on Windows.
   raw-material lot guard (raw-material reorder point ≥ BOM × (FG reorder point + production MOQ)). On the template the guard
   raises 4 raw-material reorder points in the last weeks, so the start and the saving baseline differ slightly from v17.1.
 - Start check and repair (K21): section 5 evaluates the start; only if it misses rules that can be met, section 4c makes it
-  feasible step by step (R1 bounds, R2 maximum supply before the missed weeks, R3 maximum supply everywhere) and Seeker
+  feasible step by step (R1 bounds, R1b the same from z + 0.5 (v18.2), R2 maximum supply before the missed weeks, R3
+  maximum supply everywhere) and Seeker
   starts from that. Not used on the template.
 - Chance level (K08): a value in section 0 replaced the Excel level everywhere (superseded in v18.0 by `OPTIMIZATION_FILL_RATE`).
 - Input warnings X08/X09 (K19), expected waste rows and warning (L10).
@@ -301,6 +302,15 @@ reading, so the app can overwrite or delete its copies on Windows.
 - **Summary:** new row `Review period (A03)`, e.g. "R = 4 weeks: the model is run every 4 weeks; this run commits weeks 1–4
   (…); next run in week 5". Show it next to the commit table.
 - **Input warning X10** (see above). The start policy's safety stock counts the uncertainty since the last run (K07).
+
+**v18.2 (13.11., engine session; contract version 4 unchanged): one more start-repair step, R1b (K21).**
+- If R1 leaves a cell missed, R1b repeats R1 (same weeks) from the start with z + 0.5 before R2 orders maximum supply.
+  Why: user run 13.11. (D2C week 14 + 4,000): R1 fixed week 14 but left Amazon week 36 at about 95.0%, a coin flip;
+  R2 then bought raw materials strawberry capacity can never use (start €359k instead of €129k). Replay, 20 draws of
+  500 scenarios: R2 in 7 of 20 runs without R1b, in none with it; the stress variants are unchanged.
+- For the app: no schema change. New texts only: console `  R1b: …`, phase `Time: 4c. Start repair R1b: Seeker evaluates`,
+  and the Summary row `Start repair` can name R1b. 142 tests; new fingerprint. App (15.11.): the time estimate allows
+  up to 7 repair evaluations (`ETA_REPAIR_STEPS`); the repair phase is still matched by the prefix `4c. Start repair`.
 
 **How to read one fill-rate cell (show this in the app):** row AMZ, week 12, target 95%:
 - `Expected FR 96.4%` → averaged over all futures, Amazon gets 96.4% of its week-12 demand. The rule (H05) judges this
