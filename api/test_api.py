@@ -23,6 +23,7 @@ are real model numbers, the search is trivial.
 """
 import ast
 import hashlib
+import io
 import json
 import math
 import os
@@ -203,7 +204,7 @@ def test_missed_rules_are_the_rows_the_engine_marks_below_target(done):
 
 def test_progress_shows_phase_and_log(done, api):
     run_id, status, _ = done
-    assert status["phase"].startswith("6. Out-of-sample") and status["seconds_left"] is None
+    assert status["phase"].startswith("6. Baseline (textbook s,S)") and status["seconds_left"] is None  # last: W09
     assert any(ln.startswith("Feasibility check:") for ln in status["log_tail"])
     st = api.get(f"/runs/{run_id}").json()
     assert st["finished"] and st["summary"]["rules_total"] == 90
@@ -258,7 +259,7 @@ def test_result_json_is_an_exact_copy_of_the_run_result(tmp_path, monkeypatch):
 
 
 def same(a, b):
-    if a is None:                                     # empty cell, e.g. arrival week of an order never placed
+    if a is None or a == "":                          # empty cell, e.g. arrival week of an order never placed
         return b is None or (isinstance(b, float) and math.isnan(b))
     if isinstance(a, float) or isinstance(b, float):
         return b == pytest.approx(a, rel=1e-12, abs=1e-9)
@@ -273,10 +274,14 @@ def test_every_number_shown_equals_the_results_workbook(done, api, tmp_path):
     assert r.status_code == 200 and r.content.startswith(b"PK")
     (tmp_path / "w.xlsx").write_bytes(r.content)
     book = pd.read_excel(tmp_path / "w.xlsx", sheet_name=None)
-    assert list(book) == list(result["sheets"]) == ["Summary", "Commit_Now", "Policy_sS", "Decisions", "FillRates",
-                                                   "Stock_Waste", "Bands", "KPIs"]          # engine contract v4
+    b = result["baseline"]                                     # + the textbook baseline's sheets (W09)
+    shown = {**result["sheets"], "Baseline_Comparison": b["comparison"], "Baseline_sS": b["policy"],
+             "Baseline_FillRates": b["fill_rates"], "Baseline_KPIs": b["kpis"]}
+    assert list(book) == list(shown) == ["Summary", "Commit_Now", "Policy_sS", "Decisions", "FillRates", "Stock_Waste",
+                                         "Bands", "KPIs", "Baseline_Comparison", "Baseline_sS", "Baseline_FillRates",
+                                         "Baseline_KPIs"]                           # engine contract v4 + baseline
     for name, df in book.items():
-        t = result["sheets"][name]
+        t = shown[name]
         assert list(map(str, df.columns)) == t["columns"], name
         assert len(df) == len(t["rows"]), name
         for i, row in enumerate(df.itertuples(index=False)):
@@ -636,7 +641,7 @@ def test_label_and_note_can_be_changed_later(api, done):
 
 
 def scenarios(n, t):
-    return server.expected_seconds({"time_limit": t, "overrides": {"NumScenarios": n}})
+    return server.expected_seconds({"time_limit": t, "overrides": {"NumScenarios": n}, "baseline": False})
 
 
 def test_the_time_estimate_matches_the_measured_runs():
@@ -845,7 +850,7 @@ def test_a_run_needs_either_a_file_or_a_whatif(api, done):
 def test_the_app_rules_are_served_in_the_model_assumptions_columns(api):
     rules = api.get("/app-rules").json()
     assert rules["columns"] == ["ID", "Topic", "Title", "Rule / mechanic", "Source", "Status", "Where"]
-    assert [r[0] for r in rules["rows"]] == ["W01", "W02", "W03", "W04", "W05", "W06", "W07", "W08"]
+    assert [r[0] for r in rules["rows"]] == ["W01", "W02", "W03", "W04", "W05", "W06", "W07", "W08", "W09"]
     assert all(len(r) == len(rules["columns"]) and all(r) for r in rules["rows"])
 
 
@@ -882,3 +887,52 @@ def test_lots_orders_and_lead_time_branches_can_be_added_and_removed(api, done):
 def test_rows_are_added_or_removed_only_where_allowed(api, done, edit, words):
     r = api.post("/whatif/validate", json={"base_run": done[0], "edits": [edit]}).json()
     assert r["valid"] is False and words in r["errors"][0]
+
+
+# ============================================================================
+# 11. TEXTBOOK BASELINE (app rule W09; engine/meio_baseline.py, read-only)
+# ============================================================================
+def kpi_lost(kpis):
+    """Sum of the 'Lost sales …' KPI means (all channels, both week ranges)."""
+    return sum(r[2] for r in kpis["rows"] if str(r[0]).startswith("Lost sales "))
+
+
+def test_the_baseline_runs_on_the_same_fresh_scenarios_next_to_the_optimized_plan(api, done):
+    run_id, _, res = done
+    b, h = res["baseline"], res["headline"]
+    assert b["error"] is None and b["scenarios_out_of_sample"] == res["run_info"]["scenarios_out_of_sample"]
+    s = b["summary"]
+    # the optimized column is the run's own headline; the counts come from the baseline module, never the app
+    assert (s["cost_optimized"], s["rules_met_optimized"], s["rules_total"]) == \
+        (h["cost_out_of_sample"], h["rules_met_out_of_sample"], h["rules_total"])
+    comp = pd.DataFrame(b["comparison"]["rows"], columns=b["comparison"]["columns"]).set_index("Measure")
+    assert comp.loc["Expected total cost (fresh scenarios)", "Baseline (textbook s,S)"] == s["cost_baseline"]
+    rules = comp.filter(like="Fill-rate rules met", axis=0)["Baseline (textbook s,S)"]
+    assert s["rules_met_baseline"] == int(rules.iloc[0])
+    # the baseline's KPIs are the engine's KPI table on the BASELINE's fresh-scenario numbers
+    assert b["kpis"]["columns"] == res["sheets"]["KPIs"]["columns"]
+    assert b["bands"]["columns"] == res["sheets"]["Bands"]["columns"]
+    assert kpi_lost(b["kpis"]) == pytest.approx(s["lost_demand_baseline"], rel=1e-9)
+    assert kpi_lost(res["sheets"]["KPIs"]) == pytest.approx(s["lost_demand_optimized"], rel=1e-9)
+    assert [r[0] for r in b["policy"]["rows"]] == ["FG", "RM1", "RM2", "RM3", "RM4"]   # one fixed s, S per stock point
+    channels = {r[0] for r in res["sheets"]["FillRates"]["rows"]}
+    assert len(b["fill_rates"]["rows"]) == len(channels) * res["run_info"]["horizon_weeks"]
+    wb = openpyxl.load_workbook(io.BytesIO(api.get(f"/runs/{run_id}/workbook").content), read_only=True)
+    assert {"Baseline_Comparison", "Baseline_sS", "Baseline_FillRates", "Baseline_KPIs"} <= set(wb.sheetnames)
+
+
+def test_the_baseline_can_be_switched_off(api):
+    r = api.post("/runs", files=upload(TEMPLATE), data={"time_limit": "1", "baseline": "false"})
+    st = wait(api, r.json()["id"])
+    assert st["state"] == "done" and st["settings"]["baseline"] is False
+    assert api.get(f"/runs/{st['id']}/result").json()["baseline"] is None
+    wb = openpyxl.load_workbook(io.BytesIO(api.get(f"/runs/{st['id']}/workbook").content), read_only=True)
+    assert not [n for n in wb.sheetnames if n.startswith("Baseline")]
+    assert server.expected_seconds({"baseline": True}) == pytest.approx(
+        server.expected_seconds({"baseline": False}) + 0.033 * 2500)              # one more fresh-scenario check
+
+
+def test_a_failing_baseline_never_stops_the_run(capsys):
+    block, sheets = worker.run_baseline(te.ms, object(), "license.sio", te.fake)   # not a RunResult
+    assert block["error"].startswith("AttributeError") and sheets == {}
+    assert "Traceback" in capsys.readouterr().err                                   # the details go to log.txt

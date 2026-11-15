@@ -15,7 +15,9 @@ Started by api/server.py, never imported by it. This is the ONLY app file that i
              changed), then validate → answer.json {"valid", "errors", "warnings", "input", "changes"}
   run      : engine.load_data()                      → input.json   (the master data as the engine reads it)
              engine.run()                            → result.json  (the API's result contract)
-                                                       results.xlsx (the engine's own workbook, engine.write_report)
+             meio_baseline.run_baseline(res)        → result.json "baseline" (optional; never stops the run)
+                                                       results.xlsx (the engine's own workbook, engine.write_report;
+                                                       with the baseline sheets Baseline_* when it ran)
                                                        status.json  (done / invalid / failed)
 Everything printed (engine phase lines, Seeker progress) goes to the run's log.txt, which the server streams.
 
@@ -27,7 +29,8 @@ Every number in input.json and result.json is copied from the engine; nothing is
   3. VALIDATE ........ data checks only
   4. INPUT ........... the master data as the engine read it → JSON (Master data page)
   4b. WHAT-IF ........ editable sheets; edits → a copy of the original workbook (app rules W01–W03)
-  5. RESULT .......... RunResult → result.json (contract version 4 = engine contract 4, v18.1/v18.2)
+  5. RESULT .......... RunResult → result.json (contract 5 = engine contract 4 + the baseline block)
+  5b. BASELINE ....... textbook (s,S) on the same fresh scenarios (engine/meio_baseline.py, read-only), optional
   6. RUN ............. the whole engine pipeline for one run folder (the PC is kept awake meanwhile)
   7. MAIN
 ================================================================================
@@ -51,7 +54,7 @@ import openpyxl
 # ============================================================================
 ENGINE_DIR = Path(__file__).resolve().parent.parent / "engine"
 TEST_DOUBLE_ENV = "MEIO_TEST_DOUBLE"      # "1" = use the Seeker test double from engine/test_engine.py (tests only!)
-RESULT_CONTRACT_VERSION = 4               # bump on any change to the result.json layout (and to api/openapi.json)
+RESULT_CONTRACT_VERSION = 5               # 5: + "baseline" (15.11.); bump on any change to result.json (+ openapi.json)
 EXIT_DONE, EXIT_FAILED, EXIT_INVALID = 0, 1, 2
 # run setting (request.json) → engine module constant (CLAUDE.md §6 "Settings"); None = keep the engine's default
 SETTING_CONSTANTS = {"out_of_sample_scenarios": "OUT_OF_SAMPLE_SCENARIOS",
@@ -473,6 +476,57 @@ def build_result(engine, res, test_double, settings):
 
 
 # ============================================================================
+# 5b. BASELINE — the textbook (s,S) of engine/meio_baseline.py (read-only, like the engine) on the run's own data,
+#     overrides, target and fresh-scenario batches: one more out-of-sample evaluation. Every number is the baseline
+#     module's or the engine's (band_and_kpi_tables on the baseline's fresh-scenario numbers); nothing is recomputed.
+# ============================================================================
+BASELINE_SHEETS = {"Comparison": "Baseline_Comparison", "Baseline_sS": "Baseline_sS",
+                   "FillRates_Compare": "Baseline_FillRates"}
+BASELINE_COST = "Expected total cost (fresh scenarios)"          # Comparison rows (Measure starts with …)
+BASELINE_RULES, BASELINE_LOST = "Fill-rate rules met", "Lost demand"
+
+
+def measure(comp, prefix):
+    """The Comparison row whose Measure starts with `prefix` (labels carry week numbers and counts)."""
+    rows = comp[comp["Measure"].astype(str).str.startswith(prefix)]
+    if rows.empty:
+        raise KeyError(f"Comparison row {prefix!r} not found")
+    return rows.iloc[0]
+
+
+def baseline_summary(res, comp):
+    """Optimized and baseline side by side, copied from the Comparison table (cost, rules met, lost demand)."""
+    cost, rules = measure(comp, BASELINE_COST), measure(comp, BASELINE_RULES)
+    lost = measure(comp, f"{BASELINE_LOST}, all channels, weeks 1–{res.data.horizon}")
+    share = measure(comp, f"{BASELINE_LOST}, share of expected demand")
+    base = "Baseline (textbook s,S)"
+    return {"cost_optimized": cell(cost["Optimized"]), "cost_baseline": cell(cost[base]),
+            "rules_met_optimized": int(rules["Optimized"]), "rules_met_baseline": int(rules[base]),
+            "rules_total": len(res.ins["constrained"]),
+            "lost_demand_optimized": cell(lost["Optimized"]), "lost_demand_baseline": cell(lost[base]),
+            "lost_share_optimized": cell(share["Optimized"]), "lost_share_baseline": cell(share[base]),
+            "unit": str(lost["Unit"])}
+
+
+def run_baseline(engine, res, license_file, skr):
+    """(result block, extra workbook sheets). A failing baseline never stops the run: the block then holds the error."""
+    try:
+        import meio_baseline  # lives next to the engine (ENGINE_DIR is on sys.path)
+
+        tables = meio_baseline.run_baseline(res, str(license_file), skr=skr)
+        bands, kpis = engine.band_and_kpi_tables(res.data, res.ins, tables["oos"])
+    except Exception as e:  # noqa: BLE001 — the optimized plan is complete; the comparison is optional
+        traceback.print_exc()
+        return {"error": f"{type(e).__name__}: {e}"}, {}
+    comp = tables["Comparison"]
+    block = {"error": None, "summary": baseline_summary(res, comp), "comparison": table(comp),
+             "policy": table(tables["Baseline_sS"]), "fill_rates": table(tables["FillRates_Compare"]),
+             "kpis": table(kpis), "bands": table(bands), "scenarios_out_of_sample": int(tables["oos"]["n"])}
+    sheets = {BASELINE_SHEETS[k]: tables[k] for k in BASELINE_SHEETS} | {"Baseline_KPIs": kpis}
+    return block, sheets
+
+
+# ============================================================================
 # 6. RUN
 # ============================================================================
 def write_json(path, obj):
@@ -535,7 +589,10 @@ def run(engine, skr, test_double, run_dir, license_file):
             with keep_awake():
                 res = engine.run(str(input_workbook(run_dir)), str(license_file),
                                  time_limit=float(settings["time_limit"]), skr=skr, overrides=settings.get("overrides"))
-            result = build_result(engine, res, test_double, settings)      # target_source() reads the run's target
+                result = build_result(engine, res, test_double, settings)  # target_source() reads the run's target
+                baseline, extra = (run_baseline(engine, res, license_file, skr) if settings.get("baseline")
+                                   else (None, {}))
+            result["baseline"] = baseline
         finally:
             restore_settings(engine, previous)
     except ValueError as e:
@@ -546,7 +603,7 @@ def run(engine, skr, test_double, run_dir, license_file):
         set_status(run_dir, state="failed", message=str(e), errors=[])
         return EXIT_FAILED
     write_json(run_dir / "result.json", result)
-    engine.write_report(res.sheets, run_dir / "results.xlsx")
+    engine.write_report({**res.sheets, **extra}, run_dir / "results.xlsx")
     h = result["headline"]
     summary = {k: h[k] for k in ("cost_out_of_sample", "rules_met_out_of_sample", "rules_total")}
     set_status(run_dir, state="done", message="Finished.", errors=[], summary=summary, test_double=test_double)

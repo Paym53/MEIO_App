@@ -23,12 +23,14 @@ These scenarios are the contract. Each one becomes an automated test.
 6. **One run at a time:** while a run is in progress, a second one is refused.
 7. **Safe what-ifs:** a what-if changes only a copy of the original upload, never the upload itself. The engine checks
    the copy like any workbook, invalid edits are refused in the engine's words, and every what-if run lists what it changed.
+8. **Honest baseline:** the textbook (s,S) baseline is simulated on the same fresh scenarios as the optimized plan, and its
+   cost is never shown without its rules met and lost demand.
 
 ## What is in this repo
 
 | File | Purpose |
 |---|---|
-| `engine/` | the engine bundle, **never edited here** (a test checks the fingerprints); also the textbook baseline `meio_baseline.py` (comparison only, not yet in the app) |
+| `engine/` | the engine bundle, **never edited here** (a test checks the fingerprints); also the textbook baseline `meio_baseline.py` (comparison only) |
 | `README.md` | this guide |
 | `CLAUDE.md` | rules, decisions and status for Claude |
 | `requirements.txt` | exact package versions (= your `seeker_env`) |
@@ -58,7 +60,7 @@ These scenarios are the contract. Each one becomes an automated test.
    C:\Users\ruben\seeker_env\Scripts\python.exe -m pip install -r requirements.txt
    ```
 4. **License:** copy your `license.sio` into `C:\dev\MEIO_App\engine\` (it is gitignored).
-5. **Check:** run the tests. Every test must pass (`… passed`, no `failed`); the engine alone has 142 tests (about 5 min in total).
+5. **Check:** run the tests. Every test must pass (`… passed`, no `failed`); the engine has 142 tests, the textbook baseline 9 (about 5 min in total).
    ```bat
    C:\Users\ruben\seeker_env\Scripts\python.exe -m pytest
    ```
@@ -78,6 +80,9 @@ in `engine\MEIO_Data_Template.xlsx` and writes `engine\MEIO_Results_stochastic.x
 | Decisions you act on | 500 | 700 s | 18–19 min |
 | Quick what-if (never act on it) | 100 | 150 s | 6 min |
 
+- **Textbook baseline** (on by default, about 1.5 min more): the run also shows what a standard textbook (s,S)
+  calculation would give on the same futures (Overview card, page *Solver settings → Baseline heuristic*, sheets
+  `Baseline_*` in the results workbook). It usually looks cheaper because it misses rules and loses demand.
 - **Keep the PC on:** the app keeps it awake during a run. Don't shut the lid of a laptop or turn the PC off: a sleeping PC stretched a 5-minute search to over 3 hours (12.11.).
 - **Silence is normal:** Seeker can print nothing for minutes while it searches.
 

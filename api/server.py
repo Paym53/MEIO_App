@@ -66,7 +66,8 @@ DEFAULT_TIME_LIMIT, MAX_TIME_LIMIT = 250, 3600                             # See
 DEFAULT_OOS, MIN_OOS, MAX_OOS = 2500, 500, 20000                           # fresh scenarios for the check
 MAX_SCENARIOS = 2000                                                       # NumScenarios override (optimizer)
 DEFAULT_SETTINGS = {"time_limit": DEFAULT_TIME_LIMIT, "out_of_sample_scenarios": DEFAULT_OOS,
-                    "feasibility_check": True, "start_policy_out_of_sample": False, "overrides": None}
+                    "feasibility_check": True, "start_policy_out_of_sample": False, "overrides": None,
+                    "baseline": True}                       # textbook (s,S) comparison: one more fresh-scenario check
 API_VERSION = 3                       # recorded in every run's status.json; runs of older APIs (engine before v18.1,
                                       # other result layout) are not listed or served (user decision 13.11.)
 VALIDATE_TIMEOUT_SECONDS = 120
@@ -138,6 +139,14 @@ APP_RULES = [
      "change list, so it is still a what-if of the original, not a what-if of a what-if (W05). Runs with the "
      "same fingerprint use the same data; the dashboard groups them under one data set.",
      "User decision 14.11.", "Decided", "api/server.py same_data; dashboard top bar and Run dialog"],
+    ["W09", "Comparison", "Textbook baseline",
+     "Each run can also evaluate a textbook (s,S) policy (engine/meio_baseline.py; formulas: protection weeks "
+     "W = lead time + review period, EOQ with the order rules, z from the normal loss function for the fill-rate "
+     "target, s = W·D + z·σ, S = s + Q; one fixed s and S for all weeks) on the same fresh scenarios as the "
+     "optimized plan. It ignores shelf life, capacities, price tiers, seasonality and the per-week rule. Its cost "
+     "is always shown with rules met and lost demand in units: lost sales cost nothing in the model, so a plan "
+     "that misses rules looks cheaper. It never changes the optimized plan.",
+     "User decision 15.11.; engine session", "Decided", "api/worker.py run_baseline; dashboard Overview, Baseline"],
 ]
 
 
@@ -252,7 +261,8 @@ def expected_seconds(settings, z_steps=ETA_Z_STEPS, repair=False):
     """Expected run time. z_steps / repair: the start check's real course, once the log shows it."""
     s = {**DEFAULT_SETTINGS, **settings}
     n = (s["overrides"] or {}).get("NumScenarios", ETA_ASSUMED_SCENARIOS)
-    check = ETA_OOS_SECONDS_PER_SCENARIO * s["out_of_sample_scenarios"] * (2 if s["start_policy_out_of_sample"] else 1)
+    checks = 1 + bool(s["start_policy_out_of_sample"]) + bool(s.get("baseline"))      # fresh-scenario evaluations
+    check = ETA_OOS_SECONDS_PER_SCENARIO * s["out_of_sample_scenarios"] * checks
     feasibility = ETA_FEASIBILITY_SECONDS if s["feasibility_check"] else 0.0
     start = z_steps * step_seconds(n) + (ETA_SECOND_BUILD_SECONDS if z_steps else 0.0) + \
         (ETA_REPAIR_STEPS * step_seconds(n) if repair else 0.0)
@@ -620,6 +630,31 @@ class RunInfo(BaseModel):
     warnings: list[str]
 
 
+class BaselineSummary(BaseModel):
+    cost_optimized: float | None          # fresh scenarios, both plans (engine/meio_baseline.py Comparison table)
+    cost_baseline: float | None
+    rules_met_optimized: int
+    rules_met_baseline: int
+    rules_total: int
+    lost_demand_optimized: float | None   # all channels, all weeks, in `unit`
+    lost_demand_baseline: float | None
+    lost_share_optimized: float | None    # share of expected demand
+    lost_share_baseline: float | None
+    unit: str
+
+
+class Baseline(BaseModel):
+    """Textbook (s,S) on the same fresh scenarios (W09). error set = the baseline failed; the run itself is complete."""
+    error: str | None
+    summary: BaselineSummary | None = None
+    comparison: Table | None = None       # Measure, Unit, Optimized, Baseline (textbook s,S), difference, Note
+    policy: Table | None = None           # Baseline_sS: the fixed s and S per stock point and how they were computed
+    fill_rates: Table | None = None       # FillRates_Compare: expected FR and lost demand per channel and week, both
+    kpis: Table | None = None             # the baseline's KPIs (engine layout, as sheets["KPIs"])
+    bands: Table | None = None            # the baseline's Bands (engine layout, as sheets["Bands"])
+    scenarios_out_of_sample: int | None = None
+
+
 class Result(BaseModel):
     contract_version: int
     engine_version: str
@@ -629,6 +664,7 @@ class Result(BaseModel):
     run_info: RunInfo
     sheets: dict[str, Table]  # Summary, Commit_Now, Policy_sS, Decisions, FillRates, Stock_Waste, Bands, KPIs
     timings: list[tuple[str, float]]
+    baseline: Baseline | None = None      # null = not requested (run setting baseline = false) or an older run
 
 
 @asynccontextmanager
@@ -679,6 +715,7 @@ def create_run(file: Annotated[UploadFile | None, File()] = None,
                out_of_sample_scenarios: Annotated[int, Form(ge=MIN_OOS, le=MAX_OOS)] = DEFAULT_OOS,
                feasibility_check: Annotated[bool, Form()] = True,
                start_policy_out_of_sample: Annotated[bool, Form()] = False,
+               baseline: Annotated[bool, Form()] = True,
                num_scenarios: Annotated[int | None, Form(ge=1, le=MAX_SCENARIOS)] = None,
                random_seed: Annotated[int | None, Form(ge=0)] = None,
                label: Annotated[str, Form(max_length=80)] = "",
@@ -688,6 +725,7 @@ def create_run(file: Annotated[UploadFile | None, File()] = None,
     an invalid what-if is refused with the engine's errors, 422, and starts nothing) or again on the data of an earlier
     run (same_data_as = that run: the same workbook byte for byte, a what-if keeps its original and changes; W08).
     num_scenarios / random_seed replace the Excel NumScenarios / RandomSeed for this run only (engine rule K20).
+    baseline: also evaluate the textbook (s,S) baseline on the same fresh scenarios (W09; ~+85 s at 2,500).
     The fill-rate target and the review period come from the workbook only (W04)."""
     if sum(x is not None for x in (file, base_run, same_data_as)) != 1:
         raise HTTPException(400, "Send exactly one of: a workbook (file), a what-if (base_run and edits) or the "
@@ -695,7 +733,7 @@ def create_run(file: Annotated[UploadFile | None, File()] = None,
     overrides = {k: v for k, v in (("NumScenarios", num_scenarios), ("RandomSeed", random_seed)) if v is not None}
     settings = {"time_limit": time_limit, "out_of_sample_scenarios": out_of_sample_scenarios,
                 "feasibility_check": feasibility_check, "start_policy_out_of_sample": start_policy_out_of_sample,
-                "overrides": overrides or None}
+                "overrides": overrides or None, "baseline": baseline}
     label_and_note = {"label": label, "note": note}
     if file is not None:
         return get_run(start_run(read_upload(file), file.filename, settings, label_and_note))
