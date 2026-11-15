@@ -8,7 +8,7 @@ shows the results: what to commit now, the (s,S) policy, fill rates, stock, wast
 Browser → Lovable web app → ngrok tunnel → local API on your PC → engine + Seeker license
 ```
 
-**Status:** engine v18.1, local API v3, start script and the Lovable UI are in place. Next: what-if editing.
+**Status:** engine v18.2, local API v3, start script, the Lovable UI and what-if editing are in place.
 
 ## What the app must do
 
@@ -58,7 +58,7 @@ These scenarios are the contract. Each one becomes an automated test.
    C:\Users\ruben\seeker_env\Scripts\python.exe -m pip install -r requirements.txt
    ```
 4. **License:** copy your `license.sio` into `C:\dev\MEIO_App\engine\` (it is gitignored).
-5. **Check:** run the tests. Every test must pass (`… passed`, no `failed`); the engine alone has 141 tests (about 5 min in total).
+5. **Check:** run the tests. Every test must pass (`… passed`, no `failed`); the engine alone has 142 tests (about 5 min in total).
    ```bat
    C:\Users\ruben\seeker_env\Scripts\python.exe -m pytest
    ```

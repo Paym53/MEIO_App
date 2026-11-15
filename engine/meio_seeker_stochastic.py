@@ -121,7 +121,7 @@ START_EXTRA_WEEKS_RM = 4       # RM cover window = max RM lead time + max produc
 START_LOT_WEEKS = 4            # order-up-to S = reorder point s + this many weeks of average demand (≥ MOQ,
                                # ≤ what one fresh lot can sell before it expires)
 
-SCRIPT_VERSION = "2026-11-12 v18.1 (Seeker-only)"
+SCRIPT_VERSION = "2026-11-13 v18.2 (Seeker-only)"
 EPS = 1e-9
 TIMINGS = []                                  # (phase, seconds) — printed at the end and written to the report
 
@@ -1743,8 +1743,10 @@ def feasibility_note(d, start_fr, max_fr):
 #     before the missed weeks until it meets them; Seeker then starts from that feasible but expensive plan and
 #     removes the extra cost. A used repair is printed as "START REPAIR USED" and shown in the Summary.
 # ============================================================================
-REPAIR_STEPS = (("R1", "bounds", 12), ("R2", "max", 6), ("R2", "max", 12), ("R3", "max", None))
+REPAIR_STEPS = (("R1", "bounds", 12), ("R1b", "bounds_z", 12), ("R2", "max", 6), ("R2", "max", 12), ("R3", "max", None))
 #   R1: raise s and S to their upper bounds (section 2) in the 12 order weeks that can still supply each missed week
+#   R1b: R1 again (same weeks), but from the start with z + START_Z_STEP — used when R1 left a cell just below the
+#        target (often the last week); a little more safety stock everywhere is far cheaper than maximum supply (v18.2)
 #   R2: maximum supply (section 4b) in those order weeks, first 6, then 12 of them
 #   R3: maximum supply in every week (the policy of the feasibility check)
 
@@ -1772,10 +1774,11 @@ def _raise_before(d, layout, pol, src, weeks, window):
     return out
 
 
-def repair_start(skr, d, layout, pol0, start_fr, start_cost, max_fr, license_file):
+def repair_start(skr, d, layout, pol0, start_fr, start_cost, max_fr, license_file, z=None):
     """Section 4c (K21). Returns (start policy for Seeker, repair record). Target = every rule that the start or the
     maximum-supply policy meets. Steps REPAIR_STEPS in order, each evaluated once by Seeker; stop at the first that
-    meets the target; otherwise keep the step that meets the most rules (then the lower cost)."""
+    meets the target; otherwise keep the step that meets the most rules (then the lower cost). z: the start's safety
+    factor, for step R1b (skipped if z is None or already START_Z_MAX)."""
     target = rules_met(d, start_fr) | rules_met(d, max_fr)
     ub = layout.decode([layout.upper(i) for i in range(len(layout))])
     msp = max_supply_policy(d, layout)
@@ -1790,7 +1793,15 @@ def repair_start(skr, d, layout, pol0, start_fr, start_cost, max_fr, license_fil
         if not missed:
             break
         weeks = sorted({t for _, t in missed})
-        if window is None:
+        if src == "bounds_z":
+            if z is None or z >= START_Z_MAX - EPS:
+                continue
+            zb = min(z + START_Z_STEP, START_Z_MAX)
+            cand = _raise_before(d, layout, start_policy(d, z=zb), ub, rec["weeks"], window)
+            desc = (f"s,S at their upper bounds in the {window} order weeks before week(s) "
+                    f"{', '.join(map(str, rec['weeks']))}, from the start with z = {zb:.2f}")
+            fr, cost = evaluate_policy(skr, d, layout, cand, license_file, f"4c. Start repair {label}: Seeker evaluates")
+        elif window is None:
             cand, desc = msp, "maximum supply in every week"
             fr, cost = max_fr, float("inf")               # evaluated in 4b; never cheaper than the steps before
         else:
@@ -2352,7 +2363,8 @@ def run(data_file=None, license_file=None, time_limit=None, skr=None, overrides=
             repair["note"] = "off (START_REPAIR = False) — the start misses rules that can be met"
         elif start_misses(d, start0["fr"], max_fr):
             formula = dict(cost=start0["cost"], met=start0["met"])
-            pol0, repair = repair_start(skr, d, layout, pol0, start0["fr"], start0["cost"], max_fr, license_file)
+            pol0, repair = repair_start(skr, d, layout, pol0, start0["fr"], start0["cost"], max_fr, license_file,
+                                        z=zrec["z"])
             repair["formula_start"] = formula
             layout.include_start(pol0)
             x0 = layout.encode(pol0)

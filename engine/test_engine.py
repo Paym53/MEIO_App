@@ -1495,6 +1495,38 @@ def test_repair_keeps_the_best_step_when_no_step_meets_the_target(monkeypatch):
     assert rec["chosen"].startswith("R2: maximum supply in the 12") and not rec["chosen_met_target"]
 
 
+def test_start_repair_r1b_tries_r1_again_from_a_higher_z_before_maximum_supply(monkeypatch):
+    """v18.2: if R1 leaves a cell missed, R1b repeats R1 (same weeks) from the start with z + START_Z_STEP before
+    R2; skipped without z or at START_Z_MAX."""
+    d = copy.deepcopy(D0)
+    lay = ms.PolicyLayout(d)
+    keys = [(0, 14), (1, 14), (2, 36)]
+    start = {keys[0]: 1.0, keys[1]: 0.5, keys[2]: 1.0}                          # week 14 missed by the start
+    maxs = {k: 1.0 for k in keys}
+    seen = []
+
+    def fake_eval(skr, d_, layout, pol, lic, title):
+        seen.append((title, pol))
+        return results.pop(0)
+    monkeypatch.setattr(ms, "evaluate_policy", fake_eval)
+    results = [({keys[0]: 1.0, keys[1]: 1.0, keys[2]: 0.5}, 200.0),           # R1: week 14 met, week 36 now missed
+               ({k: 1.0 for k in keys}, 210.0)]                               # R1b: all met
+    pol0 = ms.start_policy(d, z=2.5)
+    pol, rec = ms.repair_start(fake, d, lay, pol0, start, 100.0, maxs, "lic", z=2.5)
+    assert [s["step"] for s in rec["steps"]] == ["R1", "R1b"] and rec["chosen_met_target"]
+    assert rec["chosen"].startswith("R1b: s,S at their upper bounds in the 12 order weeks before week(s) 14, from the start with z = 3.00")
+    ub = lay.decode([lay.upper(i) for i in range(len(lay))])
+    want = ms._raise_before(d, lay, ms.start_policy(d, z=3.0), ub, [14], 12)   # R1's weeks (14), not the new miss (36)
+    assert "R1b" in seen[1][0]
+    for j in want:
+        assert np.array_equal(seen[1][1][j][0], want[j][0]) and np.array_equal(seen[1][1][j][1], want[j][1])
+        assert np.array_equal(pol[j][0], want[j][0])
+    for z in (None, ms.START_Z_MAX):                                             # skipped: straight on to R2
+        results = [({keys[0]: 1.0, keys[1]: 1.0, keys[2]: 0.5}, 200.0), ({k: 1.0 for k in keys}, 300.0)]
+        _, rec = ms.repair_start(fake, d, lay, pol0, start, 100.0, maxs, "lic", z=z)
+        assert [s["step"] for s in rec["steps"]] == ["R1", "R2"]
+
+
 def test_waste_shares_use_the_right_demand():
     """L10: FG waste ÷ expected FG demand; raw-material waste ÷ (BOM × expected FG demand)."""
     d = copy.deepcopy(D0)
@@ -1905,8 +1937,8 @@ def test_noise_and_direction_logic():
 # ============================================================================
 
 
-ENGINE_SHA256 = {   # engine v18.1 — set by the engine session (python test_engine.py --fingerprint)
-    "meio_seeker_stochastic.py": "1c6eed4c49ce15932987b100d30182e745ae02f8011a28fdbae39e95b8e8521d",
+ENGINE_SHA256 = {   # engine v18.2 — set by the engine session (python test_engine.py --fingerprint)
+    "meio_seeker_stochastic.py": "64aebc1790771a64c11bc0d7d911be26dfe5c453a62c4e77fa2ba2e80a1a7c41",
     "reference_simulator.py": "a308374a5ae34f9798d4457a0cdcfe16e470861630f14ce1844f4019680c9025",
     "meio_stress_tests.py": "f0fc2fe4fe372f045874de1d35846961eb1eb01d027a24b91810c17982af7a5c",
 }

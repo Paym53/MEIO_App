@@ -657,6 +657,8 @@ def test_the_estimate_follows_the_start_check_in_the_log():
     assert server.start_check_course([f"{z} = 1.50", f"{z} = 2.00"], done) == (2, False)
     assert server.start_check_course(["5. Seeker optimization (time limit 1 s)"], []) == (0, False)  # no check needed
     assert server.start_check_course([f"{z} = 4.00", "4c. Start repair R1: Seeker evaluates"], done) == (1, True)
+    r1b = "4c. Start repair R1b: Seeker evaluates"                                                   # v18.2
+    assert server.start_check_course([f"{z} = 4.00", r1b], done) == (1, True)
 
 
 def test_runs_of_older_engines_are_not_shown(api, tmp_path, monkeypatch, done):
