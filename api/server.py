@@ -174,6 +174,18 @@ def write_json(path, obj):
             time.sleep(0.05)
 
 
+def read_json(path):
+    """Read a JSON file the other process may be replacing at this moment: on Windows the read then fails briefly
+    with PermissionError (user's PC 15.11.), so retry for up to 1 s like write_json."""
+    for attempt in range(20):
+        try:
+            return json.loads(Path(path).read_text(encoding="utf-8"))
+        except PermissionError:
+            if attempt == 19:
+                raise
+            time.sleep(0.05)
+
+
 def is_original(folder):
     """A run made from an uploaded workbook (not a what-if): only these can be the base of a what-if (W05)."""
     return read_status(folder).get("base_run") is None
@@ -193,13 +205,13 @@ def run_dir(run_id):
 
 
 def read_status(folder):
-    return json.loads((Path(folder) / "status.json").read_text(encoding="utf-8"))
+    return read_json(Path(folder) / "status.json")
 
 
 def read_label(folder):
     """Label and note live in their own file, so they never collide with the worker writing status.json."""
     path = Path(folder) / "label.json"
-    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    return read_json(path) if path.exists() else {}
 
 
 def run_view(folder):

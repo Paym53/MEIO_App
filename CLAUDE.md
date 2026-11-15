@@ -383,7 +383,9 @@ Browser → Lovable web app (own repo, made by Lovable; shows only API numbers, 
   `read_text(encoding="utf-8")` fix is part of v17.1; UTF-8 mode stays for the worker's piped output.
 - **Test double in the app:** `MEIO_TEST_DOUBLE=1` makes `api/worker.py` use the Seeker stand-in from `test_engine.py`
   (tests only). Results then carry `test_double: true` and `seeker_version` "FAKE …", and `/health` reports it.
-- **Windows:** replacing a file another process is reading fails, so both `write_json` functions retry for up to 1 s.
+- **Windows:** replacing a file another process is reading fails, so both `write_json` functions retry for up to 1 s;
+  reading `status.json`/`label.json` while the other process replaces it fails too, so both `read_json` functions retry
+  the same way (user's PC 15.11.: `PermissionError` in the run-again test).
 - Users: the user only, one token. Run history = folders in `runs/`, no database.
 - FillRates column names contain the scenario counts: match columns by prefix. Read the feasibility line from
   `res.ins["feasibility"]` and the bound NOTE from `engine.bound_note(res.layout, res.x)`, not from Summary labels.
