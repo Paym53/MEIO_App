@@ -28,7 +28,7 @@ These scenarios are the contract. Each one becomes an automated test.
 
 | File | Purpose |
 |---|---|
-| `engine/` | the engine bundle, **never edited here** (a test checks the fingerprints) |
+| `engine/` | the engine bundle, **never edited here** (a test checks the fingerprints); also the textbook baseline `meio_baseline.py` (comparison only, not yet in the app) |
 | `README.md` | this guide |
 | `CLAUDE.md` | rules, decisions and status for Claude |
 | `requirements.txt` | exact package versions (= your `seeker_env`) |
