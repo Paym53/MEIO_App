@@ -489,21 +489,9 @@ def write_json(path, obj):
             time.sleep(0.05)
 
 
-def read_json(path):
-    """Read a JSON file the other process may be replacing at this moment: on Windows the read then fails briefly
-    with PermissionError (user's PC 15.11.), so retry for up to 1 s like write_json."""
-    for attempt in range(20):
-        try:
-            return json.loads(Path(path).read_text(encoding="utf-8"))
-        except PermissionError:
-            if attempt == 19:
-                raise
-            time.sleep(0.05)
-
-
 def set_status(run_dir, **fields):
     path = Path(run_dir) / "status.json"
-    status = read_json(path) if path.exists() else {}
+    status = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
     status.update(fields, finished=dt.datetime.now().astimezone().isoformat(timespec="seconds"))
     write_json(path, status)
 

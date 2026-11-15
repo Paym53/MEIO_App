@@ -453,24 +453,6 @@ def test_status_writes_survive_a_reader_holding_the_file(module, tmp_path, monke
         module.write_json(tmp_path / "status.json", {"state": "x"})
 
 
-@pytest.mark.parametrize("module", [server, worker])
-def test_status_reads_survive_a_writer_replacing_the_file(module, tmp_path, monkeypatch):
-    path, real, calls = tmp_path / "status.json", Path.read_text, []
-    path.write_text('{"state": "done"}', encoding="utf-8")
-
-    def flaky(self, *args, **kwargs):                           # Windows: reading a file while it is replaced fails
-        calls.append(1)
-        if len(calls) < 3:
-            raise PermissionError("being replaced")
-        return real(self, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "read_text", flaky)
-    assert module.read_json(path) == {"state": "done"} and len(calls) == 3       # user's PC 15.11.
-    monkeypatch.setattr(Path, "read_text", lambda self, *a, **k: (_ for _ in ()).throw(PermissionError("in use")))
-    with pytest.raises(PermissionError):
-        module.read_json(path)
-
-
 # ============================================================================
 # 7. ARCHITECTURE & CONTRACT
 # ============================================================================
