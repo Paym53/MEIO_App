@@ -29,7 +29,7 @@ Every number in input.json and result.json is copied from the engine; nothing is
   3. VALIDATE ........ data checks only
   4. INPUT ........... the master data as the engine read it → JSON (Master data page)
   4b. WHAT-IF ........ editable sheets; edits → a copy of the original workbook (app rules W01–W03)
-  5. RESULT .......... RunResult → result.json (contract 6 = engine contract 4 (v18.3) + baseline + firm_orders)
+  5. RESULT .......... RunResult → result.json (contract 7 = engine contract 4 (v18.3) + baseline, firm orders, bounds)
   5b. BASELINE ....... textbook (s,S) on the same fresh scenarios (engine/meio_baseline.py, read-only), optional
   6. RUN ............. the whole engine pipeline for one run folder (the PC is kept awake meanwhile)
   7. MAIN
@@ -54,12 +54,14 @@ import openpyxl
 # ============================================================================
 ENGINE_DIR = Path(__file__).resolve().parent.parent / "engine"
 TEST_DOUBLE_ENV = "MEIO_TEST_DOUBLE"      # "1" = use the Seeker test double from engine/test_engine.py (tests only!)
-RESULT_CONTRACT_VERSION = 6               # 6: + headline.firm_orders (v18.3); bump on any result.json change
+RESULT_CONTRACT_VERSION = 7               # 7: + extra cover weeks, bound points; bump on any result.json change
 EXIT_DONE, EXIT_FAILED, EXIT_INVALID = 0, 1, 2
 # run setting (request.json) → engine module constant (CLAUDE.md §6 "Settings"); None = keep the engine's default
 SETTING_CONSTANTS = {"out_of_sample_scenarios": "OUT_OF_SAMPLE_SCENARIOS",
                      "feasibility_check": "FEASIBILITY_CHECK",
                      "start_policy_out_of_sample": "START_POLICY_OUT_OF_SAMPLE"}
+COVER_CONSTANT = "EXTRA_COVER_WEEKS"      # run setting extra_cover_weeks {stock point: weeks} → bounds of s (K05, W10)
+DEFAULT_COVER_WEEKS = 4                   # the engine's fallback for a stock point missing in EXTRA_COVER_WEEKS (§2)
 # The fill-rate target and the review period come only from the workbook (Items!TargetFillRate, Settings!ReviewPeriod;
 # what-if edits change them): the engine's OPTIMIZATION_FILL_RATE stays None (app rule W04, user decision 13.11.).
 # Windows SetThreadExecutionState flags: keep the PC awake during a run (a sleeping PC stretched a 300 s search to
@@ -192,6 +194,25 @@ def excel_target(d):
     return d.fill_rate_target if excel is None else excel
 
 
+def stock_points(d):
+    """The engine's stock points: FG (production at the DC) and every raw material (echelon at the RMW)."""
+    return ["FG"] + [k.id for k in d.rms]
+
+
+def cover_weeks(engine, d):
+    """EXTRA_COVER_WEEKS as the engine uses it for this data (upper bound of each reorder point, K05)."""
+    cover = getattr(engine, COVER_CONSTANT)
+    return {j: int(cover.get(j, DEFAULT_COVER_WEEKS)) for j in stock_points(d)}
+
+
+def check_cover(d, settings):
+    """A run's extra_cover_weeks may only name this data's stock points (else a data error, nothing runs)."""
+    unknown = sorted(set(settings.get("extra_cover_weeks") or {}) - set(stock_points(d)))
+    if unknown:
+        raise ValueError(f"Data validation failed:\n  - Run setting extra cover weeks: unknown stock point(s) "
+                         f"{', '.join(unknown)}; this data has {', '.join(stock_points(d))}.")
+
+
 def describe_input(engine, d, path):
     unit = d.uom or {}
     with engine.pd.ExcelFile(str(path)) as xls:                    # the engine's own sheet reader (_sheet)
@@ -200,7 +221,8 @@ def describe_input(engine, d, path):
         "settings": {"horizon_weeks": d.horizon, "review_period_weeks": d.review_period,
                      "start_date": d.start_date.date().isoformat(),
                      "scenarios": d.n_scenarios, "random_seed": d.seed, "time_limit_seconds": cell(d.time_limit),
-                     "rules_from_first_controllable_week": d.enforce_from_first_controllable},
+                     "rules_from_first_controllable_week": d.enforce_from_first_controllable,
+                     "extra_cover_weeks": cover_weeks(engine, d)},          # the engine's defaults (K05)
         "product": {"id": d.fg_id, "unit": unit.get(d.fg_id), "shelf_life_weeks": d.fg_shelf_life,
                     "fill_rate_target": cell(excel_target(d)),                 # Items!TargetFillRate (H04)
                     "holding_cost": cell(d.fg_holding), "waste_cost": cell(d.fg_waste),
@@ -413,6 +435,11 @@ def start_record(ins):
     return {"z0": cell(z.get("z0")), "z": cell(z.get("z")), "steps": steps}
 
 
+def bound_points(layout, x):
+    """Stock points with a reorder point at its upper bound (the engine's layout.at_bound, as bound_note uses it)."""
+    return sorted({j for j, _, _ in layout.at_bound(x)})
+
+
 def headline(engine, res):
     ins, oos, fr, d = res.ins, res.oos, res.sheets["FillRates"], res.data
     summary = summary_rows(res)
@@ -425,6 +452,7 @@ def headline(engine, res):
         "rules_missed_out_of_sample": missed_rules(fr),
         "feasibility": str(ins["feasibility"]),                                # one line, section 4b
         "bound_note": str(engine.bound_note(res.layout, res.x)),               # "none" or which setting to raise
+        "bound_points": bound_points(res.layout, res.x),                       # the stock points at their bound
         "weakest_cell": str(summary.get("Weakest cell (out-of-sample)", "")),  # tail of the weakest cell (L04)
         "fill_rate_target": float(d.fill_rate_target),                         # the target used in this run (K08)
         "fill_rate_target_excel": float(excel_target(d)),                      # Items!TargetFillRate
@@ -460,7 +488,8 @@ def run_info(engine, res, settings):
             "fill_rate_target": float(d.fill_rate_target), "fill_rate_target_excel": float(excel_target(d)),
             "scenarios_out_of_sample": int(res.oos["n"]), "feasibility_check": bool(engine.FEASIBILITY_CHECK),
             "start_policy_out_of_sample": bool(engine.START_POLICY_OUT_OF_SAMPLE),
-            "overrides": res.overrides, "warnings": list(d.warnings or [])}
+            "overrides": res.overrides, "warnings": list(d.warnings or []),
+            "extra_cover_weeks": cover_weeks(engine, d)}                          # the upper bounds used (W10)
 
 
 def build_result(engine, res, test_double, settings):
@@ -554,10 +583,12 @@ def set_status(run_dir, **fields):
 def apply_settings(engine, settings):
     """Run settings → engine constants. Returns the previous values, so restore_settings() can put them back: the
     target (OPTIMIZATION_FILL_RATE) must never leak into a later run (one run per process anyway)."""
-    previous = {c: getattr(engine, c) for c in SETTING_CONSTANTS.values()}
+    previous = {c: getattr(engine, c) for c in (*SETTING_CONSTANTS.values(), COVER_CONSTANT)}
     for key, constant in SETTING_CONSTANTS.items():
         if settings.get(key) is not None:
             setattr(engine, constant, settings[key])
+    if settings.get("extra_cover_weeks"):                      # only the stock points the run names (W10)
+        setattr(engine, COVER_CONSTANT, {**previous[COVER_CONSTANT], **settings["extra_cover_weeks"]})
     return previous
 
 
@@ -585,6 +616,7 @@ def run(engine, skr, test_double, run_dir, license_file):
     try:
         d = engine.load_data(str(input_workbook(run_dir)))
         write_json(run_dir / "input.json", describe_input(engine, d, input_workbook(run_dir)))
+        check_cover(d, settings)
         previous = apply_settings(engine, settings)
         try:
             with keep_awake():

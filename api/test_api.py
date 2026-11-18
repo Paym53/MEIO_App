@@ -234,6 +234,7 @@ def test_result_json_is_an_exact_copy_of_the_run_result(tmp_path, monkeypatch):
     assert h["cost_out_of_sample"] == res.oos["cost"] and h["cost_in_sample"] == res.ins["cost"]
     assert h["rules_met_in_sample"] == res.ins["met"] and h["feasibility"] == res.ins["feasibility"]
     assert h["bound_note"] == te.ms.bound_note(res.layout, res.x) and h["start_policy_cost"] == res.ins["start"]["cost"]
+    assert h["bound_points"] == sorted({j for j, _, _ in res.layout.at_bound(res.x)})
     assert h["cost_parts_in_sample"] == res.ins["parts"] and len(h["cost_parts_in_sample"]) == 5
     assert h["cost_parts_out_of_sample"] == {n: res.oos[("part", n)] for n in res.ins["parts"]}
     summary = dict(res.sheets["Summary"].values)
@@ -851,7 +852,7 @@ def test_a_run_needs_either_a_file_or_a_whatif(api, done):
 def test_the_app_rules_are_served_in_the_model_assumptions_columns(api):
     rules = api.get("/app-rules").json()
     assert rules["columns"] == ["ID", "Topic", "Title", "Rule / mechanic", "Source", "Status", "Where"]
-    assert [r[0] for r in rules["rows"]] == ["W01", "W02", "W03", "W04", "W05", "W06", "W07", "W08", "W09"]
+    assert [r[0] for r in rules["rows"]] == ["W01", "W02", "W03", "W04", "W05", "W06", "W07", "W08", "W09", "W10"]
     assert all(len(r) == len(rules["columns"]) and all(r) for r in rules["rows"])
 
 
@@ -962,3 +963,53 @@ def test_a_review_period_of_two_reports_its_firm_production_orders(api, done):
     assert not res["headline"]["firm_orders"].startswith("R = 1")
     weeks = {r[0] for r in res["sheets"]["Commit_Now"]["rows"]}
     assert {"Week 1", "Week 2"} <= weeks                                  # both committed weeks, exact quantities
+
+
+# ============================================================================
+# 13. SEARCH LIMITS PER RUN (app rule W10: engine EXTRA_COVER_WEEKS, rule K05)
+# ============================================================================
+def test_the_extra_cover_weeks_raise_the_bounds_for_one_run_only(monkeypatch):
+    d = te.ms.load_data(str(TEMPLATE))
+    default = dict(te.ms.EXTRA_COVER_WEEKS)
+    before = te.ms.PolicyLayout(d)
+    previous = worker.apply_settings(te.ms, {"extra_cover_weeks": {"FG": default["FG"] + 6}})
+    cover = te.ms.EXTRA_COVER_WEEKS
+    assert cover == {**default, "FG": default["FG"] + 6}                          # only the named stock point
+    after = te.ms.PolicyLayout(d)
+    sigma = [i for i, (j, _, kind) in enumerate(before.index) if j == "FG" and kind == "sigma"]
+    assert all(after.ub_var[i] >= before.ub_var[i] for i in sigma)
+    assert any(after.ub_var[i] > before.ub_var[i] for i in sigma)                # higher reorder points allowed
+    rm = [i for i, (j, _, _) in enumerate(before.index) if j != "FG"]
+    assert [after.ub_var[i] for i in rm] == [before.ub_var[i] for i in rm]       # the raw materials are unchanged
+    worker.restore_settings(te.ms, previous)
+    restored = te.ms.EXTRA_COVER_WEEKS
+    assert restored == default                                                    # never leaks into the next run
+
+
+def test_a_run_records_the_search_limits_it_used(api, done):
+    default = done[2]["run_info"]["extra_cover_weeks"]
+    assert default == api.get(f"/runs/{done[0]}/input").json()["settings"]["extra_cover_weeks"]
+    assert set(default) == {"FG", "RM1", "RM2", "RM3", "RM4"}
+    r = api.post("/runs", data={"same_data_as": done[0], "time_limit": "1", "baseline": "false",
+                                "extra_cover_weeks": json.dumps({"RM3": default["RM3"] + 4})})
+    st = wait(api, r.json()["id"])
+    assert st["state"] == "done" and st["settings"]["extra_cover_weeks"] == {"RM3": default["RM3"] + 4}
+    info = api.get(f"/runs/{st['id']}/result").json()["run_info"]
+    assert info["extra_cover_weeks"] == {**default, "RM3": default["RM3"] + 4}
+
+
+@pytest.mark.parametrize("value", ['{"FG": -1}', '{"FG": 53}', '{"FG": 2.5}', '["FG"]', "not json", '{"FG": "8"}'])
+def test_wrong_search_limits_are_refused(api, done, value):
+    r = api.post("/runs", data={"same_data_as": done[0], "time_limit": "1", "extra_cover_weeks": value})
+    assert r.status_code == 422 and "extra_cover_weeks" in r.text
+
+
+def test_an_unknown_stock_point_is_a_data_error(api, done):
+    r = api.post("/runs", data={"same_data_as": done[0], "time_limit": "1", "extra_cover_weeks": '{"RM9": 6}'})
+    st = wait(api, r.json()["id"])
+    assert st["state"] == "invalid" and "unknown stock point(s) RM9" in st["errors"][0]
+
+
+def test_bound_points_name_each_stock_point_once():
+    layout = type("L", (), {"at_bound": lambda self, x: [("RM3", 12, 1), ("FG", 13, 1), ("RM3", 14, 1)]})()
+    assert worker.bound_points(layout, []) == ["FG", "RM3"]

@@ -145,7 +145,7 @@
    },
    "post": {
     "summary": "Create Run",
-    "description": "Starts an optimization run in the background (refused while another run is in progress), either on an uploaded\nworkbook (file), as a what-if (base_run = an original run, edits = JSON list of edits, see POST /whatif/validate;\nan invalid what-if is refused with the engine's errors, 422, and starts nothing) or again on the data of an earlier\nrun (same_data_as = that run: the same workbook byte for byte, a what-if keeps its original and changes; W08).\nnum_scenarios / random_seed replace the Excel NumScenarios / RandomSeed for this run only (engine rule K20).\nbaseline: also evaluate the textbook (s,S) baseline on the same fresh scenarios (W09; ~+85 s at 2,500).\nThe fill-rate target and the review period come from the workbook only (W04).",
+    "description": "Starts an optimization run in the background (refused while another run is in progress), either on an uploaded\nworkbook (file), as a what-if (base_run = an original run, edits = JSON list of edits, see POST /whatif/validate;\nan invalid what-if is refused with the engine's errors, 422, and starts nothing) or again on the data of an earlier\nrun (same_data_as = that run: the same workbook byte for byte, a what-if keeps its original and changes; W08).\nnum_scenarios / random_seed replace the Excel NumScenarios / RandomSeed for this run only (engine rule K20).\nbaseline: also evaluate the textbook (s,S) baseline on the same fresh scenarios (W09; ~+85 s at 2,500).\nextra_cover_weeks: JSON object {stock point: weeks}, e.g. {\"FG\": 12}: raises the upper bound of that stock point's\nreorder points for this run only (engine EXTRA_COVER_WEEKS, K05; W10); points not named keep the engine's value.\nThe fill-rate target and the review period come from the workbook only (W04).",
     "operationId": "create_run_runs_post",
     "requestBody": {
      "content": {
@@ -844,6 +844,17 @@
       "title": "Baseline",
       "default": true
      },
+     "extra_cover_weeks": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Extra Cover Weeks"
+     },
      "num_scenarios": {
       "anyOf": [
        {
@@ -1107,6 +1118,14 @@
      "bound_note": {
       "type": "string",
       "title": "Bound Note"
+     },
+     "bound_points": {
+      "items": {
+       "type": "string"
+      },
+      "type": "array",
+      "title": "Bound Points",
+      "default": []
      },
      "weakest_cell": {
       "type": "string",
@@ -1421,6 +1440,14 @@
      "rules_from_first_controllable_week": {
       "type": "boolean",
       "title": "Rules From First Controllable Week"
+     },
+     "extra_cover_weeks": {
+      "additionalProperties": {
+       "type": "integer"
+      },
+      "type": "object",
+      "title": "Extra Cover Weeks",
+      "default": {}
      }
     },
     "type": "object",
@@ -1631,6 +1658,20 @@
       },
       "type": "array",
       "title": "Warnings"
+     },
+     "extra_cover_weeks": {
+      "anyOf": [
+       {
+        "additionalProperties": {
+         "type": "integer"
+        },
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Extra Cover Weeks"
      }
     },
     "type": "object",
