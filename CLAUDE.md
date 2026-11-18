@@ -639,6 +639,16 @@ futures that order** (like arrival_week), so Orders can show "if ordered: …" i
   Solver settings: switch "Textbook baseline". Template (test double): optimized €113k, 90/90, 61 cans lost; textbook €101k,
   50/90, 4,068 cans lost.
 
+**Search limits per run (18.11., user decision, app rule W10, result contract 7):** run setting `extra_cover_weeks`
+(form field, JSON `{stock point: whole weeks 0–52}`, only the named points; `api/server.py parse_cover`, 422 otherwise) →
+the worker sets the engine constant `EXTRA_COVER_WEEKS` (merged with the engine's values) before `run()` and restores it
+after; an unknown stock point is a data error (run state `invalid`). Engine defaults per stock point in
+`/input` `settings.extra_cover_weeks`; the values used in `run_info.extra_cover_weeks`; `headline.bound_points` = the stock
+points of `layout.at_bound(x)` (as the bound NOTE). Dashboard: Run dialog → Solver settings → "Search limits" (one field
+per stock point, placeholder = engine default); Overview status chip "Search limit reached" + button "Run again with a
+higher limit" (same data, the run's values + 4 weeks for the named points, editable); Solver settings, Scenario
+comparison and the run page show the limits used.
+
 **Plan:** PR 1 foundation → user runs tests + one real F5 run from the repo → PR 2 local API → one real run via
 `localhost:8000/docs` → PR 3 ngrok → test from the phone → Lovable UI (prompt pack from Claude, one screen at a time)
 → hardening. Claude works on its branch and opens a PR; the user merges and pulls with GitHub Desktop.

@@ -83,6 +83,9 @@ in `engine\MEIO_Data_Template.xlsx` and writes `engine\MEIO_Results_stochastic.x
 - **Textbook baseline** (on by default, about 1.5 min more): the run also shows what a standard textbook (s,S)
   calculation would give on the same futures (Overview card, page *Solver settings → Baseline heuristic*, sheets
   `Baseline_*` in the results workbook). It usually looks cheaper because it misses rules and loses demand.
+- **Search limit reached** (Overview status line): a reorder point sat at the highest value the search allows. Click
+  *Run again with a higher limit*: it runs the same data with that stock point's extra cover weeks raised by 4 (you can
+  change them under *Solver settings → Search limits* in the Run dialog). The engine file is never edited.
 - **Keep the PC on:** the app keeps it awake during a run. Don't shut the lid of a laptop or turn the PC off: a sleeping PC stretched a 5-minute search to over 3 hours (12.11.).
 - **Silence is normal:** Seeker can print nothing for minutes while it searches.
 

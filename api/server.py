@@ -65,6 +65,7 @@ MAX_UPLOAD_MB = 20
 DEFAULT_TIME_LIMIT, MAX_TIME_LIMIT = 250, 3600                             # Seeker search time [s]
 DEFAULT_OOS, MIN_OOS, MAX_OOS = 2500, 500, 20000                           # fresh scenarios for the check
 MAX_SCENARIOS = 2000                                                       # NumScenarios override (optimizer)
+MAX_COVER_WEEKS = 52                                                       # extra cover weeks per stock point (W10)
 DEFAULT_SETTINGS = {"time_limit": DEFAULT_TIME_LIMIT, "out_of_sample_scenarios": DEFAULT_OOS,
                     "feasibility_check": True, "start_policy_out_of_sample": False, "overrides": None,
                     "baseline": True}                       # textbook (s,S) comparison: one more fresh-scenario check
@@ -147,6 +148,13 @@ APP_RULES = [
      "is always shown with rules met and lost demand in units: lost sales cost nothing in the model, so a plan "
      "that misses rules looks cheaper. It never changes the optimized plan.",
      "User decision 15.11.; engine session", "Decided", "api/worker.py run_baseline; dashboard Overview, Baseline"],
+    ["W10", "Run settings", "Search limits (upper bounds) per run",
+     "The upper bound of each stock point's reorder point is the forecast demand over its lead time plus extra cover "
+     "weeks (engine EXTRA_COVER_WEEKS, rule K05; defaults FG 8, RM1 4, RM2 4, RM3 8, RM4 4). When a run reports a "
+     "reorder point at its bound (bound note), the extra cover weeks of that stock point can be raised for the next "
+     "run in the Run dialog; the engine file stays unchanged. A higher bound changes no supply-chain rule, it only "
+     "lets the search consider higher reorder points (a larger search space).",
+     "User decision 18.11.", "Decided", "api/worker.py apply_settings; Run dialog, Overview status line"],
 ]
 
 
@@ -416,6 +424,22 @@ def original_base(base_run):
     return folder
 
 
+def parse_cover(text):
+    """Run setting extra_cover_weeks: a JSON object {stock point: whole weeks 0…MAX_COVER_WEEKS}; None when empty."""
+    if not text:
+        return None
+    try:
+        cover = json.loads(text)
+        ok = isinstance(cover, dict) and all(isinstance(k, str) and type(v) is int and 0 <= v <= MAX_COVER_WEEKS
+                                             for k, v in cover.items())
+    except ValueError:
+        ok = False
+    if not ok:
+        raise HTTPException(422, f"extra_cover_weeks must be a JSON object of stock point → whole weeks 0–"
+                                 f"{MAX_COVER_WEEKS}, e.g. {{\"FG\": 12}}.")
+    return cover or None
+
+
 def same_data(run_id):
     """(bytes, file name) of an earlier run's input.xlsx: a run again on the same data (W08)."""
     folder = run_dir(run_id)
@@ -468,6 +492,7 @@ class InputSettings(BaseModel):
     random_seed: int
     time_limit_seconds: float | None
     rules_from_first_controllable_week: bool
+    extra_cover_weeks: dict[str, int] = {}   # the engine's default upper-bound cover per stock point (K05, W10)
 
 
 class InputData(BaseModel):
@@ -589,6 +614,7 @@ class Headline(BaseModel):
     rules_missed_out_of_sample: list[MissedRule]
     feasibility: str
     bound_note: str
+    bound_points: list[str] = []          # stock points with a reorder point at its upper bound (raise W10)
     weakest_cell: str                     # engine Summary "Weakest cell (out-of-sample)"
     fill_rate_target: float               # the target used in this run (K08)
     fill_rate_target_excel: float         # Items!TargetFillRate
@@ -629,6 +655,7 @@ class RunInfo(BaseModel):
     start_policy_out_of_sample: bool
     overrides: dict[str, int] | None
     warnings: list[str]
+    extra_cover_weeks: dict[str, int] | None = None   # upper-bound cover per stock point this run used (W10)
 
 
 class BaselineSummary(BaseModel):
@@ -717,6 +744,7 @@ def create_run(file: Annotated[UploadFile | None, File()] = None,
                feasibility_check: Annotated[bool, Form()] = True,
                start_policy_out_of_sample: Annotated[bool, Form()] = False,
                baseline: Annotated[bool, Form()] = True,
+               extra_cover_weeks: Annotated[str | None, Form()] = None,
                num_scenarios: Annotated[int | None, Form(ge=1, le=MAX_SCENARIOS)] = None,
                random_seed: Annotated[int | None, Form(ge=0)] = None,
                label: Annotated[str, Form(max_length=80)] = "",
@@ -727,6 +755,8 @@ def create_run(file: Annotated[UploadFile | None, File()] = None,
     run (same_data_as = that run: the same workbook byte for byte, a what-if keeps its original and changes; W08).
     num_scenarios / random_seed replace the Excel NumScenarios / RandomSeed for this run only (engine rule K20).
     baseline: also evaluate the textbook (s,S) baseline on the same fresh scenarios (W09; ~+85 s at 2,500).
+    extra_cover_weeks: JSON object {stock point: weeks}, e.g. {"FG": 12}: raises the upper bound of that stock point's
+    reorder points for this run only (engine EXTRA_COVER_WEEKS, K05; W10); points not named keep the engine's value.
     The fill-rate target and the review period come from the workbook only (W04)."""
     if sum(x is not None for x in (file, base_run, same_data_as)) != 1:
         raise HTTPException(400, "Send exactly one of: a workbook (file), a what-if (base_run and edits) or the "
@@ -734,7 +764,8 @@ def create_run(file: Annotated[UploadFile | None, File()] = None,
     overrides = {k: v for k, v in (("NumScenarios", num_scenarios), ("RandomSeed", random_seed)) if v is not None}
     settings = {"time_limit": time_limit, "out_of_sample_scenarios": out_of_sample_scenarios,
                 "feasibility_check": feasibility_check, "start_policy_out_of_sample": start_policy_out_of_sample,
-                "overrides": overrides or None, "baseline": baseline}
+                "overrides": overrides or None, "baseline": baseline,
+                "extra_cover_weeks": parse_cover(extra_cover_weeks)}
     label_and_note = {"label": label, "note": note}
     if file is not None:
         return get_run(start_run(read_upload(file), file.filename, settings, label_and_note))
