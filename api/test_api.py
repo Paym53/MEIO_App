@@ -244,6 +244,7 @@ def test_result_json_is_an_exact_copy_of_the_run_result(tmp_path, monkeypatch):
                                                        summary["Review period (A03)"])
     assert h["start_policy"] == summary["Start policy (warm start)"]
     assert h["start_repair"] == summary["Start repair (section 4c, K21)"]
+    assert h["firm_orders"] == summary["Firm production orders (D06)"]                 # v18.3
     assert h["start_repair_used"] is bool(res.ins["repair"].get("used"))
     assert h["start_check"]["z0"] == res.ins["start_z"]["z0"] and h["start_check"]["z"] == res.ins["start_z"]["z"]
     assert [s["z"] for s in h["start_check"]["steps"]] == [s["z"] for s in res.ins["start_z"]["steps"]]
@@ -567,7 +568,7 @@ def test_master_data_is_exactly_what_the_engine_read(api, done):
     assert prod["cost_tiers"]["tiers"][-1]["to"] is None                       # last tier: no upper limit
     assert inp["initial_stock"]["FG1"] == [{"remaining_shelf_life": a, "quantity": q} for a, q in d.init_fg]
     assert len(inp["open_orders"]["production"]) == len(d.open_prod) and inp["warnings"] == d.warnings
-    assert len(inp["tables"]["Model_Assumptions"]["rows"]) == 85
+    assert len(inp["tables"]["Model_Assumptions"]["rows"]) == 86                  # v18.3: + D06
     src = inp["tables"]["Sourcing"]                                            # which supplier delivers which material
     item, supplier = src["columns"].index("ItemID"), src["columns"].index("SupplierID")
     assert [(r[item], r[supplier]) for r in src["rows"]] == [("RM1", "SUP_VPL"), ("RM2", "SUP_VPL"),
@@ -936,3 +937,28 @@ def test_a_failing_baseline_never_stops_the_run(capsys):
     block, sheets = worker.run_baseline(te.ms, object(), "license.sio", te.fake)   # not a RunResult
     assert block["error"].startswith("AttributeError") and sheets == {}
     assert "Traceback" in capsys.readouterr().err                                   # the details go to log.txt
+
+
+# ============================================================================
+# 12. ENGINE v18.3: firm production orders (D06) and certain open orders (J02)
+# ============================================================================
+def test_open_orders_must_arrive_with_certainty(api, done):
+    first = api.get(f"/runs/{done[0]}/sheets").json()["sheets"]["Open_Orders"]["rows"][0]["row"]
+    edit = [{"sheet": "Open_Orders", "row": first, "column": "ArrivalCertain", "value": "No"}]
+    r = api.post("/whatif/validate", json={"base_run": done[0], "edits": edit}).json()
+    assert r["valid"] is False and any("ArrivalCertain" in e and "J02" in e for e in r["errors"])   # engine's words
+
+
+def test_a_review_period_of_two_reports_its_firm_production_orders(api, done):
+    assert done[2]["headline"]["firm_orders"].startswith("R = 1: every week is a run")
+    review = row_of(api, done[0], "Settings", "ReviewPeriod")
+    edit = [{"sheet": "Settings", "row": review, "column": "Value", "value": 2}]
+    st = wait(api, api.post("/runs", data={"base_run": done[0], "edits": json.dumps(edit), "time_limit": "1",
+                                           "baseline": "false"}).json()["id"])
+    assert st["state"] == "done", st
+    res = api.get(f"/runs/{st['id']}/result").json()
+    summary = dict(res["sheets"]["Summary"]["rows"])
+    assert res["headline"]["firm_orders"] == summary["Firm production orders (D06)"]
+    assert not res["headline"]["firm_orders"].startswith("R = 1")
+    weeks = {r[0] for r in res["sheets"]["Commit_Now"]["rows"]}
+    assert {"Week 1", "Week 2"} <= weeks                                  # both committed weeks, exact quantities

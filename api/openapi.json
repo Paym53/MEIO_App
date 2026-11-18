@@ -1128,6 +1128,10 @@
       "type": "string",
       "title": "Review Period"
      },
+     "firm_orders": {
+      "type": "string",
+      "title": "Firm Orders"
+     },
      "start_policy": {
       "type": "string",
       "title": "Start Policy"
@@ -1221,6 +1225,7 @@
      "fill_rate_target_excel",
      "fill_rate_target_source",
      "review_period",
+     "firm_orders",
      "start_policy",
      "start_check",
      "start_repair_used",

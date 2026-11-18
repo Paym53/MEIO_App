@@ -284,10 +284,10 @@ CONTRACT_VERSION = 4
 
 
 # ---------------------------------------------------------------------------- shared helpers
-def build(d, x, R=60, seed=3, detail=False):
+def build(d, x, R=60, seed=3, detail=False, layout=None):
     env = fake.Env("lic", True)
     env.set_stochastic_parameters(R, 0.0)
-    lay = ms.PolicyLayout(d)
+    lay = layout or ms.PolicyLayout(d)
     model = ms.build_model(fake, env, d, lay, x, seed, R, detail=detail)
     env.evaluate()
     return env, lay, model
@@ -319,10 +319,10 @@ def v(term, n):
     return np.full(n, float(term)) if not hasattr(term, "get_values") else np.asarray(term.get_values())
 
 
-def check_equal(d, x, R=60, seed=3):
+def check_equal(d, x, R=60, seed=3, layout=None):
     """Every quantity the model exposes equals the reference simulator in every scenario, including all
     report series of the out-of-sample model (detail=True, L05–L07) and the conservation identities."""
-    env, lay, model = build(d, x, R, seed, detail=True)
+    env, lay, model = build(d, x, R, seed, detail=True, layout=layout)
     res = ref.MEIOSimulator(d, seeker_scenarios(model, d)).run(lay.decode(x), detail=True)
     rec = res.detail
     np.testing.assert_allclose(model.cost.get_values(), res.cost, rtol=1e-10, atol=1e-6)
@@ -346,6 +346,10 @@ def check_equal(d, x, R=60, seed=3):
             np.testing.assert_allclose(v(model.rm_end[(k.id, t)], R), rec[f"{k.id}_end"][:, t], atol=1e-9)
             if k.perishable:
                 np.testing.assert_allclose(v(model.rm_waste[(k.id, t)], R), rec[f"{k.id}_waste"][:, t], atol=1e-9)
+    for t, term in (model.firm or {}).items():                    # firm production orders (D06)
+        np.testing.assert_allclose(v(term, R), res.firm[t], atol=1e-9)
+    for key, term in (model.firm_start or {}).items():
+        np.testing.assert_array_equal(v(term, R) > 0.5, res.firm_start[key], err_msg=str(key))
     assert model.objective.get_value() == pytest.approx(res.cost.mean(), rel=1e-12)
     check_detail_equal(d, model, rec, R)
     check_conservation(d, model, R)
@@ -582,6 +586,7 @@ EXCEL_CHECKS = {   # Excel check → edit of an openpyxl copy → message of the
     "C14 open order quantity 0": (_set("Open_Orders", "PO-RM1-01", 6, 0), "Quantity must be > 0"),
     "C14 placed in week 1": (_set("Open_Orders", "PO-RM3-02", 7, 1), "PlacedInPeriod must be a whole week ≤ 0"),
     "C14 arrival week 0": (_set("Open_Orders", "PRD-FG1-01", 8, 0), "ExpectedArrivalPeriod must be a whole week ≥ 1"),
+    "C14 arrival not certain": (_set("Open_Orders", "PO-RM3-01", 9, "No"), "ArrivalCertain must be empty or Yes"),
 }
 VALID_EDITS = {
     "price change": _set("Costs", "RM3", 6, 3.5),
@@ -590,6 +595,7 @@ VALID_EDITS = {
     "product target 97%": _set("Items", "FG1", 6, 0.97),
     "Amazon served first": lambda wb: (_set("Channels", "AMZ", 6, 1)(wb), _set("Channels", "D2C", 6, 3)(wb)),
     "review period 4 weeks": S("ReviewPeriod", 4),
+    "open order ArrivalCertain empty": _set("Open_Orders", "PO-RM3-01", 9, None),
 }
 
 
@@ -680,17 +686,15 @@ def test_model_equals_reference_fixed_lead_times(name):
 
 
 @pytest.mark.parametrize("name", ["start", "random_small", "random_wide"])
-def test_model_equals_reference_stochastic_lead_times_and_uncertain_open_orders(name):
+def test_model_equals_reference_stochastic_lead_times_and_partly_aged_open_orders(name):
     d = copy.deepcopy(D0)
     d.prod_lead_time = ref.LeadTime(np.array([6, 8]), np.array([0.6, 0.4]))
     for k in d.rms:
         k.lead_time = ref.LeadTime(np.array([k.lead_time.min, k.lead_time.min + 4]), np.array([0.7, 0.3]))
-    for o in d.open_rm["RM3"]:
-        o["certain"] = False
     d.open_prod[1]["remaining"] = 30
     d.open_rm["RM3"][0]["remaining"] = 45                         # open orders arriving partly aged (J02)
     _, _, model, _ = check_equal(d, policies(d)[name], R=80)
-    assert any(not isinstance(a, int) for a in model.open_rm_arrival["RM3"])
+    assert all(isinstance(a, int) for a in model.open_rm_arrival["RM3"])     # open orders arrive with certainty (J02)
 
 
 def test_receipts_include_partly_aged_open_orders_in_the_same_week():
@@ -789,10 +793,11 @@ def test_review_period_1_is_exactly_the_v18_model():
             assert got == V18_START[f"{name} z{z}"], (name, z, got)
 
 
-@pytest.mark.parametrize("R", [2, 4])
+@pytest.mark.parametrize("R", [2, 4, 5])
 def test_model_equals_reference_with_a_review_period(R):
-    """The planned position between runs (A03) is written a second time in the reference: same in every scenario,
-    with fixed and with uncertain lead times; the zero policy checks that s = 0 never orders (planned position ≥ 0)."""
+    """The planned position between runs (A03) and the firm orders with their queue (D06) are written a second time in
+    the reference: same in every scenario, with fixed and with uncertain lead times; the zero policy checks that s = 0
+    never orders (planned position ≥ 0). The search model (detail=False) gives the same cost."""
     for name in ("start", "random_wide", "zero"):
         d = copy.deepcopy(D0)
         d.review_period = R
@@ -800,7 +805,128 @@ def test_model_equals_reference_with_a_review_period(R):
     d = stochastic_data()
     d.review_period = R
     for name in ("start", "random_small"):
-        check_equal(copy.deepcopy(d), policies(d)[name], R=80)
+        _, lay, model, res = check_equal(copy.deepcopy(d), policies(d)[name], R=80)
+        _, _, search = build(copy.deepcopy(d), policies(d)[name], 80, 3, detail=False)
+        np.testing.assert_allclose(search.cost.get_values(), res.cost, rtol=1e-10, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------- firm production orders (D06)
+def repro_data(stochastic):
+    """The app session's reproductions (change request 17.11.): R = 4, RM3 lead time 1 week, the three open RM3 orders
+    deleted, the fresh RM3 lot 1,800 → 1,300 kg. Repro B: every lead time uncertain."""
+    d = copy.deepcopy(D0)
+    d.review_period = 4
+    d.open_rm["RM3"] = []
+    d.init_rm["RM3"] = [(a, 1300.0 if a == 49 else q) for a, q in d.init_rm["RM3"]]
+    lt = lambda vals, probs: ref.LeadTime(np.array(vals), np.array(probs))
+    rm = {k.id: k for k in d.rms}
+    rm["RM3"].lead_time = lt([1, 3], [0.9, 0.1]) if stochastic else lt([1], [1.0])
+    if stochastic:
+        rm["RM1"].lead_time = rm["RM2"].lead_time = lt([4, 6], [0.8, 0.2])
+        rm["RM4"].lead_time = lt([12, 14], [0.8, 0.2])
+        d.prod_lead_time = lt([6, 8], [0.8, 0.2])
+    return d
+
+
+def repro_policy(d, fg_weeks, rm_zero=(), rm_max=()):
+    """The start policy with FG weeks set by hand {week: (s, S)}, raw-material weeks without an order and raw-material
+    weeks that order the maximum."""
+    lay = ms.PolicyLayout(d)
+    pol = ms.start_policy(d)
+    for t, (s_, S_) in fg_weeks.items():
+        pol["FG"][0][t], pol["FG"][1][t] = s_, S_
+    for j, t in rm_zero:
+        pol[j][0][t] = pol[j][1][t] = 0.0
+    for j, t in rm_max:
+        pol[j][0][t], pol[j][1][t] = 1e5, 1e5 + 1000
+    x = lay.encode(pol, clip=False)
+    lay.ub_var = [max(u, v_) for u, v_ in zip(lay.ub_var, x)]
+    return x, lay
+
+
+def test_repro_a_production_starts_in_week_3_not_as_a_catch_up_in_week_5():
+    """Repro A (fixed lead times): week 2 cannot produce (RM3 2,500 kg = 5,000 cans < MOQ). v18.2 counted the wish of
+    week 2 in the planned position and produced nothing until the run in week 5. With firm orders (D06) week 2's
+    firm order is 0, so week 3 orders again and starts it (3,500 kg cover the MOQ)."""
+    d = repro_data(stochastic=False)
+    x, lay = repro_policy(d, {1: (17500, 17500), 2: (19400, 25400), 3: (19900, 25900), 4: (20400, 26900)},
+                          rm_zero=[("RM3", 1)], rm_max=[("RM3", 2), ("RM3", 3)])   # strawberries ordered weeks 2, 3
+    _, _, model, res = check_equal(d, x, R=40, layout=lay)
+    firm = {t: v(model.firm[t], 40) for t in (2, 3, 4)}
+    assert (firm[2] == 0).all() and (firm[3] >= d.prod_moq).all() and (firm[3] % d.prod_batch == 0).all()
+    np.testing.assert_array_equal(v(model.prod_qty[3], 40), firm[3])                 # started in week 3
+    assert (v(model.firm_start[(3, 3)], 40) == 1).all()
+
+
+def test_repro_b_firm_order_waits_for_late_strawberries_and_starts_when_they_arrive():
+    """Repro B (every lead time uncertain): the firm order of week 2 is 6,500 cans (pineapple 1,300 kg ÷ 0.2), the
+    same in every future; it starts in week 2 when the week-1 strawberries arrive on time (90%), otherwise it waits
+    and starts in week 4; weeks 3–4 order nothing more; Commit_Now shows the firm number and when it starts."""
+    d = repro_data(stochastic=True)
+    x, lay = repro_policy(d, {1: (0, 0), 2: (24400, 30400), 3: (19200, 25200), 4: (19600, 25600)},
+                          rm_zero=[("RM3", 2), ("RM3", 3)])
+    model, oos, res = detail_oos(d, x, R=400, layout=lay)
+    f2 = v(model.firm[2], 400)
+    assert (f2 == 6500).all() and (v(model.firm[3], 400) == 0).all() and (v(model.firm[4], 400) == 0).all()
+    on_time, late = v(model.firm_start[(2, 2)], 400) > 0.5, v(model.firm_start[(2, 4)], 400) > 0.5
+    assert (on_time ^ late).all() and 0.04 < late.mean() < 0.17                     # 10% late strawberries
+    assert not (v(model.firm_start[(2, 3)], 400) > 0.5).any()
+    np.testing.assert_array_equal(v(model.prod_qty[4], 400)[late], 6500)             # the late futures start in week 4
+    assert oos[("firm", "mean", 2)] == oos[("firm", "p10", 2)] == oos[("firm", "p90", 2)] == 6500
+    note = ms.commit_notes(oos, d)[("prod", 2)]
+    assert note.startswith(f"starts week 2 (week 4 in {late.mean():.0%} of futures); arrives at DC in week 8"), note
+    assert "Firm" not in note and ms.firm_order_text(oos, d).startswith("weeks 1–4: week 2: 6,500, starts on time in")
+    check_equal(d, x, R=80, layout=lay)
+
+
+def test_two_waiting_firm_orders_start_together_as_one_order():
+    """D06: firm orders waiting for the same late material start together once it arrives: one production order,
+    one fixed cost, oldest first."""
+    d = copy.deepcopy(D0)
+    d.review_period, d.prod_moq = 4, 1000
+    rm4 = [k for k in d.rms if k.id == "RM4"][0]
+    rm4.lead_time = ref.LeadTime(np.array([1, 3]), np.array([0.6, 0.4]))           # planned 1 week, late: 3 weeks
+    d.init_rm["RM4"], d.open_rm["RM4"] = [], []
+    x, lay = repro_policy(d, {1: (0, 0), 2: (20000, 20400), 3: (21000, 21600)}, rm_zero=[("RM4", 2), ("RM4", 3)])
+    _, _, model, res = check_equal(d, x, R=120, layout=lay)
+    f2, f3 = v(model.firm[2], 120), v(model.firm[3], 120)
+    assert (f2 >= 1000).all() and (f3 >= 1000).all()
+    both = (v(model.firm_start[(2, 4)], 120) > 0.5) & (v(model.firm_start[(3, 4)], 120) > 0.5)
+    assert both.any()                                                                 # the late futures
+    np.testing.assert_array_equal(v(model.prod_qty[4], 120)[both], (f2 + f3)[both])   # one combined order
+    assert (v(model.prod_qty[2], 120)[both] == 0).all() and (v(model.prod_qty[3], 120)[both] == 0).all()
+
+
+def test_a_firm_order_still_waiting_is_cancelled_at_the_next_run():
+    """R = 2: a firm order of week 2 whose material is late is cancelled at the run in week 3 and costs nothing."""
+    d = copy.deepcopy(D0)
+    d.review_period, d.prod_moq = 2, 1000
+    rm4 = [k for k in d.rms if k.id == "RM4"][0]
+    rm4.lead_time = ref.LeadTime(np.array([1, 5]), np.array([0.6, 0.4]))
+    d.init_rm["RM4"], d.open_rm["RM4"] = [], []
+    x, lay = repro_policy(d, {1: (0, 0), 2: (20000, 20400), 3: (0, 0), 4: (0, 0)}, rm_zero=[("RM4", 2)])
+    _, _, model, res = check_equal(d, x, R=120, layout=lay)
+    started = v(model.firm_start[(2, 2)], 120) > 0.5
+    assert (v(model.firm[2], 120) >= 1000).all() and started.any() and (~started).any()
+    for t in (3, 4):                                       # the next cycle (s = 0) does not start the old order
+        assert (v(model.prod_qty.get(t, 0.0), 120)[~started] == 0).all()
+    assert not any(u == 2 and w > 2 for u, w in model.firm_start)
+
+
+@pytest.mark.parametrize("R", [1, 2, 4, 6, 8])
+@pytest.mark.parametrize("lead", ["fixed", "stochastic"])
+def test_commit_now_quantities_are_exact_whole_steps_in_every_future(R, lead):
+    """Every decision of weeks 1..R is the same in every future and a whole multiple of its step (L03, D06)."""
+    d = copy.deepcopy(D0) if lead == "fixed" else stochastic_data()
+    d.review_period = R
+    for name in ("start", "random_small"):
+        _, _, model = build(copy.deepcopy(d), policies(d)[name], 60, 3)
+        for t in range(1, R + 1):
+            F = v(model.firm.get(t, 0.0), 60)
+            assert np.ptp(F) == 0 and F[0] % d.prod_batch == 0 and (F[0] == 0 or F[0] >= d.prod_moq), (name, t)
+            for k in d.rms:
+                q = v(model.rm_order.get((k.id, t), 0.0), 60)
+                assert np.ptp(q) == 0 and q[0] % k.multiple == 0 and q[0] <= k.max_order, (name, t, k.id)
 
 
 def _reference_run(d, x, scen):
@@ -1107,9 +1233,9 @@ def test_search_model_has_no_report_series():
     assert model.objective.get_value() == model_d.objective.get_value()
 
 
-def detail_oos(d, x, R=150, seed=7):
+def detail_oos(d, x, R=150, seed=7, layout=None):
     """One out-of-sample batch done by hand: the numbers section 6 reads, and the reference on the same scenarios."""
-    env, lay, model = build(d, x, R, seed, detail=True)
+    env, lay, model = build(d, x, R, seed, detail=True, layout=layout)
     readers = ms.report_numbers(model, d)
     env.evaluate()
     oos = ms.derived_numbers({k: r() for k, r in readers.items()}, d)
@@ -1129,8 +1255,6 @@ def stochastic_data():
     d.prod_lead_time = ref.LeadTime(np.array([6, 8]), np.array([0.6, 0.4]))
     for k in d.rms:
         k.lead_time = ref.LeadTime(np.array([k.lead_time.min, k.lead_time.min + 4]), np.array([0.7, 0.3]))
-    for o in d.open_rm["RM3"]:
-        o["certain"] = False
     return d
 
 
@@ -1937,9 +2061,9 @@ def test_noise_and_direction_logic():
 # ============================================================================
 
 
-ENGINE_SHA256 = {   # engine v18.2 — set by the engine session (python test_engine.py --fingerprint)
-    "meio_seeker_stochastic.py": "64aebc1790771a64c11bc0d7d911be26dfe5c453a62c4e77fa2ba2e80a1a7c41",
-    "reference_simulator.py": "a308374a5ae34f9798d4457a0cdcfe16e470861630f14ce1844f4019680c9025",
+ENGINE_SHA256 = {   # engine v18.3 — set by the engine session (python test_engine.py --fingerprint)
+    "meio_seeker_stochastic.py": "ea2e9ea306abab179ffe2c81f36acdf876cc15e2243d88dcfea5453cdb10c500",
+    "reference_simulator.py": "4da487d30d35d6b3d9913c46de7f349ea018523bd53c3611c80674d64ab721fd",
     "meio_stress_tests.py": "f0fc2fe4fe372f045874de1d35846961eb1eb01d027a24b91810c17982af7a5c",
 }
 

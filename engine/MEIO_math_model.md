@@ -1,6 +1,6 @@
-# MEIO model: mathematical formulation for Seeker (v1.3, implemented in meio_seeker_stochastic.py v18.1)
+# MEIO model: mathematical formulation for Seeker (v1.4, implemented in meio_seeker_stochastic.py v18.3)
 
-Companion to `MEIO_model_spec.md` (rule IDs in brackets), the data template (v18.1 layout) and `meio_seeker_stochastic.py`. Its
+Companion to `MEIO_model_spec.md` (rule IDs in brackets), the data template (v18.3 layout) and `meio_seeker_stochastic.py`. Its
 section 3 writes §3–§5 below once, as Seeker Terms (K06). `reference_simulator.py` implements the same equations a second time,
 independently, for the tests.
 
@@ -8,7 +8,7 @@ independently, for the tests.
 - one fill-rate target per product, and the **expected** fill rate per cell as the rule (§5, H04/H05; the chance constraint and
   the chance level are gone);
 - serving order from the input ShortagePriority (H02);
-- the review period R with the **planned position** between runs (§3, A03);
+- the review period R with the **planned position** between runs and **firm production orders** (§3, A03, D06);
 - the start policy and start check (§7, K07/K21).
 
 **Key modeling principle.** In Seeker the inventory dynamics are not constraints the solver has to satisfy, as they would be in
@@ -68,10 +68,10 @@ therefore depend only on the state at the run and on the forecast; they are exac
 The (s,S) rules act on a position $\widetilde{IP}$: the actual position (below) in a run week, the **planned position** in the
 weeks between runs:
 
-$$\widetilde{IP}^{FG}_t=\begin{cases}IP^{FG}_t & t=r(t)\\ \max\big(0,\ \widetilde{IP}^{FG}_{t-1}+\hat q^{\,plan}_{t-1}-\mu_{t-1}\big) & \text{otherwise}\end{cases}\qquad
+$$\widetilde{IP}^{FG}_t=\begin{cases}IP^{FG}_t & t=r(t)\\ \max\big(0,\ \widetilde{IP}^{FG}_{t-1}+F_{t-1}-\mu_{t-1}\big) & \text{otherwise}\end{cases}\qquad
 \widetilde{IP}^{k}_t=\begin{cases}IP^{k}_t & t=r(t)\\ \max\big(0,\ \widetilde{IP}^{k}_{t-1}+q^k_{t-1}-b_k\,\mu_{t-1}\big) & \text{otherwise}\end{cases}$$
 
-- The planned order is $\hat q^{\,plan}_t=\mathbb 1[\widetilde{IP}^{FG}_t<s_{FG,t}]\cdot\hat q_t$, before the raw-material check of E2.
+- The planned position counts the **firm production order** $F_t$ of E2 (D06), never the requested quantity $\hat q_t$.
 - The planned position never falls below 0 (lost sales). So $s=0$ still means "never order" (C06).
 - It is age-blind like the actual position (K22).
 - With $R=1$ every week is a run week and $\widetilde{IP}=IP$: the weekly model.
@@ -86,11 +86,24 @@ $$X^{FG}_{t,SL^{FG}} \mathrel{+}= \textstyle\sum_{n:A^P_n=t} q^P_n,\qquad X^k_{t
 production pipeline. It is age-blind: lots that will expire before they are sold still count (K22).
 $$IP^{FG}_t=\sum_{a\ge\rho^{min}}X^{FG}_{t,a}+\sum_{n:\,\text{placed}<t,\ A^P_n>t}q^P_n$$
 $$\hat q_t=\min\!\Big(U^P,\ \max\big(MOQ^P,\ m^P\lceil (S_{FG,t}-\widetilde{IP}^{FG}_t)/m^P\rceil\big)\Big)$$
-$$\text{avail}_k=\sum_{a\ge\varphi_k}X^k_{t,a},\qquad \check q=\min\!\Big(\hat q_t,\ m^P\Big\lfloor \min_k \tfrac{\text{avail}_k}{b_k}\,/\,m^P\Big\rfloor\Big)$$
-$$q^P_t=\mathbb 1[\widetilde{IP}^{FG}_t<s_{FG,t}]\cdot\mathbb 1[\check q\ge MOQ^P]\cdot\check q,\qquad A^P_t=\max\big(t+L^P_{t\omega},\ A^P_{prev}\big)\ \ \text{(no overtaking, E04)}$$
+$$\text{avail}_k=\sum_{a\ge\varphi_k}\widetilde X^k_{t,a},\qquad \check q=\min\!\Big(\hat q_t,\ m^P\Big\lfloor \min_k \tfrac{\text{avail}_k}{b_k}\,/\,m^P\Big\rfloor\Big)$$
+$$F_t=\mathbb 1[\widetilde{IP}^{FG}_t<s_{FG,t}]\cdot\mathbb 1[\check q\ge MOQ^P]\cdot\check q\qquad\text{(the firm order, D06)}$$
+**Planned material** $\widetilde X^k_t$ (D06): in a run week the actual lots $X^k_t$; between runs the lots of the run, plus the
+deliveries at their *planned* arrival week (open orders: $ExpectedArrivalPeriod$, J02; supplier orders: placement + the most
+likely lead time, no overtaking; an order overdue at the run: the week after the run), minus $b_kF_u$ reserved FEFO by the firm
+orders of earlier weeks $u$ of the cycle, aged like the actual lots (E6). So $F_t$ is the same in every scenario of the cycle;
+with fixed lead times $\widetilde X^k_t=X^k_t$.
+
+**Execution** (D06). In a run week $q^P_t=F_t$ (planned on the actual material). Between runs the firm orders of the cycle wait
+in a queue, oldest first, with waiting quantities $w_u$ ($w_u=F_u$ when placed). In week $t$, with $c_u=\sum_{v\le u}w_v$ over the
+queue and the actual usable stock $\text{avail}^{act}_k=\sum_{a\ge\varphi_k}X^k_{t,a}$:
+$$o_u=\prod_{v\le u}\mathbb 1\big[c_v\le U^P\big]\prod_k\mathbb 1\big[b_k\,c_v\le \text{avail}^{act}_k\big],\qquad q^P_t=\sum_u o_u\,w_u,\qquad w_u\leftarrow(1-o_u)\,w_u$$
+(oldest first, all or nothing per firm order, one start per week, D03). At the next run week the remaining $w_u$ are cancelled.
+$$A^P_t=\max\big(t+L^P_{t\omega},\ A^P_{prev}\big)\ \ \text{(no overtaking, E04)}$$
 Then $b_k q^P_t$ of each raw material leaves the RMW in the same week, FEFO among lots with $a\ge\varphi_k$ (B02). Several orders
-may be in the pipeline at once (D04). A production order planned at a run can come out smaller if its raw material is not on
-hand in its week.
+may be in the pipeline at once (D04). Production, fixed and transport costs are charged on $q^P_t$ (a combined start pays one
+fixed cost; cancelled firm orders cost nothing, I07). In the reported FG position a waiting firm order counts as released
+($IP^{FG}_t+\sum_u w_u$); in the echelon position (E3) it is not added again, its raw material is still in the RMW.
 
 **E3 RM review on the echelon** (C03, C04, D01), after E2:
 $$IP^k_t=\sum_{a\ge\varphi_k+1}X^{k,E2}_{t,a}+\sum_{n:\,A^k_n>t}q^k_n+b_k\big(IP^{FG}_t+q^P_t\big)$$

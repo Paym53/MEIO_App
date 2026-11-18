@@ -1,6 +1,59 @@
 # Engine v18.1: hand-over to the app session (everything since v17.1)
 
-> **Update v18.2 (13.11.) — if you already installed v18.1, this is the only change.**
+> **Update v18.3 (17.11.): your change request "firm production orders within a review cycle" (issues 1c, 1a, 1b).
+> If you installed v18.2, this box is the only change; from v18.1, read the v18.2 box below too.**
+> - Engine `2026-11-17 v18.3 (Seeker-only)`; **contract version 4 unchanged** (no sheet, column or `RunResult` field change).
+> - **What (new rule D06; changed A03, C01, D02, E03, I07, J02, K18, K19, L02, L03; 86 rules):** built as you specified.
+>   - Firm order F_t per FG review week of a cycle = the request cut to the **planned material**: stock at the run still usable
+>     in week t, plus deliveries at their planned arrival week (open orders at `ExpectedArrivalPeriod`; supplier orders at
+>     placement + the planned lead time, no overtaking; an order overdue at the run is expected the week after), minus what
+>     earlier firm orders of the cycle reserved (FEFO). Planned lead time = most likely value, on a tie the longer one.
+>   - The planned position counts F_t: P_{t+1} = max(0, P_t + F_t − μ_t).
+>   - Execution per future: a queue, oldest first; in each week the oldest waiting orders whose full quantities the actually
+>     usable material covers start together as one production order (one start per week, ≤ the maximum per order, all or
+>     nothing). Still waiting at the next run → cancelled, no cost. Costs when an order starts; one fixed cost per start.
+>   - Reported FG position (Bands `position`): a waiting order counts as released; the echelon position counts its raw
+>     material once.
+>   - **J02:** open orders arrive with certainty. `ArrivalCertain` must be empty or `Yes`; `No` is refused with sheet, row and
+>     field, in Python and in Excel (Open_Orders RowCheck ERROR, cross-checked with LibreOffice). The uncertain-open-order path is
+>     removed from the engine and the reference.
+>   - R = 1: identical to v18.2.
+> - **For the app:**
+>   - **Commit_Now:** same columns. Production row: `Quantity` = the firm order (whole batches, the same in every future); note
+>     e.g. `starts week 2 (week 4 in 9% of futures); arrives at DC in week 8 (week 10 in 20%)`, plus `; cancelled at the next run
+>     in x% of futures (no material)` when that happens; `no production order` when F = 0. The old note `raw material permitting
+>     (P10 …, P90 …)` is gone. Transfers = BOM × the firm order, note `leaves the RMW when the production order starts`. Supplier
+>     orders: `arrives at RMW in week 9 (week 13 in 10%)` (the most likely week first, then the other weeks with their shares).
+>   - **Summary:** new row `Firm production orders (D06)`, e.g. `weeks 1–4: week 2: 6,500, starts on time in 91% of futures,
+>     waits for material in 9%, cancelled at the next run in 0%`; at R = 1 a fixed text.
+>   - **Decisions:** same columns; `Production …` is the quantity *started* that week (it follows the queue).
+>   - **oos keys (R ≥ 2, weeks 1..R):** `("firm", "mean"|"p10"|"p90", t)`, `("firm_start", t, w)` (share of futures in which the
+>     firm order of week t starts in week w), `("firm_arr", t, a)` (share started and at the DC by week a). Not added: the
+>     optional Bands series `production_start_week` (so the contract stays 4).
+>   - **Input:** a workbook with `ArrivalCertain = No` now fails validation (show the message as usual).
+>   - **Run time:** Seeker Terms on the template: R = 1 13,099 (unchanged); R = 4 16,451 with fixed and 27,240 with uncertain
+>     lead times (R = 1 with uncertain: 24,637). Expect roughly 10–25% longer evaluations at R = 4; not yet measured on Seeker.
+> - **Acceptance criteria:**
+>
+>   | Criterion | Result |
+>   |---|---|
+>   | R = 1 regression (template, REF-EQ variants, V18_START) | identical; 13,099 Terms |
+>   | Engine = reference (independent D06) every scenario, R = 2, 4, 5, fixed + uncertain lead times, incl. search model | ✓ |
+>   | Repro A: firm order placed and started in week 3, no catch-up in week 5 | ✓ (`test_repro_a_…`) |
+>   | Repro B: week 2 = 6,500 in every future, note `starts week 2 (week 4 in ≈ 9% of futures)`, nothing new in weeks 3–4, late futures start in week 4 | ✓ (`test_repro_b_…`, 400 futures: late share ≈ 9–10%) |
+>   | Two waiting orders start together as one order, one fixed cost | ✓ (`test_two_waiting_…`) |
+>   | Waiting order cancelled at the next run, no cost | ✓ (`test_a_firm_order_still_waiting_…`) |
+>   | Commit Now integrity, R ∈ {1, 2, 4, 6, 8} × fixed / uncertain | whole steps, the same in every future ✓ |
+>   | Input check `ArrivalCertain = No` refused; empty / Yes pass | ✓ (Python and Excel) |
+>   | Mutants caught: wish counted, partial start, two starts, not cancelling (+ material/receipt variants) | ✓ (see F) |
+>   | Docs: spec, Model_Assumptions, math model (v1.4), this box, CLAUDE.md | ✓ |
+>
+>   The property "P_{t+1} = max(0, P_t + F_t − μ_t)" is checked through repro A and the "wish counted" mutant (the planned
+>   position is internal). "F_t ≤ the planned-material cap" holds by construction and through engine = reference.
+> - Tests: **159** (17 new or changed); fingerprints updated; template: `Open_Orders` (ArrivalCertain help text, validation
+>   list `Yes`, RowCheck) and `Model_Assumptions` (86 rules).
+
+> **Update v18.2 (13.11.)**
 > - Engine `2026-11-13 v18.2 (Seeker-only)`; contract version **4 unchanged** (no sheet, column or `RunResult` change).
 > - **What:** one more start-repair step **R1b** between R1 and R2 (K21): if R1 leaves a cell missed, R1 is repeated in
 >   the same weeks from the start with z + 0.5 before R2 orders maximum supply. Skipped when z is already 4.
@@ -28,7 +81,7 @@ below) and `MEIO_math_model.md`.
    - template: `MEIO_Data_Template.xlsx`
    - documents: `MEIO_model_spec.md`, `MEIO_math_model.md`, `CLAUDE.md`, `MEIO_shelf_life_aware_policies.md`
    - Delete `ENGINE_v17_RESPONSE.md`; this note replaces it.
-2. Run `python -m pytest -q test_engine.py`: **142 passed** with v18.2 (v18.1: 141; v17.1: 117), about 2.5 min.
+2. Run `python -m pytest -q test_engine.py`: **159 passed** with v18.3 (v18.2: 142; v18.1: 141; v17.1: 117), about 2.5 min.
 3. **`CLAUDE.md`:** if you edited your copy, merge §1, §4, §5, §6 and §8 instead of replacing it.
 4. **New files:**
    - `MEIO_math_model.md`: the formal model, now part of the bundle.
@@ -332,8 +385,8 @@ below) and `MEIO_math_model.md`.
 
 | Check | Result |
 |---|---|
-| Test suite | 142 tests with v18.2 (v18.1: 141; v17.1: 117) |
-| Mutation test | 46/46 deliberate rule errors caught, 12 of them for the review period; v18.2: 49/49 (3 for R1b) |
+| Test suite | 159 tests with v18.3 (v18.2: 142; v18.1: 141; v17.1: 117) |
+| Mutation test | 46/46 deliberate rule errors caught, 12 of them for the review period; v18.2: 49/49 (3 for R1b); v18.3: 55/55 (7 for firm orders D06) |
 | Engine = reference simulator in every scenario | incl. R = 2, 3, 4 and uncertain lead times |
 | R = 1 = v18.0 exactly | ✓ |
 | Committed weeks identical in every future; cycles don't react to later demand | ✓ |

@@ -235,9 +235,10 @@ def load_data(path):
     if oo is not None and len(oo):
         oo = oo.loc[oo["OrderType"].notna()]
         for _, r in oo.iterrows():
+            if str(r.get("ArrivalCertain", "")).strip().lower() not in ("", "yes", "nan", "none"):
+                raise ValueError(f"Open order {r.get('OrderID')}: open orders arrive with certainty (J02)")
             rec = dict(qty=float(r[_col(oo, "Quantity")]), placed=int(_num(r["PlacedInPeriod"], 0)),
                        arrival=int(r["ExpectedArrivalPeriod"]),
-                       certain=str(r["ArrivalCertain"]).strip().lower() != "no",
                        remaining=_num(r[_col(oo, "RemainingShelfLifeAtArrival")]))
             if r["OrderType"] == "Production":
                 open_prod.append(rec)
@@ -348,19 +349,13 @@ def make_scenarios(d, n, seed):
     lt_rm = {k.id: sample_lead_times(k.lead_time, (n, H + 1), streams[3 + i]) for i, k in enumerate(d.rms)}
 
     def open_arrivals(orders, lt, rng):
-        """Open orders: fixed arrival if certain; otherwise sampled (conditional on not yet arrived).
+        """Open orders arrive in their ExpectedArrivalPeriod, with certainty (J02).
         No crossing (E04): each order arrives no earlier than the previously placed one."""
         orders = sorted(orders, key=lambda o: o["placed"])
         arr = np.zeros((n, len(orders)), dtype=int)
         last = np.zeros(n, dtype=int)
         for j, o in enumerate(orders):
-            if o["certain"]:
-                a = np.full(n, o["arrival"])
-            else:
-                ok = lt.values + o["placed"] >= 1
-                vals, p = (lt.values[ok], lt.probs[ok] / lt.probs[ok].sum()) if ok.any() else (np.array([1 - o["placed"]]), np.array([1.0]))
-                a = o["placed"] + rng.choice(vals, size=n, p=p)
-            arr[:, j] = np.maximum(a, last)
+            arr[:, j] = np.maximum(o["arrival"], last)
             last = arr[:, j]
         return orders, arr
 
@@ -374,6 +369,12 @@ def make_scenarios(d, n, seed):
 # ============================================================================
 # 3. SIMULATOR — the model dynamics (A04, E1–E6), vectorized over scenarios
 # ============================================================================
+def plan_lead(lt):
+    """D06: the lead time a plan counts on = the most likely value; on equal probabilities the longer one."""
+    order = sorted(zip(lt.probs, lt.values))                 # ascending by probability, then by value
+    return int(order[-1][1])
+
+
 def fefo_take(stock, need):
     """Take `need` units FEFO from lots stock[:, 0..m] ordered oldest → freshest.
     Returns the quantity taken from each lot (same shape as stock)."""
@@ -472,9 +473,24 @@ class MEIOSimulator:
         plan_fg, plan_order_fg = np.zeros(N), np.zeros(N)
         plan_rm = {k.id: np.zeros(N) for k in d.rms}
         plan_order_rm = {k.id: np.zeros(N) for k in d.rms}
+        # firm production orders within a cycle (D06)
+        RP = d.review_period
+        Lplan = {k.id: plan_lead(k.lead_time) for k in d.rms}
+        first_open = {k.id: max([0] + [int(sc.open_rm_arrival[k.id][0, j]) for j in range(len(d.open_rm[k.id]))])
+                      for k in d.rms}
+        rm_orders = {k.id: [] for k in d.rms}                    # (planned week, qty (N,), arrival (N,), rest shelf life)
+        for k in d.rms:
+            for j, o in enumerate(d.open_rm[k.id]):
+                age = (k.shelf_life if o["remaining"] is None else int(o["remaining"])) if k.perishable else 0
+                rm_orders[k.id].append((int(sc.open_rm_arrival[k.id][0, j]), np.full(N, o["qty"]),
+                                        sc.open_rm_arrival[k.id][:, j], age))
+        queue, PB, PIN, cycle_end = [], {}, {}, 0                # waiting firm orders, planned lots, planned receipts
+        firm, firm_start = {}, {}
 
         for t in range(1, H + 1):
             is_run = (t - 1) % d.review_period == 0              # weeks 1, 1+R, 1+2R, …
+            if is_run:
+                queue, cycle_end = [], t + RP - 1                # cancel what still waits (D06)
             # ---- E1: receipts (full shelf life, F01) ------------------------------------
             got = arr_fg[:, t].copy()
             X[:, SLf] += got
@@ -497,20 +513,50 @@ class MEIOSimulator:
                     pipe_rm[who] -= hit
                 if detail:
                     rec["fg_received" if who == "FG" else f"{who}_received"][:, t] += hit
+            if RP > 1 and not is_run:                            # planned receipts (D06)
+                for k in d.rms:
+                    if t in PIN[k.id]:
+                        PB[k.id] += PIN[k.id].pop(t)
 
-            # ---- E2: FG review at DC → production order (C01, C06, D02, D03, E04) -------
+            # ---- E2: FG review at DC → firm production order (C01, C06, D02, D06) ----
             s_t, S_t = policy["FG"][0][t], policy["FG"][1][t]
             ip_fg = X[:, rho_min:].sum(1) + pipe_fg              # sellable stock + pipeline (actual)
+            waiting = sum([e[1] for e in queue], np.zeros(N))   # firm orders released, waiting for material
             ip_use = ip_fg if is_run else np.maximum(0.0, plan_fg + plan_order_fg - exp_dem[t - 1])
             trigger = ip_use < s_t                               # strict trigger (C06)
             q_hat = np.minimum(d.prod_max, np.maximum(d.prod_moq, round_up(S_t - ip_use, d.prod_batch)))
-            plan_fg, plan_order_fg = ip_use, np.where(trigger, q_hat, 0.0)
+            lots = R if is_run else PB                           # actual material at a run, else the planned one
             cap = np.full(N, np.inf)                             # raw material availability (D02)
             for k in d.rms:
-                avail = R[k.id][:, k.min_remaining:].sum(1) if k.perishable else R[k.id][:, 0]
+                avail = lots[k.id][:, k.min_remaining:].sum(1) if k.perishable else lots[k.id][:, 0]
                 cap = np.minimum(cap, avail / k.bom)
             q_chk = np.minimum(q_hat, round_down(cap, d.prod_batch))
-            q_p = np.where(trigger & (q_chk >= d.prod_moq - EPS), q_chk, 0.0)
+            F = np.where(trigger & (q_chk >= d.prod_moq - EPS), q_chk, 0.0)
+            firm[t] = F
+            plan_fg, plan_order_fg = ip_use, F                   # planned position counts the firm order
+            if not is_run:
+                for k in d.rms:                                  # reserve the planned material
+                    if k.perishable:
+                        PB[k.id][:, k.min_remaining:] -= fefo_take(PB[k.id][:, k.min_remaining:], k.bom * F)
+                    else:
+                        PB[k.id][:, 0] -= k.bom * F
+            if is_run:
+                q_p = F
+                firm_start[(t, t)] = F > 0
+            else:                                                # oldest first, all or nothing, one start a week
+                queue.append([t, F.copy()])
+                have = {k.id: (R[k.id][:, k.min_remaining:].sum(1) if k.perishable else R[k.id][:, 0]) for k in d.rms}
+                total_w, go_on, q_p = np.zeros(N), np.ones(N, dtype=bool), np.zeros(N)
+                for e in queue:
+                    total_w = total_w + e[1]
+                    fits = total_w <= d.prod_max + EPS
+                    for k in d.rms:
+                        fits &= k.bom * total_w <= have[k.id] + 1e-6
+                    go_on &= fits
+                    firm_start[(e[0], t)] = go_on & (e[1] > 0)
+                    start = np.where(go_on, e[1], 0.0)
+                    q_p += start
+                    e[1] = e[1] - start
             placed = q_p > 0
             arrival = np.maximum(t + sc.lt_prod[:, t], last_prod)   # no overtaking (E04)
             arr_fg[rows[placed], arrival[placed]] += q_p[placed]
@@ -528,8 +574,17 @@ class MEIOSimulator:
             if d.transport_tiers is not None:
                 parts["transport"] += d.transport_tiers.cost(q_p)
             if detail:
-                rec["prod_qty"][:, t], rec["ip_fg"][:, t] = q_p, ip_fg
+                rec["prod_qty"][:, t], rec["ip_fg"][:, t] = q_p, ip_fg + waiting
                 rec["prod_arrival"][:, t] = np.where(placed, arrival, 0)
+            if RP > 1 and is_run:                                # the cycle's planned material (D06)
+                PB = {k.id: R[k.id].copy() for k in d.rms}
+                PIN = {k.id: {} for k in d.rms}
+                for k in d.rms:
+                    for (p, qty, arr_o, age) in rm_orders[k.id]:
+                        w = max(p, t + 1)
+                        if w <= cycle_end:
+                            due = np.where(arr_o > t, qty, 0.0)
+                            PIN[k.id].setdefault(w, np.zeros_like(R[k.id]))[:, age] += due
 
             # ---- E3: RM review at RMW on echelon position → supplier orders (C03, C04, D01)
             ip_fg_after = ip_fg + q_p
@@ -546,6 +601,11 @@ class MEIOSimulator:
                 arr_rm[k.id][rows[placed_k], arr_k[placed_k]] += q_k[placed_k]
                 pipe_rm[k.id] += q_k
                 last_rm[k.id] = np.where(placed_k, arr_k, last_rm[k.id])
+                p_plan = max(t + Lplan[k.id], first_open[k.id])  # planned arrival (D06)
+                age = k.shelf_life if k.perishable else 0
+                rm_orders[k.id].append((p_plan, q_k.copy(), arr_k.copy(), age))
+                if RP > 1 and max(p_plan, t + 1) <= cycle_end:
+                    PIN[k.id].setdefault(max(p_plan, t + 1), np.zeros_like(R[k.id]))[:, age] += q_k
                 parts["rm_ordering"] += k.fixed_cost * placed_k + k.var_cost * q_k
                 if detail:
                     rec[f"{k.id}_order"][:, t], rec[f"{k.id}_ip"][:, t] = q_k, ip_k
@@ -586,6 +646,9 @@ class MEIOSimulator:
                     w_k = R[k.id][:, :k.min_remaining + 1].sum(1)
                     R[k.id][:, :-1], R[k.id][:, -1] = R[k.id][:, 1:].copy(), 0.0
                     R[k.id][:, :k.min_remaining] = 0.0
+                    if RP > 1 and k.id in PB:                    # planned lots age too (D06)
+                        PB[k.id][:, :k.min_remaining + 1] = 0.0
+                        PB[k.id][:, :-1], PB[k.id][:, -1] = PB[k.id][:, 1:].copy(), 0.0
                     waste_cost += k.waste * w_k
                     if detail:
                         rec[f"{k.id}_waste"][:, t] = w_k
@@ -595,6 +658,7 @@ class MEIOSimulator:
         res = SimResult(total, parts, FR)
         if detail:
             res.detail = rec
+        res.firm, res.firm_start = firm, firm_start
         return res
 
 
