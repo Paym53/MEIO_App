@@ -28,6 +28,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -1013,3 +1014,18 @@ def test_an_unknown_stock_point_is_a_data_error(api, done):
 def test_bound_points_name_each_stock_point_once():
     layout = type("L", (), {"at_bound": lambda self, x: [("RM3", 12, 1), ("FG", 13, 1), ("RM3", 14, 1)]})()
     assert worker.bound_points(layout, []) == ["FG", "RM3"]
+
+
+def test_results_of_runs_made_before_the_newest_fields_are_still_served(api, done):
+    """A result.json from contract 5 (before firm orders, bound points and search limits) must still load (18.11.)."""
+    old = server.RUNS_DIR / "20261115-200500-0abc"
+    shutil.copytree(server.RUNS_DIR / done[0], old)
+    result = json.loads((old / "result.json").read_text(encoding="utf-8"))
+    for key in ("firm_orders", "bound_points"):
+        result["headline"].pop(key)
+    result["run_info"].pop("extra_cover_weeks")
+    result["contract_version"] = 5
+    (old / "result.json").write_text(json.dumps(result), encoding="utf-8")
+    r = api.get(f"/runs/{old.name}/result")
+    assert r.status_code == 200, r.text
+    assert (r.json()["headline"]["firm_orders"], r.json()["headline"]["bound_points"]) == ("", [])
