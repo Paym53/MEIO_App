@@ -620,7 +620,7 @@ class Headline(BaseModel):
     fill_rate_target_excel: float         # Items!TargetFillRate
     fill_rate_target_source: str          # "Excel Items!TargetFillRate of FG1" or the run's own target
     review_period: str                    # engine Summary "Review period (A03)": which weeks this run commits
-    firm_orders: str                      # engine Summary "Firm production orders (D06)" (v18.3): how they start
+    firm_orders: str = ""                 # engine Summary "Firm production orders (D06)" (v18.3); "" = older run
     start_policy: str                     # engine Summary "Start policy (warm start)"
     start_check: StartCheck
     start_repair_used: bool               # K21: show as a notice, not an error

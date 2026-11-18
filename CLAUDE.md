@@ -410,6 +410,9 @@ Browser → Lovable web app (own repo, made by Lovable; shows only API numbers, 
   `read_text(encoding="utf-8")` fix is part of v17.1; UTF-8 mode stays for the worker's piped output.
 - **Test double in the app:** `MEIO_TEST_DOUBLE=1` makes `api/worker.py` use the Seeker stand-in from `test_engine.py`
   (tests only). Results then carry `test_double: true` and `seeker_version` "FAKE …", and `/health` reports it.
+- **New result fields always get a default** (empty text, empty list, null): runs made before them must still load.
+  On 18.11. the required `headline.firm_orders` made every pre-v18.3 run fail to load (500), so the dashboard showed
+  "No product"; a test now serves a contract-5 result.json.
 - **Windows:** replacing a file another process is reading fails, so both `write_json` functions retry for up to 1 s.
 - Users: the user only, one token. Run history = folders in `runs/`, no database.
 - FillRates column names contain the scenario counts: match columns by prefix. Read the feasibility line from
