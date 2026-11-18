@@ -49,8 +49,13 @@ WHAT EACH SECTION DOES
   REVIEW PERIOD R (Settings!ReviewPeriod, A03): the model is run every R weeks (weeks 1, 1+R, 1+2R, …).
   Each run commits every decision of weeks 1..R as exact quantities; nothing inside a cycle reacts to the demand
   that actually happens. In a run week the (s,S) rule uses the actual inventory position; in the other weeks it
-  uses the PLANNED position = position at the last run + orders planned since − expected demand since. R = 1:
+  uses the PLANNED position = position at the last run + firm orders planned since − expected demand since. R = 1:
   every week is a run week (the v18 model).
+  FIRM PRODUCTION ORDERS (D06, R ≥ 2): the production order of a planned week is sized at the run to the raw
+  material the plan counts on (stock at the run + deliveries at their planned weeks − material already reserved);
+  that firm quantity is the same in every future and is what the planned position counts. If the material is late
+  in a future, the order waits and starts as soon as the material is there (waiting orders start together, oldest
+  first, all or nothing); what still waits at the next run is cancelled. Open orders arrive with certainty (J02).
 
   Inventory positions are NOT shelf-life aware (K22): the (s,S) rules compare s with positions that count
   all usable stock, also stock that will expire unsold; Seeker adapts through the weekly s,S values.
@@ -121,7 +126,7 @@ START_EXTRA_WEEKS_RM = 4       # RM cover window = max RM lead time + max produc
 START_LOT_WEEKS = 4            # order-up-to S = reorder point s + this many weeks of average demand (≥ MOQ,
                                # ≤ what one fresh lot can sell before it expires)
 
-SCRIPT_VERSION = "2026-11-13 v18.2 (Seeker-only)"
+SCRIPT_VERSION = "2026-11-17 v18.3 (Seeker-only)"
 EPS = 1e-9
 TIMINGS = []                                  # (phase, seconds) — printed at the end and written to the report
 
@@ -243,7 +248,7 @@ class ModelData:
     demand_q: np.ndarray     # (C, H+1, 10) quantiles, index t = 1..H
     init_fg: list            # [(remaining shelf life, qty)]
     init_rm: dict            # rm id -> [(remaining shelf life or None, qty)]
-    open_prod: list          # dicts: qty, placed, arrival, certain, remaining
+    open_prod: list          # dicts: qty, placed, arrival (certain, J02), remaining
     open_rm: dict            # rm id -> list of such dicts
     data_status: str = "unknown"
     warnings: list = None    # input-check warnings (K19)
@@ -663,6 +668,10 @@ def input_problems(xls):
         sl = item_sl.get(r["ItemID"])
         if rem is not None and not (_whole(rem) and 0 <= rem <= (sl if sl is not None else rem)):
             bad.append("RemainingShelfLifeAtArrival must be whole weeks within the shelf life")
+        cert = r.get("ArrivalCertain")
+        if not _blank(cert) and str(cert).strip().lower() != "yes":
+            bad.append("ArrivalCertain must be empty or Yes (open orders arrive in ExpectedArrivalPeriod with "
+                       "certainty, J02; update the week at each run if an order is late)")
         if bad:
             E.append(f"Open_Orders row {row_no(i)}: " + "; ".join(bad))
             continue
@@ -780,7 +789,6 @@ def _read_workbook(xls):
         for _, r in oo.iterrows():
             rec = dict(qty=float(r[_col(oo, "Quantity")]), placed=int(_num(r["PlacedInPeriod"], 0)),
                        arrival=int(r["ExpectedArrivalPeriod"]),
-                       certain=str(r["ArrivalCertain"]).strip().lower() != "no",
                        remaining=_num(r[_col(oo, "RemainingShelfLifeAtArrival")]))
             if r["OrderType"] == "Production":
                 open_prod.append(rec)
@@ -822,6 +830,12 @@ def _read_workbook(xls):
 def run_week(d, t):
     """The run (review) week whose information plans week t (A03): 1, 1 + R, 1 + 2R, … R = 1 → t itself."""
     return 1 + d.review_period * ((t - 1) // d.review_period)
+
+
+def planned_lead_time(lt):
+    """The lead time a plan counts on (D06): the most likely value of the distribution; on a tie the longer one."""
+    best = max(lt.probs)
+    return int(max(v for v, p in zip(lt.values, lt.probs) if p >= best - 1e-12))
 
 
 def echelon_lead_time(d):
@@ -1077,11 +1091,15 @@ class _Stream:
     """Orders from one source (production line or one supplier) and their arrivals, as Terms.
     No overtaking (E04): arrival = max(week + lead time, arrival of the previous order)."""
 
-    def __init__(self, T, open_orders, open_arrivals, lead_terms, fixed_lt):
+    def __init__(self, T, open_orders, open_arrivals, lead_terms, fixed_lt, plan_lead=0):
         self.T = T
         self.orders = []                        # (arrival: int or Term, qty: Term or float, rest shelf life or None)
         for o, a in zip(open_orders, open_arrivals):
             self.orders.append((a, o["qty"], o["remaining"]))
+        # planned arrival week of every order (D06): open orders at ExpectedArrivalPeriod (certain, J02); new orders
+        # at placement + the planned lead time, no overtaking (E04) — with a fixed lead time exactly the real arrival
+        self.plan = [int(a) for a in open_arrivals]
+        self.plan_lead, self.max_open = int(plan_lead), max(self.plan, default=0)
         self.lead = lead_terms                  # week -> int (fixed) or Term (stochastic)
         ints = [a for a, _, _ in self.orders if isinstance(a, int)]
         max_open = max(ints) if len(ints) == len(self.orders) and ints else (0 if not self.orders else None)
@@ -1100,6 +1118,7 @@ class _Stream:
             arr = self.T.max(base, self.last)
             self.last = self.T.env.if_(q > 0, arr, self.last)      # previous arrival only moves if an order is placed
         self.orders.append((arr, q, None))
+        self.plan.append(max(t + self.plan_lead, self.max_open))
         return arr
 
     def receipts(self, t, full_shelf_life):
@@ -1181,6 +1200,8 @@ class SeekerModel:
     holding: dict                              # week -> holding cost
     keep_alive: list                           # Python objects Seeker calls back into (must outlive env)
     detail: dict = None                        # report series (only built for the out-of-sample check, L05–L08)
+    firm: dict = None                          # week -> firm production order quantity (D06)
+    firm_start: dict = None                    # (week of the firm order, week) -> 1 if it starts that week (R ≥ 2)
 
 
 SUPPORTS_MAX_SAMPLE = {}
@@ -1263,36 +1284,27 @@ def build_model(skr, env, d, layout, x_start, seed, resolution, detail=False):
                                     [float(v) for v in lt.values], max_sample=max_sample)
                 for t in weeks}, False
 
-    def open_arrival_terms(orders, lt):
-        arrs, prev = [], None
-        for o in orders:                                         # sorted by placement (section 1)
-            if o["certain"]:
-                a = int(o["arrival"])
-            else:
-                ok = lt.values + o["placed"] >= 1
-                vals, p = (lt.values[ok], lt.probs[ok] / lt.probs[ok].sum()) if ok.any() else (np.array([1 - o["placed"]]), np.array([1.0]))
-                a = _with_max_sample(env.categorical_distribution, [float(x) for x in p],
-                                     [float(o["placed"] + v) for v in vals], max_sample=max_sample) \
-                    if len(vals) > 1 else int(o["placed"] + vals[0])
-            if prev is not None:                                 # open orders do not overtake each other either
-                if isinstance(a, int) and isinstance(prev, int):
-                    a = max(a, prev)
-                else:
-                    a = T.max(a if not isinstance(a, int) else T.C(a), prev if not isinstance(prev, int) else T.C(prev))
-            arrs.append(a)
-            prev = a
+    def open_arrival_terms(orders):
+        """Open orders arrive in ExpectedArrivalPeriod, with certainty (J02); sorted by placement (section 1),
+        they do not overtake each other either (E04)."""
+        arrs = []
+        for o in orders:
+            arrs.append(int(o["arrival"]) if not arrs else max(int(o["arrival"]), arrs[-1]))
         return arrs
 
     weeks_fg = [t for t in range(1, H + 1) if ("FG", t) in sig]
+    if d.review_period > 1:                                      # a waiting firm order can start in any week (D06)
+        weeks_fg = list(range(1, H + 1))
     lead_prod, fixed_p = lead_terms(d.prod_lead_time, weeks_fg)
-    open_prod_arr = open_arrival_terms(d.open_prod, d.prod_lead_time)
-    fg_stream = _Stream(T, d.open_prod, open_prod_arr, lead_prod, fixed_p)
+    open_prod_arr = open_arrival_terms(d.open_prod)
+    fg_stream = _Stream(T, d.open_prod, open_prod_arr, lead_prod, fixed_p, planned_lead_time(d.prod_lead_time))
     lead_rm, open_rm_arr, rm_stream = {}, {}, {}
     for k in d.rms:
         weeks_k = [t for t in range(1, H + 1) if (k.id, t) in sig]
         lead_rm[k.id], fixed_k = lead_terms(k.lead_time, weeks_k)
-        open_rm_arr[k.id] = open_arrival_terms(d.open_rm[k.id], k.lead_time)
-        rm_stream[k.id] = _Stream(T, d.open_rm[k.id], open_rm_arr[k.id], lead_rm[k.id], fixed_k)
+        open_rm_arr[k.id] = open_arrival_terms(d.open_rm[k.id])
+        rm_stream[k.id] = _Stream(T, d.open_rm[k.id], open_rm_arr[k.id], lead_rm[k.id], fixed_k,
+                                  planned_lead_time(k.lead_time))
 
     # ---- initial stock (J01): one Term per lot bucket ------------------------------------------
     fg = {}
@@ -1324,9 +1336,29 @@ def build_model(skr, env, d, layout, x_start, seed, resolution, detail=False):
     mu = demand_moments(d)[0]                                    # expected demand per week (planned position, A03)
     plan_fg = plan_q_fg = None                                   # planned FG position and planned order of last week
     plan_rm, plan_q_rm = {}, {}                                  # the same per raw material (echelon)
+    R = d.review_period
+    queue, firm, firm_start = [], {}, {}                         # firm production orders of the cycle (D06)
+    plan_book, plan_in, cycle_end = {}, {}, 0                    # planned RM lots and planned receipts (D06)
+
+    def planned_receipts(k, r):
+        """Deliveries of raw material k the run in week r plans with in its cycle (D06): every order not yet
+        arrived at the run, at its planned arrival week (an overdue one: next week). {week: {rest shelf life: qty}}"""
+        out, st = {}, rm_stream[k.id]
+        for (arr, q, rem), p in zip(st.orders, st.plan):
+            w = max(p, r + 1)
+            if w > r + R - 1 or (isinstance(arr, (int, np.integer)) and arr <= r):
+                continue
+            qq = q if not isinstance(q, (int, float)) else T.C(q)
+            amt = qq if isinstance(arr, (int, np.integer)) else env.if_(arr > r, qq, T.C(0))
+            a = (k.shelf_life if rem is None else int(rem)) if k.perishable else 0
+            out.setdefault(w, {}).setdefault(a, []).append(amt)
+        return {w: {a: T.sum(v) for a, v in lots.items()} for w, lots in out.items()}
+
     for t in range(1, H + 1):
         run = run_week(d, t) == t                                # run week: actual position; else planned (A03)
         plan_next = run_week(d, t + 1) != t + 1                  # next week is planned from this week's numbers
+        if run:
+            queue, cycle_end = [], t + R - 1                     # firm orders still waiting are cancelled (D06)
         # ---- E1: receipts with full shelf life (F01) -------------------------------------------
         got = fg_stream.receipts(t, d.fg_shelf_life)
         for a, term in got.items():
@@ -1340,29 +1372,65 @@ def build_model(skr, env, d, layout, x_start, seed, resolution, detail=False):
                 rm[k.id][key] = term if rm[k.id].get(key) is None else rm[k.id][key] + term
             if detail:
                 det[("receipts", k.id, t)] = tsum(list(got.values()))
+        if R > 1 and not run:                                    # planned receipts of the cycle (D06)
+            for k in d.rms:
+                for a, term in plan_in[k.id].pop(t, {}).items():
+                    plan_book[k.id][a] = term if plan_book[k.id].get(a) is None else plan_book[k.id][a] + term
 
-        # ---- E2: FG review → production order (C01, C06, A03, D02) ---------------------------
+        # ---- E2: FG review → firm production order (C01, C06, A03, D02, D06) ----------------
         ip_fg = T.sum([v for a, v in fg.items() if a >= rho_min]) + fg_stream.pipeline(t) if run or detail else None
-        if detail:
-            det[("position", d.fg_id, t)] = ip_fg                # actual position (C01)
+        if detail:                                               # actual position (C01); a waiting firm order counts
+            det[("position", d.fg_id, t)] = ip_fg + T.sum([e["wq"] for e in queue]) if queue else ip_fg  # (D06)
         ip_rule = ip_fg if run else env.max_0(plan_fg + plan_q_fg - float(mu[t - 1]))   # planned position (A03)
-        q, q_plan = None, 0.0
+
+        def usable(lots, k):                                     # raw material usable for production this week (F03)
+            return T.sum([v for a, v in lots.items() if a >= k.min_remaining]) if k.perishable else lots.get(0, T.C(0))
+
+        F, q_plan = None, 0.0
         pol = policy("FG", t)
         if pol is not None:
             s, S = pol
             q_hat = T.min(d.prod_max, T.max(d.prod_moq, d.prod_batch * env.ceil((S - ip_rule) / d.prod_batch - EPS)))
-            caps = []
-            for k in d.rms:
-                if k.perishable:
-                    avail = T.sum([v for a, v in rm[k.id].items() if a >= k.min_remaining])
-                else:
-                    avail = rm[k.id].get(0, T.C(0))
-                caps.append(avail / k.bom)
+            book = rm if run else plan_book                      # run week: actual material; else planned (D06)
+            caps = [usable(book[k.id], k) / k.bom for k in d.rms]
             cap = caps[0] if len(caps) == 1 else env.min(caps)
             q_chk = T.min(q_hat, d.prod_batch * env.floor(cap / d.prod_batch + EPS))
-            q = (ip_rule < s) * (q_chk >= d.prod_moq - EPS) * q_chk      # produced (raw material permitting)
+            F = (ip_rule < s) * (q_chk >= d.prod_moq - EPS) * q_chk      # the firm order (D02, D06)
+            firm[t] = F
             if plan_next:
-                q_plan = (ip_rule < s) * q_hat                   # planned at the run, before the material check
+                q_plan = F                                       # the planned position counts the firm order (D06)
+            if not run:                                          # it reserves its planned material (D06)
+                for k in d.rms:
+                    if k.perishable:
+                        _fefo(T, plan_book[k.id], sorted(a for a in plan_book[k.id] if a >= k.min_remaining), k.bom * F)
+                    else:
+                        plan_book[k.id][0] = plan_book[k.id].get(0, T.C(0)) - k.bom * F
+
+        # ---- execution (D06): the firm orders waiting, oldest first, start together while the material actually
+        #      usable this week covers their full quantities (one start per week, at most the maximum per order)
+        if run:
+            q = F                                                # planned on today's material: starts now
+            if R > 1 and F is not None:
+                firm_start[(t, t)] = F > 0
+        else:
+            queue = queue + ([{"u": t, "wq": F}] if F is not None else [])
+            q = None
+            if queue:
+                avail = [usable(rm[k.id], k) for k in d.rms]
+                cum = ok = None
+                started = []
+                for e in queue:
+                    cum = e["wq"] if cum is None else cum + e["wq"]
+                    cover = cum <= d.prod_max + EPS
+                    for k, av in zip(d.rms, avail):
+                        cover = cover * (k.bom * cum <= av + 1e-6)
+                    ok = cover if ok is None else ok * cover
+                    firm_start[(e["u"], t)] = ok * (e["wq"] > 0)
+                    go = ok * e["wq"]
+                    started.append(go)
+                    e["wq"] = e["wq"] - go                       # all or nothing per firm order
+                q = T.sum(started)
+        if q is not None:
             prod_arr[t] = fg_stream.add(t, q)
             prod_qty[t] = q
             for k in d.rms:                                       # transfer RMW → KAJA (B02), FEFO
@@ -1376,6 +1444,9 @@ def build_model(skr, env, d, layout, x_start, seed, resolution, detail=False):
                 costs["transport"].append(tier_cost(d.transport_tiers, q))
 
         plan_fg, plan_q_fg = ip_rule, q_plan
+        if R > 1 and run:                                        # the cycle plans from today's material (D06)
+            plan_book = {k.id: dict(rm[k.id]) for k in d.rms}
+            plan_in = {k.id: planned_receipts(k, t) for k in d.rms}
 
         # ---- E3: RM review on echelon position (C03, C04, A03, D01) ---------------------------
         ip_after = None if ip_fg is None else (ip_fg if q is None else ip_fg + q)
@@ -1398,6 +1469,12 @@ def build_model(skr, env, d, layout, x_start, seed, resolution, detail=False):
             plan_rm[k.id], plan_q_rm[k.id] = ip_k, qk
             rm_arr[(k.id, t)] = rm_stream[k.id].add(t, qk)
             rm_order[(k.id, t)] = qk
+            if R > 1:                                            # planned receipt of this order in the cycle (D06)
+                w = max(rm_stream[k.id].plan[-1], t + 1)
+                if w <= cycle_end:
+                    a = k.shelf_life if k.perishable else 0
+                    lots = plan_in[k.id].setdefault(w, {})
+                    lots[a] = qk if lots.get(a) is None else lots[a] + qk
             costs["rm_ordering"] += [k.fixed_cost * (qk > 0), k.var_cost * qk]
 
         # ---- E4: demand, channels by priority, FEFO among eligible lots (H01–H04) -------------
@@ -1436,6 +1513,8 @@ def build_model(skr, env, d, layout, x_start, seed, resolution, detail=False):
                     rm_waste[(k.id, t)] = T.sum([v for a, v in rm[k.id].items() if a <= k.min_remaining])
                     waste.append(k.waste * rm_waste[(k.id, t)])
                 rm[k.id] = {a - 1: v for a, v in rm[k.id].items() if a > k.min_remaining}
+                if R > 1 and plan_next:                          # planned lots age the same way (D06)
+                    plan_book[k.id] = {a - 1: v for a, v in plan_book[k.id].items() if a > k.min_remaining}
         if waste:
             costs["waste"].append(T.sum(waste))
 
@@ -1462,7 +1541,7 @@ def build_model(skr, env, d, layout, x_start, seed, resolution, detail=False):
         env.enforce_geq(fr_mean[(ci, t)], d.fill_rate_target, f"FR_{d.channels[ci].id}_w{t}")
     return SeekerModel(env, T, variables, objective, total, cost_parts, fill_rate, fr_mean, constrained,
                        demand, lead_prod, lead_rm, open_prod_arr, open_rm_arr, prod_qty, prod_arr, rm_order, rm_arr,
-                       fg_end, fg_waste, rm_end, rm_waste, holding, keep, det if detail else None)
+                       fg_end, fg_waste, rm_end, rm_waste, holding, keep, det if detail else None, firm, firm_start)
 
 
 # ============================================================================
@@ -1913,6 +1992,20 @@ def report_numbers(model, d):
             num[(k.id, "end", t)] = single_number(model, model.rm_end[(k.id, t)])
             if k.perishable:
                 num[(k.id, "waste", t)] = single_number(model, model.rm_waste[(k.id, t)])
+    if model.firm and R > 1:                                                 # firm orders of weeks 1..R (D06)
+        T = model.T
+        for t in range(1, R + 1):
+            F = model.firm.get(t, 0.0)
+            for kind in ("mean", "p10", "p90"):
+                num[("firm", kind, t)] = single_number(model, F, kind)
+            starts = [(w, model.firm_start[(t, w)]) for w in range(t, R + 1) if (t, w) in (model.firm_start or {})]
+            for w, ind in starts:
+                num[("firm_start", t, w)] = single_number(model, ind, "share", 0.5)
+            cand = sorted({a for w, _ in starts for a in arrival_candidates(d, d.fg_id, w, d.prod_lead_time)})
+            for a in cand:                                       # P(started and at the DC by week a)
+                parts = [ind * (model.prod_arrival[w] <= a) if not isinstance(model.prod_arrival[w], (int, np.integer))
+                         else (ind if model.prod_arrival[w] <= a else None) for w, ind in starts]
+                num[("firm_arr", t, a)] = single_number(model, T.sum(parts), "share", 0.5)
     for item, t, q, arr, lt in arrival_streams(model, d):                    # arrival week given an order (L06)
         if isinstance(arr, (int, np.integer)):
             num[("arr_fixed", item, t)] = single_number(model, int(arr))
@@ -1925,6 +2018,80 @@ def report_numbers(model, d):
 
 
 BAND_STATS = ("mean", "p05", "p10", "p25", "p50", "p75", "p90", "p95")
+
+
+def week_spread(pmf, of=""):
+    """'8 (week 10 in 20%)': the most likely week, then the other weeks with their shares."""
+    pmf = {w: p for w, p in pmf.items() if p > 0.0005}
+    if not pmf:
+        return "–"
+    main = max(pmf, key=lambda w: (pmf[w], -w))
+    rest = [f"week {w:.0f} in {pmf[w]:.0%}{of}" for w in sorted(pmf) if w != main]
+    return f"{main:.0f}" + (f" ({'; '.join(rest)})" if rest else "")
+
+
+def cdf_to_pmf(pts, total):
+    """Shares P(event and week ≤ w) → P(week = w | event), for w in pts (sorted)."""
+    out, prev = {}, 0.0
+    for w, sh in sorted(pts):
+        if total > 1e-12 and sh - prev > 1e-12:
+            out[w] = (sh - prev) / total
+        prev = sh
+    return out
+
+
+def commit_notes(oos, d):
+    """Commit_Now notes (L03, D06): when each firm production order starts and arrives, when each supplier order
+    arrives — the most likely week and how often another week happens. {(item key, week): note}."""
+    R, fg, notes = d.review_period, d.fg_id, {}
+    for t in range(1, R + 1):
+        F = oos.get(("firm", "mean", t), oos[("prod", "mean", t)])
+        if F <= 0.5:
+            notes[("prod", t)] = "no production order"
+            continue
+        if ("firm_start", t, t) in oos:                         # R ≥ 2: start week of the firm order (D06)
+            start = {w: oos[("firm_start", t, w)] for w in range(t, R + 1) if ("firm_start", t, w) in oos}
+            cancel = max(0.0, 1.0 - sum(start.values()))
+            txt = f"starts week {week_spread(start, ' of futures')}"
+            if cancel > 0.0005:
+                txt += f"; cancelled at the next run in {cancel:.0%} of futures (no material)"
+            arr = cdf_to_pmf([(a, oos[k]) for k in oos if isinstance(k, tuple) and k[0] == "firm_arr" and k[1] == t
+                              for a in [k[2]]], sum(start.values()))
+            notes[("prod", t)] = f"{txt}; arrives at DC in week {week_spread(arr)}"
+        else:
+            notes[("prod", t)] = f"starts week {t}; arrives at DC in week {week_spread(item_arrival_pmf(oos, fg, 'prod', t))}"
+    for k in d.rms:
+        for t in range(1, R + 1):
+            qk = oos[(k.id, "mean", t)]
+            notes[(k.id, t)] = (f"arrives at RMW in week {week_spread(item_arrival_pmf(oos, k.id, k.id, t))}"
+                                if qk > 0 else "no order")
+    return notes
+
+
+def item_arrival_pmf(oos, item, key, t):
+    """Arrival week of the order placed in week t, given it is placed: {week: share} (L06)."""
+    p = oos.get((key, "p_order", t), 0.0)
+    if ("arr_fixed", item, t) in oos:
+        return {oos[("arr_fixed", item, t)]: 1.0} if p > 1e-12 else {}
+    pts = [(k[3], oos[k]) for k in oos if isinstance(k, tuple) and k[0] == "arr_share" and k[1] == item and k[2] == t]
+    return cdf_to_pmf(pts, p)
+
+
+def firm_order_text(oos, d):
+    """Summary row 'Firm production orders (D06)'."""
+    R = d.review_period
+    if R == 1:
+        return "R = 1: every week is a run; the production order of week 1 starts in week 1"
+    parts = []
+    for t in range(1, R + 1):
+        F = oos.get(("firm", "mean", t), 0.0)
+        if F <= 0.5:
+            continue
+        on_time = oos.get(("firm_start", t, t), 1.0)
+        started = sum(oos.get(("firm_start", t, w), 0.0) for w in range(t, R + 1))
+        parts.append(f"week {t}: {F:,.0f}, starts on time in {on_time:.0%} of futures, waits for material in "
+                     f"{max(0.0, started - on_time):.0%}, cancelled at the next run in {max(0.0, 1 - started):.0%}")
+    return (f"weeks 1–{R}: " + "; ".join(parts)) if parts else f"no firm production order in weeks 1–{R}"
 
 
 def arrival_streams(model, d):
@@ -1940,7 +2107,7 @@ def arrival_candidates(d, item, t, lt):
     """Every week in which an order placed in week t can arrive: t + lead time, or later if an earlier
     (open) order arrives later (no overtaking, E04)."""
     opens = d.open_prod if item == d.fg_id else d.open_rm[item]
-    latest = [o["arrival"] if o["certain"] else o["placed"] + int(lt.values.max()) for o in opens]
+    latest = [o["arrival"] for o in opens]                               # open orders arrive with certainty (J02)
     hi = max([t + int(lt.values.max())] + latest)
     return range(t + int(lt.values.min()), hi + 1)
 
@@ -2107,21 +2274,16 @@ def build_report(d, layout, x, ins, oos, oos_start=None):
                         f"{k.id} transfer→KAJA mean": k.bom * oos[("prod", "mean", t)]})
         dec_rows.append(row)
     # --- 3. commit now (L03): every decision of weeks 1..R, fixed at this run from today's stock and the expected
-    #        demand (A03), so the same in every scenario; only a production order can come out smaller if its raw
-    #        material is late (uncertain lead times)
-    commit = []
+    #        demand (A03), so the same in every scenario. Production: the firm order (D06); its start can wait for
+    #        late material — the note says when it starts and arrives
+    commit, notes = [], commit_notes(oos, d)
     for t in range(1, R + 1):
-        w, qp = f"Week {t}", oos[("prod", "mean", t)]
-        lo, hi = oos[("prod", "p10", t)], oos[("prod", "p90", t)]
-        note = f"arrives at DC in week {oos[('prod', 'arrival', t)]:.0f}" if qp > 0 else "no production"
-        if hi - lo > 0.5:
-            note += f"; raw material permitting (P10 {lo:,.0f}, P90 {hi:,.0f})"
-        commit.append([w, "Production order FG1 (KAJA)", qp, note])
-        commit += [[w, f"Transfer {k.id} RMW → KAJA", k.bom * qp, "for this week's production order"] for k in d.rms]
+        w, qp = f"Week {t}", oos.get(("firm", "mean", t), oos[("prod", "mean", t)])   # the firm order (D06)
+        commit.append([w, "Production order FG1 (KAJA)", qp, notes[("prod", t)]])
+        commit += [[w, f"Transfer {k.id} RMW → KAJA", k.bom * qp,
+                    "leaves the RMW when the production order starts" if qp > 0.5 else "–"] for k in d.rms]
         for k in d.rms:
-            qk = oos[(k.id, "mean", t)]
-            commit.append([w, f"Supplier order {k.id}", qk,
-                           f"arrives at RMW in week {oos[(k.id, 'arrival', t)]:.0f}" if qk > 0 else "no order"])
+            commit.append([w, f"Supplier order {k.id}", oos[(k.id, "mean", t)], notes[(k.id, t)]])
     # --- 4. fill rates (L04)
     fr_rows, con = [], set(ins["constrained"])
     for ci, ch in enumerate(d.channels):
@@ -2157,6 +2319,7 @@ def build_report(d, layout, x, ins, oos, oos_start=None):
             ("Seeker settings", f"speed {STOCHASTIC_SPEED}, constraint form {FILL_RATE_CONSTRAINT_FORM}, "
                                 f"fill-rate target {d.fill_rate_target:.1%} ({target_source(d)})"),
             ("Review period (A03)", review_text(d)),
+            ("Firm production orders (D06)", firm_order_text(oos, d)),
             ("Search space / priorities", f"10^{layout.search_space_log10():.0f} combinations; {VARIABLE_PRIORITY}"),
             ("Start policy (warm start)", f"{start_z_text(d, ins.get('start_z'))}, extra weeks FG {START_EXTRA_WEEKS_FG} / RM {START_EXTRA_WEEKS_RM}, "
                                           f"lot {START_LOT_WEEKS} weeks"),

@@ -29,7 +29,7 @@ Every number in input.json and result.json is copied from the engine; nothing is
   3. VALIDATE ........ data checks only
   4. INPUT ........... the master data as the engine read it → JSON (Master data page)
   4b. WHAT-IF ........ editable sheets; edits → a copy of the original workbook (app rules W01–W03)
-  5. RESULT .......... RunResult → result.json (contract 5 = engine contract 4 + the baseline block)
+  5. RESULT .......... RunResult → result.json (contract 6 = engine contract 4 (v18.3) + baseline + firm_orders)
   5b. BASELINE ....... textbook (s,S) on the same fresh scenarios (engine/meio_baseline.py, read-only), optional
   6. RUN ............. the whole engine pipeline for one run folder (the PC is kept awake meanwhile)
   7. MAIN
@@ -54,7 +54,7 @@ import openpyxl
 # ============================================================================
 ENGINE_DIR = Path(__file__).resolve().parent.parent / "engine"
 TEST_DOUBLE_ENV = "MEIO_TEST_DOUBLE"      # "1" = use the Seeker test double from engine/test_engine.py (tests only!)
-RESULT_CONTRACT_VERSION = 5               # 5: + "baseline" (15.11.); bump on any change to result.json (+ openapi.json)
+RESULT_CONTRACT_VERSION = 6               # 6: + headline.firm_orders (v18.3); bump on any result.json change
 EXIT_DONE, EXIT_FAILED, EXIT_INVALID = 0, 1, 2
 # run setting (request.json) → engine module constant (CLAUDE.md §6 "Settings"); None = keep the engine's default
 SETTING_CONSTANTS = {"out_of_sample_scenarios": "OUT_OF_SAMPLE_SCENARIOS",
@@ -430,6 +430,7 @@ def headline(engine, res):
         "fill_rate_target_excel": float(excel_target(d)),                      # Items!TargetFillRate
         "fill_rate_target_source": engine.target_source(d),                    # Excel or the run's own target
         "review_period": str(summary.get("Review period (A03)", "")),          # which weeks this run commits
+        "firm_orders": str(summary.get("Firm production orders (D06)", "")),   # v18.3: how the firm orders start
         "start_policy": str(summary.get("Start policy (warm start)", "")),
         "start_check": start_record(ins),
         "start_repair_used": bool((ins.get("repair") or {}).get("used")),      # K21: show as a notice, not an error

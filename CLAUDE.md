@@ -12,15 +12,15 @@ The engine bundle lives in `engine/`, byte-exact. A new engine version replaces 
 | File | What it is | You may edit? |
 |---|---|---|
 | `CLAUDE.md` | this file: everything you need to know | yes (keep it current) |
-| `engine/meio_seeker_stochastic.py` | **the engine** (v18.2, contract version 4): every rule, written once, as Seeker Terms | **no** |
+| `engine/meio_seeker_stochastic.py` | **the engine** (v18.3, contract version 4): every rule, written once, as Seeker Terms | **no** |
 | `engine/reference_simulator.py` | independent second implementation of the rules, used only by the tests | **no** |
 | `engine/meio_stress_tests.py` | 26 data-change scenarios run through the engine (needs Seeker) | **no** |
-| `engine/test_engine.py` | **the engine test suite** (142 tests): input control, physics & dynamics, model functionality, output control, stress cases, engine fingerprint; includes a Seeker test double, so no license needed | **no** |
+| `engine/test_engine.py` | **the engine test suite** (159 tests): input control, physics & dynamics, model functionality, output control, stress cases, engine fingerprint; includes a Seeker test double, so no license needed | **no** |
 | `engine/MEIO_Data_Template.xlsx` | the input file (v18.1 layout, **example data**; the tests depend on it) incl. sheet `Model_Assumptions`; workbooks from v17.x are rejected (handover B1) | **no** (real data goes in `data/`, gitignored) |
-| `engine/MEIO_model_spec.md` | the dynamics/assumptions list: all 85 rules (IDs like C03, H05, K17), same as the Excel sheet | **no** |
+| `engine/MEIO_model_spec.md` | the dynamics/assumptions list: all 86 rules (IDs like C03, H05, K17), same as the Excel sheet | **no** |
 | `engine/MEIO_math_model.md` | the formal model: sets, dynamics, objective, fill-rate rule, Seeker mapping | **no** |
 | `engine/MEIO_shelf_life_aware_policies.md` | archived design of age-aware positions (rejected, K22); the waste warning (L10) refers to it | **no** |
-| `engine/ENGINE_v18_1_HANDOVER.md` | the record of every engine change since v17.1 and why (v18.2 box at the top), what the app had to adapt, and the open proposals (section G) | **no** |
+| `engine/ENGINE_v18_1_HANDOVER.md` | the record of every engine change since v17.1 and why (v18.3 and v18.2 boxes at the top), what the app had to adapt, and the open proposals (section G) | **no** |
 | `engine/meio_baseline.py` | textbook (s,S) baseline for comparison only (formulas in its header): one fixed (s,S) per stock point, simulated with the engine's own out-of-sample check on the same fresh scenarios; never changes the engine | **no** |
 | `engine/test_baseline.py` | its 9 tests (Seeker test double, no license) | **no** |
 | `MEIO_Results_stochastic.xlsx` | results of a real Seeker run (sheet layout = engine output); on the user's PC only, gitignored | no |
@@ -44,7 +44,7 @@ into CRLF on checkout and the engine fingerprint test would fail on the user's P
   - Show the feasibility line and the bound NOTE prominently.
   - Show the rules missed on fresh scenarios.
   - Compare costs only between plans that meet the same number of rules (there is no lost-sales cost, so a plan that misses rules looks cheaper).
-- **Checks stay green:** `python -m ruff check .` and `python -m pytest` from the repo root (142 engine tests,
+- **Checks stay green:** `python -m ruff check .` and `python -m pytest` from the repo root (159 engine tests,
   about 2.5 min, plus the app's own tests) on every change. CI runs both on Linux and Windows, plus a secret scan.
 
 ## 3. How to work (the user's method) and the user
@@ -105,7 +105,11 @@ The example data is generated; real data comes later.
   - Lead times are fixed or random; orders never overtake.
 - **Review period R (Settings!ReviewPeriod, default 1, A03):** the model is run every R weeks. A run commits every decision
   of weeks 1..R as exact quantities. Between runs the (s,S) rules use the *planned* position (position at the last run +
-  orders planned since − expected demand since), so nothing inside a cycle reacts to the actual demand. R = 1 = weekly.
+  firm orders planned since − expected demand since), so nothing inside a cycle reacts to the actual demand. R = 1 = weekly.
+- **Firm production orders (D06, R ≥ 2):** a production order planned for a week of the cycle is sized at the run to the raw
+  material the plan counts on; that firm quantity is the same in every future and is committed. If the material is late,
+  the order waits and starts when the material is there (waiting orders start together); what still waits at the next run is
+  cancelled. Open orders arrive with certainty in `ExpectedArrivalPeriod` (J02); `ArrivalCertain = No` is refused.
 - **Objective:** minimize expected total cost: raw materials + production + transport + holding + waste. There is no lost-sales cost and no
   end-of-horizon value (user decision, A05): stock left after the last week is worth nothing, so plans run stock down near the end.
   Act only on the committed weeks; read the last weeks as indicative and total cost as spending within the horizon.
@@ -304,6 +308,29 @@ reading, so the app can overwrite or delete its copies on Windows.
 - **Summary:** new row `Review period (A03)`, e.g. "R = 4 weeks: the model is run every 4 weeks; this run commits weeks 1–4
   (…); next run in week 5". Show it next to the commit table.
 - **Input warning X10** (see above). The start policy's safety stock counts the uncertainty since the last run (K07).
+
+**v18.3 (17.11., engine session; contract version 4 unchanged): firm production orders within a review cycle (D06), from the
+app session's change request (issues 1a–1c).**
+- With R ≥ 2 the planned position counted a production order at its full requested size even when missing raw material cut
+  it, so the rest of the cycle believed stock that was never made and committed "no production" where it was needed.
+- Now each planned week has one **firm order** sized to the planned material (stock at the run + deliveries at their planned
+  week − material already reserved; planned lead time = most likely value), counted in the planned position, the same in
+  every future. In each future it starts when its material is actually there (oldest first, all or nothing, waiting orders
+  start together as one order with one fixed cost); still waiting at the next run → cancelled, no cost.
+- **Open orders arrive with certainty (J02):** `Open_Orders!ArrivalCertain` must be empty or `Yes`; `No` is refused (sheet, row,
+  field), in Excel (RowCheck ERROR) and in Python alike. The engine's uncertain-open-order path is removed (the open-order
+  dicts have no `certain` key any more).
+- **Commit_Now:** the production row shows the firm quantity (whole batches, the same in every future) with a note like
+  "starts week 2 (week 4 in 9% of futures); arrives at DC in week 8 (week 10 in 20%)"; supplier orders "arrives at RMW in week
+  9 (week 13 in 10%)" when the lead time is uncertain; transfers = BOM × the firm order. New Summary row `Firm production orders
+  (D06)`. The Decisions sheet's production column is the quantity started that week. Bands `position`: a waiting firm order
+  counts as released (FG); the echelon position counts its raw material once.
+- **R = 1 is identical to v18.2** (same numbers, 13,099 Terms). Terms grow with R ≥ 2: template R = 4 16,451 (fixed lead
+  times) and 27,240 (uncertain; R = 1: 24,637), so an evaluation takes roughly 10–25% longer (not measured on Seeker yet; the
+  API's time estimate is not scaled for it).
+- **App (18.11.):** result contract 6 = + `headline.firm_orders` (the Summary row, copied); the dashboard shows it next to the
+  commit cards; Master data no longer shows "confirmed / not confirmed" for open orders (all are certain, J02); a what-if
+  with `ArrivalCertain = No` is refused in the engine's words (test). 159 engine + 9 baseline + 73 app tests.
 
 **v18.2 (13.11., engine session; contract version 4 unchanged): one more start-repair step, R1b (K21).**
 - If R1 leaves a cell missed, R1b repeats R1 (same weeks) from the start with z + 0.5 before R2 orders maximum supply.
