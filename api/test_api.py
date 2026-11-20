@@ -1079,3 +1079,14 @@ def test_results_of_runs_made_before_the_newest_fields_are_still_served(api, don
     r = api.get(f"/runs/{old.name}/result")
     assert r.status_code == 200, r.text
     assert (r.json()["headline"]["firm_orders"], r.json()["headline"]["bound_points"]) == ("", [])
+
+
+def test_the_order_quantity_if_ordered_reaches_the_result(done):
+    """Engine v18.5 (change request 20.11.): Bands order_qty_if_ordered for production and every raw material."""
+    bands = pd.DataFrame(done[2]["sheets"]["Bands"]["rows"], columns=done[2]["sheets"]["Bands"]["columns"])
+    new = bands[bands["Series"] == "order_qty_if_ordered"]
+    assert set(new["Item"]) == {"FG1", "RM1", "RM2", "RM3", "RM4"}
+    both = new.merge(bands[bands["Series"] == "order_qty"], on=["Item", "Week"], suffixes=("_if", "_all"))
+    ordered = both[both["Mean_if"].notna()]
+    assert len(ordered) and (ordered["Mean_if"] >= ordered["Mean_all"] - 1e-9).all()      # ≥ the all-futures mean
+    assert (both.loc[both["Mean_all"] == 0, "Mean_if"].isna()).all()                     # never ordered → empty

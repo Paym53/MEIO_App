@@ -12,15 +12,15 @@ The engine bundle lives in `engine/`, byte-exact. A new engine version replaces 
 | File | What it is | You may edit? |
 |---|---|---|
 | `CLAUDE.md` | this file: everything you need to know | yes (keep it current) |
-| `engine/meio_seeker_stochastic.py` | **the engine** (v18.4, contract version 4): every rule, written once, as Seeker Terms | **no** |
+| `engine/meio_seeker_stochastic.py` | **the engine** (v18.5, contract version 4): every rule, written once, as Seeker Terms | **no** |
 | `engine/reference_simulator.py` | independent second implementation of the rules, used only by the tests | **no** |
 | `engine/meio_stress_tests.py` | 26 data-change scenarios run through the engine (needs Seeker) | **no** |
-| `engine/test_engine.py` | **the engine test suite** (169 tests): input control, physics & dynamics, model functionality, output control, stress cases, engine fingerprint; includes a Seeker test double, so no license needed | **no** |
+| `engine/test_engine.py` | **the engine test suite** (184 tests): input control, physics & dynamics, model functionality, output control, stress cases, engine fingerprint; includes a Seeker test double, so no license needed | **no** |
 | `engine/MEIO_Data_Template.xlsx` | the input file (v18.1 layout, **example data**; the tests depend on it) incl. sheet `Model_Assumptions`; workbooks from v17.x are rejected (handover B1) | **no** (real data goes in `data/`, gitignored) |
 | `engine/MEIO_model_spec.md` | the dynamics/assumptions list: all 86 rules (IDs like C03, H05, K17), same as the Excel sheet | **no** |
 | `engine/MEIO_math_model.md` | the formal model: sets, dynamics, objective, fill-rate rule, Seeker mapping | **no** |
 | `engine/MEIO_shelf_life_aware_policies.md` | archived design of age-aware positions (rejected, K22); the waste warning (L10) refers to it | **no** |
-| `engine/ENGINE_v18_1_HANDOVER.md` | the record of every engine change since v17.1 and why (v18.4, v18.3 and v18.2 boxes at the top), what the app had to adapt, and the open proposals (section G) | **no** |
+| `engine/ENGINE_v18_1_HANDOVER.md` | the record of every engine change since v17.1 and why (v18.5, v18.4, v18.3 and v18.2 boxes at the top), what the app had to adapt, and the open proposals (section G) | **no** |
 | `engine/meio_baseline.py` | textbook (s,S) baseline for comparison only (formulas in its header): one fixed (s,S) per stock point, simulated with the engine's own out-of-sample check on the same fresh scenarios; never changes the engine | **no** |
 | `engine/test_baseline.py` | its 9 tests (Seeker test double, no license) | **no** |
 | `MEIO_Results_stochastic.xlsx` | results of a real Seeker run (sheet layout = engine output); on the user's PC only, gitignored | no |
@@ -44,7 +44,7 @@ into CRLF on checkout and the engine fingerprint test would fail on the user's P
   - Show the feasibility line and the bound NOTE prominently.
   - Show the rules missed on fresh scenarios.
   - Compare costs only between plans that meet the same number of rules (there is no lost-sales cost, so a plan that misses rules looks cheaper).
-- **Checks stay green:** `python -m ruff check .` and `python -m pytest` from the repo root (169 engine tests,
+- **Checks stay green:** `python -m ruff check .` and `python -m pytest` from the repo root (184 engine tests,
   about 2.5 min, plus the app's own tests) on every change. CI runs both on Linux and Windows, plus a secret scan.
 
 ## 3. How to work (the user's method) and the user
@@ -153,6 +153,7 @@ all on the fresh scenarios; definitions in rules L05–L06):**
 | `position` | FG1, RM1–RM4 | the quantity s and S act on: FG stock position (C01), raw-material echelon position (C03). Draw s/S against this, not against end stock |
 | `waste` | FG1, RM3, RM4 | units scrapped that week |
 | `order_qty` | FG1 (production), RM1–RM4 | order quantity (0 when nothing is ordered) |
+| `order_qty_if_ordered` | FG1 (production), RM1–RM4 | v18.5: order quantity **only over the scenarios that order that week** (empty if none); Mean × P(order) = `order_qty` Mean. Show it as "if ordered: P10–P90 … (avg …)" next to P(order) |
 | `arrival_week` | FG1, RM1–RM4 | arrival week of the order placed that week, **only over scenarios that place it**; empty if never placed |
 | `receipts` | FG1, RM1–RM4 | units arriving at the start of the week |
 | `served`, `lost` | channels | units sold, demand lost (served + lost = demand) |
@@ -309,6 +310,19 @@ reading, so the app can overwrite or delete its copies on Windows.
 - **Summary:** new row `Review period (A03)`, e.g. "R = 4 weeks: the model is run every 4 weeks; this run commits weeks 1–4
   (…); next run in week 5". Show it next to the commit table.
 - **Input warning X10** (see above). The start policy's safety stock counts the uncertainty since the last run (K07).
+
+**v18.5 (20.11., engine session; contract version 4 unchanged): order quantity over the futures that order (L05), from the
+app session's change request of 20.11.**
+- New Bands series `order_qty_if_ordered` (FG1 production, RM1–RM4): Mean and P05–P95 of the order quantity over only the
+  fresh scenarios that order that week; empty (NaN) when none does. Mean = `order_qty` Mean ÷ P(order); quantiles by the
+  order-statistic rule of the other bands, over all batches together. Search model, plan and every other number unchanged
+  (13,099 Terms); the out-of-sample check reads ~7,800 more single numbers (a few seconds; time one real run).
+- By design: with R ≥ 2 and uncertain lead times, a firm order that waited and started together with a later one shows the
+  started sum in that week (acceptance 4 exception). 184 tests (15 new), 5 new mutants caught.
+- **App (20.11.):** verified on the user's 20.11. what-if replay (their real plan, 2,500 futures): RM3 week 6 Mean 1,851.6 kg,
+  P10/P50/P90 1,690 / 1,810 / 2,070 = the reference simulator's 577 ordering futures exactly; Mean × P(order) = `order_qty`
+  Mean for every item and week. The worker passes Bands through unchanged (new app test); the dashboard shows "if ordered:
+  P10–P90 … (avg …)" next to P(order) for indicative weeks (`quantityText`).
 
 **v18.4 (18.11., engine session; contract version 4 unchanged): parallel start check (section 4d, K07) — faster, same run.**
 - The start check's evaluations (maximum supply K17 = the feasibility check, z₀, the z grid) are independent Seeker models
@@ -579,12 +593,12 @@ life. The map needs `input.tables.Sourcing` (supplier → material), added on 09
 run is made, so runs before 09.11. have no supplier arrows (start a new run).
 **Dashboard progress (09.11.):** Overview, map + panels, Orders and Master data reworked and merged (dashboard PRs #4–#10;
 Lovable prompts A, B, map rebuild, Orders, Master data; Claude's review fixes in the same PRs). One place per input:
-solver settings only in the Run dialog. **Engine change request `order_qty_if_ordered` (sent 20.11., pending):** the order
+solver settings only in the Run dialog. **Engine change request `order_qty_if_ordered` (sent 20.11., delivered as v18.5):** the order
 quantity **only over futures that order** (like arrival_week), so Orders can show "if ordered: …". Why: the user read a
 week-6 RM3 mean of 428 kg (R = 2 what-if) as an order size; verified 20.11. (engine = reference per future on the user's
 plan; committed weeks exact; week 6 planned at the future run in week 5, ordered in 23 % of futures, 1,690–2,070 kg).
-Until then the dashboard (PR #19, `quantityText`) leads with "ordered in X % of futures" and labels the mean "not an
-order size"; committed weeks "exact: the same in every future".
+The dashboard (`quantityText`) leads with "ordered in X % of futures", then "if ordered: P10–P90 … (avg …)" from
+v18.5's series, and labels the all-futures mean "not an order size"; committed weeks "exact: the same in every future".
 **Engine v18.1 + API 3 (13.11.; handover `engine/ENGINE_v18_1_HANDOVER.md`):** result contract 4 = engine contract 4.
 - **User decisions 13.11.:** the run's own fill-rate target (`optimization_fill_rate`, any value in (0, 1], → engine
   `OPTIMIZATION_FILL_RATE`, set before `run()` and restored afterwards); run-dialog presets "Decision run" (500 scenarios,

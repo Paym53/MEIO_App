@@ -130,7 +130,7 @@ START_EXTRA_WEEKS_RM = 4       # RM cover window = max RM lead time + max produc
 START_LOT_WEEKS = 4            # order-up-to S = reorder point s + this many weeks of average demand (≥ MOQ,
                                # ≤ what one fresh lot can sell before it expires)
 
-SCRIPT_VERSION = "2026-11-18 v18.4 (Seeker-only)"
+SCRIPT_VERSION = "2026-11-20 v18.5 (Seeker-only)"
 EPS = 1e-9
 TIMINGS = []                                  # (phase, seconds) — printed at the end and written to the report
 
@@ -1206,6 +1206,7 @@ class SeekerModel:
     detail: dict = None                        # report series (only built for the out-of-sample check, L05–L08)
     firm: dict = None                          # week -> firm production order quantity (D06)
     firm_start: dict = None                    # (week of the firm order, week) -> 1 if it starts that week (R ≥ 2)
+    policy: dict = None                        # the (s,S) values of the model (out-of-sample model only; L05)
 
 
 SUPPORTS_MAX_SAMPLE = {}
@@ -1545,7 +1546,8 @@ def build_model(skr, env, d, layout, x_start, seed, resolution, detail=False):
         env.enforce_geq(fr_mean[(ci, t)], d.fill_rate_target, f"FR_{d.channels[ci].id}_w{t}")
     return SeekerModel(env, T, variables, objective, total, cost_parts, fill_rate, fr_mean, constrained,
                        demand, lead_prod, lead_rm, open_prod_arr, open_rm_arr, prod_qty, prod_arr, rm_order, rm_arr,
-                       fg_end, fg_waste, rm_end, rm_waste, holding, keep, det if detail else None, firm, firm_start)
+                       fg_end, fg_waste, rm_end, rm_waste, holding, keep, det if detail else None, firm, firm_start,
+                       layout.decode(x_start) if detail else None)
 
 
 # ============================================================================
@@ -2235,6 +2237,32 @@ def arrival_candidates(d, item, t, lt):
     return range(t + int(lt.values.min()), hi + 1)
 
 
+ORDER_NONE = 1e15                                         # stands for "no order" in the order-quantity shares
+
+
+def order_lattice(d, item, t, policy=None):
+    """Every quantity an order of `item` placed (FG: started) in week t can have, smallest first (D01, D02, D06):
+    multiples of the order multiple / batch from the MOQ to the maximum. With the week's (s, S) the range is cut to
+    what the rule can order (position ≥ 0 and < s): RM [⌈S − s⌉, max(MOQ, ⌈S⌉)]; FG up to max(MOQ, ⌈S⌉) (down to the
+    MOQ: material can cut it; R ≥ 2: waiting firm orders can start together, so up to the maximum). The maximum
+    itself always stays in, so a quantity outside the cut range would still be counted (and reported)."""
+    if item == d.fg_id:
+        key, step, lo = "FG", d.prod_batch, d.prod_moq
+        top = math.floor(d.prod_max / step + EPS) * step
+    else:
+        k = next(r for r in d.rms if r.id == item)
+        key, step, lo, top = k.id, k.multiple, k.moq, k.max_order
+    lo, hi = max(lo, step), top
+    if policy and key in policy:
+        s, S = policy[key][0][t], policy[key][1][t]
+        if item != d.fg_id or d.review_period == 1:
+            hi = min(top, max(lo, step * math.ceil(S / step - EPS)))
+        if item != d.fg_id:
+            lo = min(hi, max(lo, step * math.ceil((S - s) / step - EPS)))
+    vals = [lo + step * i for i in range(int(round((hi - lo) / step)) + 1)]
+    return vals + ([top] if hi < top - EPS else [])
+
+
 def detail_numbers(model, d):
     """Single numbers of the report series (L05–L07), read from the out-of-sample model only."""
     H, det, fg = d.horizon, model.detail, d.fg_id
@@ -2261,6 +2289,11 @@ def detail_numbers(model, d):
     for name, item, t, term in series:
         for kind in BAND_STATS:
             num[("band", name, item, t, kind)] = read(term, kind)
+    for name, item, t, q in series:                       # order quantity over the futures that order (L05)
+        if name == "order_qty" and hasattr(q, "get_value"):
+            above = -(q + (q < 0.5) * ORDER_NONE)             # −quantity; −ORDER_NONE where nothing is ordered
+            for v in order_lattice(d, item, t, model.policy):
+                num[("q_le", item, t, v)] = single_number(model, above, "share", -v)   # P(order and quantity ≤ v)
     for t in range(1, H + 1):
         num[("band_aux", "rsl_num", fg, t)] = read(det[("rsl_num", fg, t)], "mean")
         num[("band", "no_stock_share", fg, t, "mean")] = read(det[("no_stock", fg, t)], "share", -0.5)
@@ -2271,6 +2304,33 @@ def detail_numbers(model, d):
             if key[1] != "avg_end_stock":                # share of scenarios where it happens at all
                 num[("kpi",) + key[1:] + ("share",)] = read(term, "share", 0.5)
     return num
+
+
+def order_qty_if_ordered(oos, d):
+    """Band series order_qty_if_ordered (L05): the order quantity over the futures that order in that week (empty if
+    none). Mean = mean over all futures ÷ P(order), exact. Quantile q = the (⌊q·n⌋+1)-th smallest of the n futures
+    that order (Seeker's rule for the other bands), from the counts P(order and quantity ≤ v) × N on the lattice."""
+    fg, N = d.fg_id, oos.get("n")
+    lat = {}
+    for key in [k for k in oos if isinstance(k, tuple) and k[0] == "q_le"]:
+        lat.setdefault(key[1:3], []).append((key[3], oos[key]))
+    for (_, _, item, t, _) in [k for k in oos if isinstance(k, tuple) and k[:2] == ("band", "order_qty") and k[4] == "mean"]:
+        j = "prod" if item == fg else item
+        p, pts = oos.get((j, "p_order", t), 0.0), sorted(lat.get((item, t), []))
+        if pts and p > 1e-12 and pts[-1][1] < p - 1e-9:
+            print(f"WARNING (L05): {item} week {t}: order quantities outside the expected range", flush=True)
+        for kind in BAND_STATS:
+            if p <= 1e-12:
+                v = float("nan")
+            elif kind == "mean":
+                v = oos[(j, "mean", t)] / p
+            elif not pts:                                        # same quantity in every future
+                v = oos[("band", "order_qty", item, t, kind)]
+            else:
+                q = int(kind[1:]) / 100.0
+                need = (math.floor(q * round(p * N) + 1e-9) + 1) / N if N else q * p
+                v = next((w for w, sh in pts if sh >= need - 1e-9), pts[-1][0])
+            oos[("band", "order_qty_if_ordered", item, t, kind)] = v
 
 
 def derived_numbers(oos, d):
@@ -2298,6 +2358,7 @@ def derived_numbers(oos, d):
                 q = int(kind[1:]) / 100.0
                 v = next((w for w, sh in pts if sh / p >= q - 1e-9), pts[-1][0])
             oos[("band", "arrival_week", item, t, kind)] = v
+    order_qty_if_ordered(oos, d)
     for t in range(1, d.horizon + 1):
         if ("band_aux", "rsl_num", fg, t) in oos:
             stock = oos[("fg_end", t)]
@@ -2323,8 +2384,7 @@ def out_of_sample(skr, d, layout, x, license_file, detail=True, label="Out-of-sa
             for key, read in readers.items():
                 total[key] = total.get(key, 0.0) + read() * n
             env.end()
-    oos = derived_numbers({key: v / sum(sizes) for key, v in total.items()}, d)
-    oos["n"] = sum(sizes)
+    oos = derived_numbers(dict({key: v / sum(sizes) for key, v in total.items()}, n=sum(sizes)), d)
     odd = [k for k in oos if isinstance(k, tuple) and k[1] == "p10" and oos[k] > oos[(k[0], "p90", k[2])] + 1e-6]
     if odd:                                                  # plausibility gate on Seeker's quantile convention
         print(f"WARNING: P10 > P90 for {len(odd)} decision series — check aggregate_quantile semantics", flush=True)
@@ -2476,8 +2536,8 @@ def build_report(d, layout, x, ins, oos, oos_start=None):
             "Bands": bands, "KPIs": kpis}
 
 
-BAND_SERIES = ("end_stock", "position", "waste", "order_qty", "arrival_week", "receipts", "served", "lost",
-               "eligible_next_week", "rsl_mean", "no_stock_share")
+BAND_SERIES = ("end_stock", "position", "waste", "order_qty", "order_qty_if_ordered", "arrival_week", "receipts",
+               "served", "lost", "eligible_next_week", "rsl_mean", "no_stock_share")
 
 
 def band_and_kpi_tables(d, ins, oos, oos_start=None):

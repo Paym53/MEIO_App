@@ -1239,8 +1239,7 @@ def detail_oos(d, x, R=150, seed=7, layout=None):
     env, lay, model = build(d, x, R, seed, detail=True, layout=layout)
     readers = ms.report_numbers(model, d)
     env.evaluate()
-    oos = ms.derived_numbers({k: r() for k, r in readers.items()}, d)
-    oos["n"] = R
+    oos = ms.derived_numbers(dict({k: r() for k, r in readers.items()}, n=R), d)
     res = ref.MEIOSimulator(d, seeker_scenarios(model, d)).run(lay.decode(x), detail=True)
     return model, oos, res
 
@@ -1292,6 +1291,75 @@ def test_bands_are_the_statistics_of_the_reference_series(lead):
     for t in range(1, d.horizon + 1):
         assert oos[("band", "no_stock_share", fg, t, "mean")] == pytest.approx((end[:, t] <= 0.5).mean())
     assert n_rows == 33 * d.horizon
+
+
+def order_streams(d, rec):
+    fg_top = np.floor(d.prod_max / d.prod_batch + 1e-9) * d.prod_batch
+    return [(d.fg_id, "prod", rec["prod_qty"], d.prod_moq, fg_top)] + \
+        [(k.id, k.id, rec[f"{k.id}_order"], k.moq, k.max_order) for k in d.rms]
+
+
+@pytest.mark.parametrize("R", [1, 2, 4])
+@pytest.mark.parametrize("lead", ["fixed", "stochastic"])
+@pytest.mark.parametrize("plan", ["random_wide", "start"])
+def test_order_quantity_if_ordered_is_the_statistic_over_the_futures_that_order(R, lead, plan):
+    """L05 order_qty_if_ordered (change request 20.11.): mean and P05…P95 of the order quantity over the futures that
+    order in the week, = the reference future by future; empty if none orders; mean × P(order) = the order_qty mean;
+    within MOQ … maximum and ordered; equal to the order_qty row when every future orders; every quantity a future
+    orders lies on the lattice of shares the engine reads."""
+    d = copy.deepcopy(D0) if lead == "fixed" else stochastic_data()
+    d.review_period = R
+    model, oos, res = detail_oos(d, policies(d)[plan], R=200)
+    rec, checked, partial = res.detail, 0, 0
+    for item, j, arr, lo, top in order_streams(d, rec):
+        for t in range(1, d.horizon + 1):
+            got = [oos[("band", "order_qty_if_ordered", item, t, kind)] for kind in ms.BAND_STATS]
+            q = arr[:, t]
+            placed = q > 0
+            if not placed.any():
+                assert all(np.isnan(g) for g in got), (item, t)
+                continue
+            c = q[placed]
+            for kind, g in zip(ms.BAND_STATS, got):
+                assert g == pytest.approx(stat(c, kind), rel=1e-9), (item, t, kind)
+            assert got[0] * oos[(j, "p_order", t)] == pytest.approx(oos[("band", "order_qty", item, t, "mean")], rel=1e-9)
+            assert lo - 1e-9 <= got[1] and got[-1] <= top + 1e-9 and got[1:] == sorted(got[1:]), (item, t)
+            assert set(c) <= set(ms.order_lattice(d, item, t, model.policy)), (item, t)
+            if placed.all():
+                assert got == [oos[("band", "order_qty", item, t, kind)] for kind in ms.BAND_STATS], (item, t)
+            checked += 1
+            partial += not placed.all()
+    assert checked > 20 and (partial > 10 or plan == "start")
+
+
+@pytest.mark.parametrize("R", [1, 4])
+def test_order_quantity_if_ordered_in_committed_weeks_is_the_commit_quantity(R):
+    """Weeks 1..R are the same in every future (fixed lead times): P05 = P95 = the Commit_Now quantity when > 0."""
+    d = copy.deepcopy(D0)
+    d.review_period = R
+    _, oos, res = detail_oos(d, policies(d)["push"], R=100)
+    seen = 0
+    for item, _, arr, _, _ in order_streams(d, res.detail):
+        for t in range(1, R + 1):
+            q = arr[:, t]
+            assert (q == q[0]).all()
+            if q[0] > 0:
+                for kind in ms.BAND_STATS:
+                    assert oos[("band", "order_qty_if_ordered", item, t, kind)] == pytest.approx(q[0]), (item, t, kind)
+                seen += 1
+    assert seen >= 2 * R
+
+
+def test_order_lattice_holds_every_possible_order_quantity():
+    d = copy.deepcopy(D0)
+    k = d.rms[2]                                                       # RM3: 10 kg multiple, MOQ 200, max 1,000
+    pol = {k.id: (np.full(d.horizon + 1, 1200.0), np.full(d.horizon + 1, 1735.0))}
+    assert ms.order_lattice(d, k.id, 5) == list(np.arange(200, 1001, 10))
+    assert ms.order_lattice(d, k.id, 5, pol) == [540 + 10 * i for i in range(47)]       # ⌈535⌉ … max 1,000
+    fg = ms.order_lattice(d, d.fg_id, 5, {"FG": (np.full(d.horizon + 1, 9000.0), np.full(d.horizon + 1, 15050.0))})
+    assert fg[0] == d.prod_moq and fg[-2] == 15100 and fg[-1] == 50000              # material can cut to the MOQ
+    d.review_period = 2                                                # waiting firm orders can start together
+    assert ms.order_lattice(d, d.fg_id, 5, {"FG": (np.zeros(d.horizon + 1), np.full(d.horizon + 1, 15050.0))})[-1] == 50000
 
 
 def test_arrival_weeks_are_conditional_on_an_order():
@@ -2197,8 +2265,8 @@ def test_noise_and_direction_logic():
 # ============================================================================
 
 
-ENGINE_SHA256 = {   # engine v18.4 — set by the engine session (python test_engine.py --fingerprint)
-    "meio_seeker_stochastic.py": "5c808d145e464c8288c12b592e0dece643367be5b303ccb0408bc274554ff6f5",
+ENGINE_SHA256 = {   # engine v18.5 — set by the engine session (python test_engine.py --fingerprint)
+    "meio_seeker_stochastic.py": "433b06dd06d948efe36d5b50fbea7552611a6b5b39289a885f9d54a8406837a9",
     "reference_simulator.py": "4da487d30d35d6b3d9913c46de7f349ea018523bd53c3611c80674d64ab721fd",
     "meio_stress_tests.py": "f0fc2fe4fe372f045874de1d35846961eb1eb01d027a24b91810c17982af7a5c",
 }

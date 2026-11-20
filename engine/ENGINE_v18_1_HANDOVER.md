@@ -1,5 +1,30 @@
 # Engine v18.1: hand-over to the app session (everything since v17.1)
 
+> **Update v18.5 (20.11.): your change request "order quantity only over the futures that order". If you installed v18.4,
+> this box is the only change.**
+> - Engine `2026-11-20 v18.5 (Seeker-only)`; **contract version 4 unchanged**: the frozen schema covers sheet columns, and Bands
+>   keeps its columns; it only gets one more series.
+> - **What (L05):** Bands series `order_qty_if_ordered` for FG1 (production) and RM1–RM4, per week Mean and P05–P95 over the fresh
+>   scenarios that place an order that week; empty (NaN) when none does. `oos` keys `("band", "order_qty_if_ordered", item, week,
+>   stat)`. Mean = `order_qty` Mean ÷ P(order) (exact). Quantile q = the (⌊q·n⌋+1)-th smallest quantity of the n ordering
+>   scenarios — the order-statistic rule of the other bands, counted over all batches together — from the shares P(order and
+>   quantity ≤ v) for every quantity v the order can take (batch / order-multiple steps from the MOQ to the maximum, cut to what
+>   that week's (s,S) can order; the maximum always stays in).
+> - **Unchanged:** the search model (13,099 Terms on the template), the plan, costs, fill rates and every other number. The
+>   out-of-sample model reads about 7,800 more single numbers on the template (estimated a few seconds; please time one run).
+> - **Acceptance criteria:**
+>
+>   | Criterion | Result |
+>   |---|---|
+>   | 1. Mean × P(order) = `order_qty` Mean | ✓ every item and week (tests, 12 cases) |
+>   | 2. P05 ≥ MOQ (FG: production MOQ), P95 ≤ maximum, P05 ≤ … ≤ P95 | ✓ |
+>   | 3. Empty when P(order) = 0; = the `order_qty` row when P(order) = 1 | ✓ (single batch; with several batches `order_qty` quantiles are batch averages, the new series is over all batches) |
+>   | 4. Committed weeks: P05 = P95 = the Commit_Now quantity when > 0 | ✓ fixed lead times, R = 1 and 4. Exception by design: R ≥ 2 with uncertain lead times, a firm production order that waited for material and started together with a later one shows the started sum |
+>   | 5. Engine = reference simulator, every scenario, R = 1, 2, 4, fixed + uncertain lead times | ✓ (two plans each); every quantity a future ordered lies on the share lattice |
+>   | 6. No plan change; search-model Terms unchanged | ✓ 13,099 Terms; all v18.4 tests unchanged and green |
+>   | 7. 20.11. what-if replay: RM3 week 6 Mean ≈ 1,852 kg, P50 ≈ 1,810 kg | not run here: I don't have that workbook and plan. Your replay (2,500 futures) is the check: the new Mean is by construction 428 ÷ 0.232 ≈ 1,845 kg on the engine's own fresh scenarios |
+> - Tests: **184** (15 new); 5 new mutants (quantile index, mean, no-order futures counted, two lattice cuts), all caught.
+>
 > **Update v18.4 (18.11.): parallel start check — faster, same results. If you installed v18.3, this box is the only change.**
 > - Engine `2026-11-18 v18.4 (Seeker-only)`; **contract version 4 unchanged**; no model, rule or output change.
 > - **What:** the start check's evaluations (maximum supply, z₀, the z grid) run at the same time in separate Seeker processes
