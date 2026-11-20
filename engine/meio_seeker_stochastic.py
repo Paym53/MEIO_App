@@ -70,7 +70,9 @@ HOW TO RUN (Spyder: open this file, press F5)
   3. Keep MEIO_Data_Template.xlsx next to this file (or change DATA_FILE).
 ================================================================================
 """
+import contextlib
 import copy
+import io
 import math
 import sys
 import time
@@ -104,6 +106,8 @@ OPTIMIZATION_FILL_RATE = None                 # None = Excel Items!TargetFillRat
 START_POLICY_OUT_OF_SAMPLE = False            # also evaluate the start policy on the fresh scenarios (+~75 s)
 FEASIBILITY_CHECK = True                      # section 4b: ~25 s (one extra model); False skips it
 START_REPAIR = True                           # section 4c: repair an infeasible start (K21); normally not needed
+PARALLEL_START_CHECK = 4                      # section 4d: start-check evaluations at the same time, each in its own
+                                              # process (same numbers, ~90 s faster); 1 = one after another (v18.3)
 WASTE_WARNING_SHARE = 0.05                    # warn if expected waste > 5% of expected demand (L10)
 HORIZON_MARGIN_WEEKS = 8                      # input warning X10 if horizon < echelon lead time + R + this (A02)
 REPORT_INTERVAL_SECONDS = 30                  # Seeker progress line every … seconds
@@ -126,7 +130,7 @@ START_EXTRA_WEEKS_RM = 4       # RM cover window = max RM lead time + max produc
 START_LOT_WEEKS = 4            # order-up-to S = reorder point s + this many weeks of average demand (≥ MOQ,
                                # ≤ what one fresh lot can sell before it expires)
 
-SCRIPT_VERSION = "2026-11-17 v18.3 (Seeker-only)"
+SCRIPT_VERSION = "2026-11-20 v18.5 (Seeker-only)"
 EPS = 1e-9
 TIMINGS = []                                  # (phase, seconds) — printed at the end and written to the report
 
@@ -1202,6 +1206,7 @@ class SeekerModel:
     detail: dict = None                        # report series (only built for the out-of-sample check, L05–L08)
     firm: dict = None                          # week -> firm production order quantity (D06)
     firm_start: dict = None                    # (week of the firm order, week) -> 1 if it starts that week (R ≥ 2)
+    policy: dict = None                        # the (s,S) values of the model (out-of-sample model only; L05)
 
 
 SUPPORTS_MAX_SAMPLE = {}
@@ -1541,7 +1546,8 @@ def build_model(skr, env, d, layout, x_start, seed, resolution, detail=False):
         env.enforce_geq(fr_mean[(ci, t)], d.fill_rate_target, f"FR_{d.channels[ci].id}_w{t}")
     return SeekerModel(env, T, variables, objective, total, cost_parts, fill_rate, fr_mean, constrained,
                        demand, lead_prod, lead_rm, open_prod_arr, open_rm_arr, prod_qty, prod_arr, rm_order, rm_arr,
-                       fg_end, fg_waste, rm_end, rm_waste, holding, keep, det if detail else None, firm, firm_start)
+                       fg_end, fg_waste, rm_end, rm_waste, holding, keep, det if detail else None, firm, firm_start,
+                       layout.decode(x_start) if detail else None)
 
 
 # ============================================================================
@@ -1657,6 +1663,15 @@ def start_z_text(d, rec):
     return f"z = {z:.2f} ({src})"
 
 
+def start_z_grid(z0):
+    """The z values the start check tries after z₀, in this order (empty if z₀ is already START_Z_MAX)."""
+    if z0 >= START_Z_MAX - EPS:
+        return []
+    first = START_Z_STEP * (math.floor((z0 + 0.1) / START_Z_STEP + EPS) + 1)  # fixed grid 0.5, 1.0, 1.5, … above z₀ + 0.1,
+    return [first + START_Z_STEP * i for i in range(100)                       # so a lower target never ends on a
+            if first + START_Z_STEP * i < START_Z_MAX - EPS] + [START_Z_MAX]   # higher z than a higher target
+
+
 def raise_start_z(skr, d, layout, z0, start0, max_fr, license_file):
     """Start check, step 2 (K07): the start with z₀ misses cells that the maximum-supply policy meets. Raise z to the
     next multiples of START_Z_STEP up to START_Z_MAX, each start evaluated once by Seeker; stop at the first that misses nothing that
@@ -1664,12 +1679,9 @@ def raise_start_z(skr, d, layout, z0, start0, max_fr, license_file):
     (then the cheaper), and the start repair (section 4c) continues from it."""
     rec = dict(z0=z0, steps=[dict(z=z0, met=start0["met"], cost=start0["cost"])])
     best = (start0["met"], -start0["cost"], z0, start_policy(d, z=z0), start0)
-    first = START_Z_STEP * (math.floor((z0 + 0.1) / START_Z_STEP + EPS) + 1)  # fixed grid 0.5, 1.0, 1.5, … above z₀ + 0.1,
-    zs = [first + START_Z_STEP * i for i in range(100)                         # so a lower target never ends on a
-          if first + START_Z_STEP * i < START_Z_MAX - EPS] + [START_Z_MAX]     # higher z than a higher target
     print(f"Start check: the start with z = {z0:.2f} meets {start0['met']} of {len(start0['fr'])} cells → raising z "
           f"(section 4)", flush=True)
-    for z in zs if z0 < START_Z_MAX - EPS else []:
+    for z in start_z_grid(z0):
         pol = start_policy(d, z=z)
         fr, cost = evaluate_policy(skr, d, layout, pol, license_file, f"4. Start check: Seeker evaluates the start with z = {z:.2f}")
         num = dict(cost=cost, met=len(rules_met(d, fr)), fr=fr)
@@ -1770,7 +1782,11 @@ def max_supply_policy(d, layout):
 def evaluate_policy(skr, d, layout, pol, license_file, title):
     """Seeker evaluates one fixed policy on the optimization scenarios (same count and seed as section 5), in its
     own environment with bounds widened to contain the policy. Returns ({(channel, week): expected fill rate} for
-    the constrained cells, expected cost)."""
+    the constrained cells, expected cost). Already evaluated by the parallel start check (section 4d): its numbers."""
+    done = PRE_EVALUATED.get(policy_key(pol))
+    if done is not None:
+        print(f"{title}: evaluated in parallel (section 4d)", flush=True)
+        return dict(done[0]), done[1]
     lay = copy.deepcopy(layout)
     lay.include_start(pol, margin=1.0)
     with phase(title):
@@ -1908,6 +1924,115 @@ def repair_note(rec):
     steps = "; ".join(f"{s['step']} {s['met']}/{rec['n']}" for s in rec["steps"])
     return (f"USED: start policy met {rec['start_met']} of {rec['n']} rules ({rec['target']} can be met); steps {steps}; "
             f"Seeker started from {rec['chosen']}")
+
+
+# ============================================================================
+# 4d. PARALLEL START CHECK — the same evaluations as sections 4 and 4b, at the same time (K07)
+# ============================================================================
+# Sections 4 and 4b evaluate, one after another, the maximum-supply policy, the start with z₀ and then z on the
+# fixed grid until a start misses nothing that can be met. Each evaluation is a separate Seeker model on the same
+# scenarios (same count and seed), so they can run at the same time in separate processes. This section does
+# that before section 4b and stops once the start check's answer is known; evaluate_policy then takes the numbers
+# from PRE_EVALUATED instead of evaluating again. Every decision stays with sections 4, 4b and 4c, unchanged.
+# Each process reads the data file itself (with the run overrides and section 0 settings of this run) and
+# rebuilds the policy; its numbers are only used if it is bit for bit the policy this run evaluates. If anything
+# goes wrong (e.g. no separate processes possible), the run continues one after another, as in v18.3.
+PRE_EVALUATED = {}                     # policy_key(policy) -> (fill rates, expected cost) of this run
+PARALLEL_TIMEOUT_SECONDS = 900
+
+
+def policy_key(pol):
+    """The policy's exact numbers (a dictionary key)."""
+    return tuple((j, np.asarray(s, float).tobytes(), np.asarray(S, float).tobytes()) for j, (s, S) in sorted(pol.items()))
+
+
+def _real_seeker(skr):
+    return getattr(skr, "__file__", None) is not None          # the installed Seeker (not a test double)
+
+
+def _settings():
+    """Section 0 settings of this run (the app may change them), for the separate processes."""
+    return {k: v for k, v in globals().items() if k.isupper() and k not in ("TIMINGS", "PRE_EVALUATED")
+            and isinstance(v, (bool, int, float, str, type(None), dict, list, tuple))}
+
+
+def _start_check_worker(job, skr=None):
+    """One evaluation in its own process: data, layout and policy as in the run, then evaluate_policy."""
+    data_file, overrides, settings, ub_var, license_file, kind, z = job
+    globals().update(settings)
+    d = load_data(data_file)
+    apply_overrides(d, overrides)
+    validate(d)
+    layout = PolicyLayout(d)
+    layout.ub_var = list(ub_var)
+    pol = max_supply_policy(d, layout) if kind == "max" else start_policy(d, z=z)
+    skr = skr or import_seeker()
+    with contextlib.redirect_stdout(io.StringIO()):            # its progress lines would mix with the run's
+        fr, cost = evaluate_policy(skr, d, layout, pol, license_file, "")
+    return policy_key(pol), fr, cost
+
+
+def _worker_function():
+    """_start_check_worker as a function of an importable module: when this file runs as a script (F5 in Spyder),
+    the separate processes could not find functions of '__main__', so the file is imported once under its name."""
+    if __name__ != "__main__":
+        return _start_check_worker
+    import importlib
+    folder = str(Path(__file__).resolve().parent)
+    if folder not in sys.path:
+        sys.path.insert(0, folder)
+    return importlib.import_module(Path(__file__).stem)._start_check_worker
+
+
+def _run_start_jobs(jobs, workers, stop, worker=None):
+    """Runs the jobs in separate processes (oldest first); stops once stop(results) is True. {job index: result}."""
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    out, finished = {}, False
+    ex = ProcessPoolExecutor(max_workers=min(workers, len(jobs)), mp_context=mp.get_context("spawn"))
+    try:
+        futures = {ex.submit(worker or _worker_function(), job): i for i, job in enumerate(jobs)}
+        for f in as_completed(futures, timeout=PARALLEL_TIMEOUT_SECONDS):
+            out[futures[f]] = f.result()
+            if stop(out):
+                break
+        finished = True
+    finally:
+        ex.shutdown(wait=finished, cancel_futures=True)
+    return out
+
+
+def parallel_start_check(skr, d, layout, z0, data_file, license_file, overrides):
+    """Fills PRE_EVALUATED with maximum supply, z₀ and the z grid (section 4), evaluated at the same time."""
+    PRE_EVALUATED.clear()
+    if PARALLEL_START_CHECK <= 1 or START_Z is not None or not _real_seeker(skr):
+        return
+    plans = [("max", None), ("z", z0)] + [("z", z) for z in start_z_grid(z0)]
+    pols = [max_supply_policy(d, layout) if k == "max" else start_policy(d, z=z) for k, z in plans]
+    base = (str(Path(data_file).resolve()), overrides, _settings(), list(layout.ub_var), str(Path(license_file).resolve()))
+    jobs = [base + plan for plan in plans]
+
+    def answer_known(res):                        # the start check's answer (sections 4/4b) needs no other plan
+        if 0 not in res:
+            return False
+        for i in range(1, len(plans)):
+            if i not in res:
+                return False
+            if not start_misses(d, res[i][1], res[0][1]):
+                return True
+        return True
+
+    with phase(f"4d. Start check in parallel: up to {len(plans)} evaluations, {PARALLEL_START_CHECK} at a time"):
+        try:
+            res = _run_start_jobs(jobs, PARALLEL_START_CHECK, answer_known)
+        except Exception as e:                    # noqa: BLE001 — any failure: one after another, as before
+            print(f"Parallel start check not possible ({type(e).__name__}: {e}) → one after another", flush=True)
+            return
+    for i, (key, fr, cost) in res.items():
+        if key == policy_key(pols[i]):
+            PRE_EVALUATED[key] = (fr, cost)
+    names = ["maximum supply" if k == "max" else f"z = {z:.2f}" for i, (k, z) in enumerate(plans) if i in res]
+    print(f"Parallel start check: {', '.join(names)} evaluated ({len(PRE_EVALUATED)} of {len(res)} used)", flush=True)
 
 
 # ============================================================================
@@ -2112,6 +2237,32 @@ def arrival_candidates(d, item, t, lt):
     return range(t + int(lt.values.min()), hi + 1)
 
 
+ORDER_NONE = 1e15                                         # stands for "no order" in the order-quantity shares
+
+
+def order_lattice(d, item, t, policy=None):
+    """Every quantity an order of `item` placed (FG: started) in week t can have, smallest first (D01, D02, D06):
+    multiples of the order multiple / batch from the MOQ to the maximum. With the week's (s, S) the range is cut to
+    what the rule can order (position ≥ 0 and < s): RM [⌈S − s⌉, max(MOQ, ⌈S⌉)]; FG up to max(MOQ, ⌈S⌉) (down to the
+    MOQ: material can cut it; R ≥ 2: waiting firm orders can start together, so up to the maximum). The maximum
+    itself always stays in, so a quantity outside the cut range would still be counted (and reported)."""
+    if item == d.fg_id:
+        key, step, lo = "FG", d.prod_batch, d.prod_moq
+        top = math.floor(d.prod_max / step + EPS) * step
+    else:
+        k = next(r for r in d.rms if r.id == item)
+        key, step, lo, top = k.id, k.multiple, k.moq, k.max_order
+    lo, hi = max(lo, step), top
+    if policy and key in policy:
+        s, S = policy[key][0][t], policy[key][1][t]
+        if item != d.fg_id or d.review_period == 1:
+            hi = min(top, max(lo, step * math.ceil(S / step - EPS)))
+        if item != d.fg_id:
+            lo = min(hi, max(lo, step * math.ceil((S - s) / step - EPS)))
+    vals = [lo + step * i for i in range(int(round((hi - lo) / step)) + 1)]
+    return vals + ([top] if hi < top - EPS else [])
+
+
 def detail_numbers(model, d):
     """Single numbers of the report series (L05–L07), read from the out-of-sample model only."""
     H, det, fg = d.horizon, model.detail, d.fg_id
@@ -2138,6 +2289,11 @@ def detail_numbers(model, d):
     for name, item, t, term in series:
         for kind in BAND_STATS:
             num[("band", name, item, t, kind)] = read(term, kind)
+    for name, item, t, q in series:                       # order quantity over the futures that order (L05)
+        if name == "order_qty" and hasattr(q, "get_value"):
+            above = -(q + (q < 0.5) * ORDER_NONE)             # −quantity; −ORDER_NONE where nothing is ordered
+            for v in order_lattice(d, item, t, model.policy):
+                num[("q_le", item, t, v)] = single_number(model, above, "share", -v)   # P(order and quantity ≤ v)
     for t in range(1, H + 1):
         num[("band_aux", "rsl_num", fg, t)] = read(det[("rsl_num", fg, t)], "mean")
         num[("band", "no_stock_share", fg, t, "mean")] = read(det[("no_stock", fg, t)], "share", -0.5)
@@ -2148,6 +2304,33 @@ def detail_numbers(model, d):
             if key[1] != "avg_end_stock":                # share of scenarios where it happens at all
                 num[("kpi",) + key[1:] + ("share",)] = read(term, "share", 0.5)
     return num
+
+
+def order_qty_if_ordered(oos, d):
+    """Band series order_qty_if_ordered (L05): the order quantity over the futures that order in that week (empty if
+    none). Mean = mean over all futures ÷ P(order), exact. Quantile q = the (⌊q·n⌋+1)-th smallest of the n futures
+    that order (Seeker's rule for the other bands), from the counts P(order and quantity ≤ v) × N on the lattice."""
+    fg, N = d.fg_id, oos.get("n")
+    lat = {}
+    for key in [k for k in oos if isinstance(k, tuple) and k[0] == "q_le"]:
+        lat.setdefault(key[1:3], []).append((key[3], oos[key]))
+    for (_, _, item, t, _) in [k for k in oos if isinstance(k, tuple) and k[:2] == ("band", "order_qty") and k[4] == "mean"]:
+        j = "prod" if item == fg else item
+        p, pts = oos.get((j, "p_order", t), 0.0), sorted(lat.get((item, t), []))
+        if pts and p > 1e-12 and pts[-1][1] < p - 1e-9:
+            print(f"WARNING (L05): {item} week {t}: order quantities outside the expected range", flush=True)
+        for kind in BAND_STATS:
+            if p <= 1e-12:
+                v = float("nan")
+            elif kind == "mean":
+                v = oos[(j, "mean", t)] / p
+            elif not pts:                                        # same quantity in every future
+                v = oos[("band", "order_qty", item, t, kind)]
+            else:
+                q = int(kind[1:]) / 100.0
+                need = (math.floor(q * round(p * N) + 1e-9) + 1) / N if N else q * p
+                v = next((w for w, sh in pts if sh >= need - 1e-9), pts[-1][0])
+            oos[("band", "order_qty_if_ordered", item, t, kind)] = v
 
 
 def derived_numbers(oos, d):
@@ -2175,6 +2358,7 @@ def derived_numbers(oos, d):
                 q = int(kind[1:]) / 100.0
                 v = next((w for w, sh in pts if sh / p >= q - 1e-9), pts[-1][0])
             oos[("band", "arrival_week", item, t, kind)] = v
+    order_qty_if_ordered(oos, d)
     for t in range(1, d.horizon + 1):
         if ("band_aux", "rsl_num", fg, t) in oos:
             stock = oos[("fg_end", t)]
@@ -2200,8 +2384,7 @@ def out_of_sample(skr, d, layout, x, license_file, detail=True, label="Out-of-sa
             for key, read in readers.items():
                 total[key] = total.get(key, 0.0) + read() * n
             env.end()
-    oos = derived_numbers({key: v / sum(sizes) for key, v in total.items()}, d)
-    oos["n"] = sum(sizes)
+    oos = derived_numbers(dict({key: v / sum(sizes) for key, v in total.items()}, n=sum(sizes)), d)
     odd = [k for k in oos if isinstance(k, tuple) and k[1] == "p10" and oos[k] > oos[(k[0], "p90", k[2])] + 1e-6]
     if odd:                                                  # plausibility gate on Seeker's quantile convention
         print(f"WARNING: P10 > P90 for {len(odd)} decision series — check aggregate_quantile semantics", flush=True)
@@ -2353,8 +2536,8 @@ def build_report(d, layout, x, ins, oos, oos_start=None):
             "Bands": bands, "KPIs": kpis}
 
 
-BAND_SERIES = ("end_stock", "position", "waste", "order_qty", "arrival_week", "receipts", "served", "lost",
-               "eligible_next_week", "rsl_mean", "no_stock_share")
+BAND_SERIES = ("end_stock", "position", "waste", "order_qty", "order_qty_if_ordered", "arrival_week", "receipts",
+               "served", "lost", "eligible_next_week", "rsl_mean", "no_stock_share")
 
 
 def band_and_kpi_tables(d, ins, oos, oos_start=None):
@@ -2508,8 +2691,17 @@ def run(data_file=None, license_file=None, time_limit=None, skr=None, overrides=
           f"{START_EXTRA_WEEKS_RM}, lot {START_LOT_WEEKS} weeks. Bounds: section 2, EXTRA_COVER_WEEKS {EXTRA_COVER_WEEKS}. "
           f"Search space 10^{layout.search_space_log10():.0f}.", flush=True)
 
+    parallel_start_check(skr, d, layout, z0, data_file, license_file, overrides)    # section 4d
     max_fr = feasibility_check(skr, d, layout, license_file) if FEASIBILITY_CHECK else None   # section 4b
-    x, ins = optimize(skr, d, layout, x0, license_file, time_limit, max_fr)  # section 5 (incl. start check)
+    done = PRE_EVALUATED.get(policy_key(pol0))
+    if done is not None and len(rules_met(d, done[0])) < len(done[0]) and \
+            (max_fr is None or start_misses(d, done[0], max_fr)):      # 4d: the start fails → no search model yet
+        ins = dict(start=dict(cost=done[1], met=len(rules_met(d, done[0])), fr=dict(done[0])))
+        print(f"Start policy on Seeker's scenarios: expected cost {done[1]:,.0f}, {ins['start']['met']}/"
+              f"{len(done[0])} fill-rate constraints met (section 4d)", flush=True)
+        x = None
+    else:
+        x, ins = optimize(skr, d, layout, x0, license_file, time_limit, max_fr)  # section 5 (incl. start check)
     repair = dict(used=False)
     if x is None:                                    # start check failed → higher z (4), repair (4c), then 5 again
         start0 = ins["start"]
@@ -2539,6 +2731,7 @@ def run(data_file=None, license_file=None, time_limit=None, skr=None, overrides=
                       flush=True)
         x, ins = optimize(skr, d, layout, x0, license_file, time_limit, max_fr if FEASIBILITY_CHECK else None,
                           start_check=False, formula_fr=start0["fr"])
+    PRE_EVALUATED.clear()
     ins["repair"], ins["start_z"] = repair, zrec
     if layout.at_bound(x):
         print(f"NOTE: reorder point(s) at their upper bound: {bound_note(layout, x)}", flush=True)

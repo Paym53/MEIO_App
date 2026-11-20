@@ -643,30 +643,80 @@ def test_label_and_note_can_be_changed_later(api, done):
     assert api.patch("/runs/20991231-235959-ffff", json={"label": "a"}).status_code == 404
 
 
-def scenarios(n, t):
-    return server.expected_seconds({"time_limit": t, "overrides": {"NumScenarios": n}, "baseline": False})
+def scenarios(n, t, **course):
+    return server.expected_seconds({"time_limit": t, "overrides": {"NumScenarios": n}, "baseline": False}, **course)
 
 
 def test_the_time_estimate_matches_the_measured_runs():
-    assert scenarios(120, 120) == pytest.approx(290, rel=0.2)    # user's PC 13.11., v18.1: ≈ 290 s, 3 z steps
-    assert scenarios(200, 300) == pytest.approx(600, rel=0.1)    # engine session: ≈ 10 min
-    assert scenarios(500, 700) == pytest.approx(1140, rel=0.1)   # engine session: ≈ 19 min
+    one_by_one = {"z_steps": 3, "parallel": False}                 # v18.1–v18.3: feasibility check + 3 z steps in a row
+    assert scenarios(120, 120, **one_by_one) == pytest.approx(290, rel=0.2)    # user's PC 13.11., v18.1: ≈ 290 s
+    assert scenarios(200, 300, **one_by_one) == pytest.approx(600, rel=0.1)    # engine session: ≈ 10 min
+    assert scenarios(500, 700, **one_by_one) == pytest.approx(1140, rel=0.1)   # engine session: ≈ 19 min
+    for n, t in ((120, 120), (200, 300), (500, 700)):               # v18.4: one parallel round, ≈ 40–90 s faster
+        saved = scenarios(n, t, **one_by_one) - scenarios(n, t)
+        assert 35 < saved < 100, (n, t, saved)
+    assert server.ETA_PARALLEL_FACTOR * server.step_seconds(200) == pytest.approx(33, abs=1)  # measured 18.11.
     default = server.expected_seconds({})
-    assert server.expected_seconds({"feasibility_check": False}) == pytest.approx(default - 21)
+    assert server.expected_seconds({"feasibility_check": False}) == pytest.approx(default)     # inside the round
+    assert server.expected_seconds({"feasibility_check": False}, parallel=False) == pytest.approx(
+        server.expected_seconds({}, parallel=False) - 21)
     assert server.expected_seconds({"start_policy_out_of_sample": True}) == pytest.approx(default + 82.5)
-    assert server.expected_seconds({}, z_steps=0) < default < server.expected_seconds({}, repair=True)
+    assert server.expected_seconds({}, parallel=False) < default < server.expected_seconds({}, repair=True)
 
 
 def test_the_estimate_follows_the_start_check_in_the_log():
-    z = server.Z_STEP_PHASE
-    assert server.start_check_course([], []) == (3, False)                       # nothing seen yet: 3 steps
-    assert server.start_check_course([f"{z} = 1.50", f"{z} = 2.00", f"{z} = 2.50"], []) == (4, False)  # still raising
+    z, par = server.Z_STEP_PHASE, f"{server.PARALLEL_PHASE}: up to 9 evaluations, 4 at a time"
     done = ["Start check: Seeker starts from z = 2.50"]
-    assert server.start_check_course([f"{z} = 1.50", f"{z} = 2.00"], done) == (2, False)
-    assert server.start_check_course(["5. Seeker optimization (time limit 1 s)"], []) == (0, False)  # no check needed
-    assert server.start_check_course([f"{z} = 4.00", "4c. Start repair R1: Seeker evaluates"], done) == (1, True)
+    assert server.start_check_course([], []) == (0, False, True)                     # not known yet: parallel (v18.4)
+    assert server.start_check_course([par], []) == (0, False, True)
+    assert server.start_check_course([par, "5. Seeker optimization (time limit 1 s)"], []) == (0, False, True)
+    assert server.start_check_course([par, f"{z} = 4.00"], done) == (1, False, True)  # a step the round did not answer
+    fallback = ["Parallel start check not possible (OSError: x) → one after another"]
+    assert server.start_check_course([par], fallback) == (3, False, False)          # one after another, as v18.3
+    # one after another (test double, fixed START_Z, or the fallback): every z step prints its own phase
+    assert server.start_check_course([f"{z} = 1.50", f"{z} = 2.00", f"{z} = 2.50"], []) == (4, False, False)
+    assert server.start_check_course([f"{z} = 1.50", f"{z} = 2.00"], done) == (2, False, False)
+    assert server.start_check_course(["5. Seeker optimization (time limit 1 s)"], []) == (0, False, False)
+    assert server.start_check_course([f"{z} = 4.00", "4c. Start repair R1: Seeker evaluates"], done) == (1, True, False)
     r1b = "4c. Start repair R1b: Seeker evaluates"                                                   # v18.2
-    assert server.start_check_course([f"{z} = 4.00", r1b], done) == (1, True)
+    assert server.start_check_course([f"{z} = 4.00", r1b], done) == (1, True, False)
+
+
+CHILD = """import subprocess, sys, time
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+open(sys.argv[1], "w").write(str(child.pid))
+time.sleep(120)
+"""
+
+
+def alive(pid):
+    if os.name == "nt":
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True).stdout
+        return str(pid) in out
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().split()[2] != "Z"                # a zombie is dead
+    except FileNotFoundError:
+        return False
+
+
+def test_stopping_a_worker_also_stops_the_processes_it_started(tmp_path):
+    """Engine v18.4 starts up to 4 Seeker processes for the start check; cancel and the watchdog must end them too."""
+    script, pid_file = tmp_path / "parent.py", tmp_path / "child.pid"
+    script.write_text(CHILD, encoding="utf-8")
+    with open(tmp_path / "log.txt", "wb") as log:
+        proc = server.popen_worker([sys.executable, "-u", str(script), str(pid_file)], log)
+    t0 = time.time()
+    while not (pid_file.exists() and pid_file.read_text()) and time.time() - t0 < 20:
+        time.sleep(0.1)
+    child = int(pid_file.read_text())
+    assert alive(child)
+    server.stop_worker(proc)
+    proc.wait(timeout=10)
+    t0 = time.time()
+    while alive(child) and time.time() - t0 < 10:
+        time.sleep(0.2)
+    assert not alive(child)
+    server.stop_worker(proc)                                                         # already stopped: nothing happens
 
 
 def test_runs_of_older_engines_are_not_shown(api, tmp_path, monkeypatch, done):
@@ -1029,3 +1079,14 @@ def test_results_of_runs_made_before_the_newest_fields_are_still_served(api, don
     r = api.get(f"/runs/{old.name}/result")
     assert r.status_code == 200, r.text
     assert (r.json()["headline"]["firm_orders"], r.json()["headline"]["bound_points"]) == ("", [])
+
+
+def test_the_order_quantity_if_ordered_reaches_the_result(done):
+    """Engine v18.5 (change request 20.11.): Bands order_qty_if_ordered for production and every raw material."""
+    bands = pd.DataFrame(done[2]["sheets"]["Bands"]["rows"], columns=done[2]["sheets"]["Bands"]["columns"])
+    new = bands[bands["Series"] == "order_qty_if_ordered"]
+    assert set(new["Item"]) == {"FG1", "RM1", "RM2", "RM3", "RM4"}
+    both = new.merge(bands[bands["Series"] == "order_qty"], on=["Item", "Week"], suffixes=("_if", "_all"))
+    ordered = both[both["Mean_if"].notna()]
+    assert len(ordered) and (ordered["Mean_if"] >= ordered["Mean_all"] - 1e-9).all()      # ≥ the all-futures mean
+    assert (both.loc[both["Mean_all"] == 0, "Mean_if"].isna()).all()                     # never ordered → empty
