@@ -31,12 +31,13 @@ import json
 import os
 import re
 import secrets
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -78,9 +79,15 @@ VALIDATE_TIMEOUT_SECONDS = 120
 #     + one more build and start evaluation; a start repair (4c lines) adds up to 7 more evaluations (v18.2: R1b),
 #   search = time limit + 10 % + 10 s, out-of-sample check 0.033 s per fresh scenario (twice with the start policy).
 #   Totals: 200 scenarios / 300 s ≈ 9.5 min, 500 / 700 s ≈ 18 min (engine session: ≈ 10 and 19 min).
+# Engine v18.4: with real Seeker the start check (maximum supply = the feasibility check, z₀ and the z grid) runs as one
+#   parallel round (section 4d, up to 4 evaluations at once: 33 s where one takes 20–25 s, 18.11.) ≈ ETA_PARALLEL_FACTOR
+#   × one evaluation, instead of the feasibility check + z steps one after another. The log shows which way a run went:
+#   a "4d." phase (parallel), or "4. Start check … z = …" phases (one after another: test double, fixed START_Z, or the
+#   console line "Parallel start check not possible").
 ETA_BASE_SECONDS, ETA_PER_SCENARIO_SECONDS, ETA_FEASIBILITY_SECONDS = 20.0, 0.1, 21.0
 ETA_Z_STEPS, ETA_STEP_SECONDS, ETA_STEP_PER_SCENARIO_SECONDS, ETA_SECOND_BUILD_SECONDS = 3, 8.0, 0.06, 12.0
 ETA_REPAIR_STEPS = 7                                                       # v18.2: + R1b
+ETA_PARALLEL_FACTOR = 1.65                                                 # v18.4: one parallel round (section 4d)
 ETA_ASSUMED_SCENARIOS = 200                                                # Excel NumScenarios of the template
 ETA_OOS_SECONDS_PER_SCENARIO, ETA_SEARCH_OVERRUN, ETA_SEARCH_OVERHEAD_SECONDS = 0.033, 0.10, 10.0
 WATCHDOG_FACTOR = 3.0                                                      # a run taking 3 × its estimate is stopped
@@ -91,6 +98,8 @@ PHASE_START = re.compile(r"^\[\d\d:\d\d:\d\d\] (.+) \.\.\.$")              # eng
 Z_STEP_PHASE = "4. Start check: Seeker evaluates the start with z"             # one per z step (phase names repeat:
 REPAIR_PHASE = "4c. Start repair"                                              # lines are counted, never keyed)
 START_CHECK_DONE = "Start check: Seeker starts from z"
+PARALLEL_PHASE = "4d. Start check in parallel"                                 # engine v18.4, section 4d
+PARALLEL_FAILED = "Parallel start check not possible"                          # → one after another, as v18.3
 MAX_EDITS = 5000                                                           # edits per what-if (one request)
 
 # The app's own rules (what-if editing, run settings, comparisons), shown on Explainability next to the engine's
@@ -265,26 +274,35 @@ def step_seconds(scenarios):
     return ETA_STEP_SECONDS + ETA_STEP_PER_SCENARIO_SECONDS * scenarios
 
 
-def expected_seconds(settings, z_steps=ETA_Z_STEPS, repair=False):
-    """Expected run time. z_steps / repair: the start check's real course, once the log shows it."""
+def expected_seconds(settings, z_steps=0, repair=False, parallel=True):
+    """Expected run time. Default: v18.4's parallel start check (one round, which includes the feasibility check's
+    evaluation). z_steps / repair / parallel: the start check's real course, once the log shows it."""
     s = {**DEFAULT_SETTINGS, **settings}
     n = (s["overrides"] or {}).get("NumScenarios", ETA_ASSUMED_SCENARIOS)
     checks = 1 + bool(s["start_policy_out_of_sample"]) + bool(s.get("baseline"))      # fresh-scenario evaluations
     check = ETA_OOS_SECONDS_PER_SCENARIO * s["out_of_sample_scenarios"] * checks
-    feasibility = ETA_FEASIBILITY_SECONDS if s["feasibility_check"] else 0.0
-    start = z_steps * step_seconds(n) + (ETA_SECOND_BUILD_SECONDS if z_steps else 0.0) + \
+    feasibility = ETA_FEASIBILITY_SECONDS if s["feasibility_check"] and not parallel else 0.0
+    evaluations = (ETA_PARALLEL_FACTOR if parallel else 0.0) + z_steps
+    start = evaluations * step_seconds(n) + (ETA_SECOND_BUILD_SECONDS if evaluations else 0.0) + \
         (ETA_REPAIR_STEPS * step_seconds(n) if repair else 0.0)
     search = float(s["time_limit"]) * (1 + ETA_SEARCH_OVERRUN) + ETA_SEARCH_OVERHEAD_SECONDS
     return ETA_BASE_SECONDS + ETA_PER_SCENARIO_SECONDS * n + feasibility + start + search + check
 
 
 def start_check_course(phases, lines):
-    """(z steps to plan for, repair seen) from the log: every z step and repair step prints its own phase line; while
-    the check is still raising z, plan for at least one more step (the engine session's default: 3 steps)."""
+    """(z steps one after another, repair seen, parallel) from the log. Until the log says otherwise the start check
+    runs in parallel (v18.4). One after another (z steps printed as their own phases, or the engine's fallback line):
+    every z step and repair step prints its own phase line; while the check is still raising z, plan for at least one
+    more step (the engine session's default: 3 steps)."""
     seen = sum(p.startswith(Z_STEP_PHASE) for p in phases)
+    repair = any(p.startswith(REPAIR_PHASE) for p in phases)
+    failed = any(PARALLEL_FAILED in ln for ln in lines)
     done = any(START_CHECK_DONE in ln for ln in lines) or any(p.startswith("5. Seeker optimization") for p in phases)
-    steps = seen if done else max(ETA_Z_STEPS, seen + 1)
-    return steps, any(p.startswith(REPAIR_PHASE) for p in phases)
+    if any(p.startswith(PARALLEL_PHASE) for p in phases) and not failed:
+        return seen, repair, True                         # the round, plus any step it could not answer
+    if not (seen or failed or done):
+        return 0, repair, True                            # not known yet: real Seeker runs it in parallel
+    return (seen if done else max(ETA_Z_STEPS, seen + 1)), repair, False
 
 
 def progress(folder, status):
@@ -295,8 +313,8 @@ def progress(folder, status):
     left = None
     if status["state"] == "running":
         elapsed = (dt.datetime.now().astimezone() - dt.datetime.fromisoformat(status["started"])).total_seconds()
-        steps, repair = start_check_course(phases, lines)
-        left = max(0.0, expected_seconds(settings_of(status), steps, repair) - elapsed)
+        steps, repair, parallel = start_check_course(phases, lines)
+        left = max(0.0, expected_seconds(settings_of(status), steps, repair, parallel) - elapsed)
     return {"phase": phases[-1] if phases else None, "seconds_left": left, "log_tail": lines[-LOG_TAIL_LINES:]}
 
 
@@ -321,6 +339,26 @@ def busy():
         read_status(RUNS_DIR / run_id)["state"] == "running"
 
 
+def popen_worker(cmd, log):
+    """The worker process. Outside Windows it gets its own process group, so stop_worker can end the processes it
+    starts too (engine v18.4: up to PARALLEL_START_CHECK Seeker processes for the start check, section 4d)."""
+    group = {} if os.name == "nt" else {"start_new_session": True}
+    return subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, cwd=str(ROOT), env=worker_env(), **group)
+
+
+def stop_worker(proc):
+    """Stops the worker and every process it started: on Windows the whole tree (taskkill /T), elsewhere its group."""
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, check=False)
+    else:
+        with suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+    if proc.poll() is None:
+        proc.kill()
+
+
 def let_finished_worker_exit():
     """Before a new run starts: wait for the previous, finished worker to exit; stop it if it hangs (its results
     are already written)."""
@@ -330,7 +368,7 @@ def let_finished_worker_exit():
     try:
         proc.wait(timeout=EXIT_WAIT_SECONDS)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        stop_worker(proc)
         proc.wait()
 
 
@@ -339,7 +377,7 @@ def watch(run_id, proc, folder, settings):
     try:
         code = proc.wait(timeout=WATCHDOG_FACTOR * expected_seconds(settings))
     except subprocess.TimeoutExpired:
-        proc.kill()
+        stop_worker(proc)
         code = proc.wait()
         update_status(folder, state="failed", finished=now(), message="Stopped: the run took far longer than expected.")
     status = read_status(folder)
@@ -376,7 +414,7 @@ def start_run(data, file_name, settings, label_and_note=None, origin=None):
                                             "changes": len(origin["changes"]) if origin else 0})
         cmd = [sys.executable, "-u", str(WORKER), "run", str(folder), str(LICENSE_FILE)]
         with open(folder / "log.txt", "wb") as log:
-            proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, cwd=str(ROOT), env=worker_env())
+            proc = popen_worker(cmd, log)
         thread = threading.Thread(target=watch, args=(run_id, proc, folder, settings), daemon=True)
         CURRENT.update(id=run_id, proc=proc, thread=thread, cancelled=False)
         thread.start()
@@ -863,7 +901,7 @@ def cancel_run(run_id: str):
         if CURRENT["id"] != run_id or not busy():
             raise HTTPException(409, "This run is not in progress.")
         CURRENT["cancelled"] = True
-        CURRENT["proc"].kill()
+        stop_worker(CURRENT["proc"])                                       # with its Seeker processes (v18.4)
         thread = CURRENT["thread"]
     thread.join(timeout=30)                                                # the watcher records "cancelled"
     return get_run(folder.name)

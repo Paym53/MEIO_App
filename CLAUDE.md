@@ -12,15 +12,15 @@ The engine bundle lives in `engine/`, byte-exact. A new engine version replaces 
 | File | What it is | You may edit? |
 |---|---|---|
 | `CLAUDE.md` | this file: everything you need to know | yes (keep it current) |
-| `engine/meio_seeker_stochastic.py` | **the engine** (v18.3, contract version 4): every rule, written once, as Seeker Terms | **no** |
+| `engine/meio_seeker_stochastic.py` | **the engine** (v18.4, contract version 4): every rule, written once, as Seeker Terms | **no** |
 | `engine/reference_simulator.py` | independent second implementation of the rules, used only by the tests | **no** |
 | `engine/meio_stress_tests.py` | 26 data-change scenarios run through the engine (needs Seeker) | **no** |
-| `engine/test_engine.py` | **the engine test suite** (159 tests): input control, physics & dynamics, model functionality, output control, stress cases, engine fingerprint; includes a Seeker test double, so no license needed | **no** |
+| `engine/test_engine.py` | **the engine test suite** (169 tests): input control, physics & dynamics, model functionality, output control, stress cases, engine fingerprint; includes a Seeker test double, so no license needed | **no** |
 | `engine/MEIO_Data_Template.xlsx` | the input file (v18.1 layout, **example data**; the tests depend on it) incl. sheet `Model_Assumptions`; workbooks from v17.x are rejected (handover B1) | **no** (real data goes in `data/`, gitignored) |
 | `engine/MEIO_model_spec.md` | the dynamics/assumptions list: all 86 rules (IDs like C03, H05, K17), same as the Excel sheet | **no** |
 | `engine/MEIO_math_model.md` | the formal model: sets, dynamics, objective, fill-rate rule, Seeker mapping | **no** |
 | `engine/MEIO_shelf_life_aware_policies.md` | archived design of age-aware positions (rejected, K22); the waste warning (L10) refers to it | **no** |
-| `engine/ENGINE_v18_1_HANDOVER.md` | the record of every engine change since v17.1 and why (v18.3 and v18.2 boxes at the top), what the app had to adapt, and the open proposals (section G) | **no** |
+| `engine/ENGINE_v18_1_HANDOVER.md` | the record of every engine change since v17.1 and why (v18.4, v18.3 and v18.2 boxes at the top), what the app had to adapt, and the open proposals (section G) | **no** |
 | `engine/meio_baseline.py` | textbook (s,S) baseline for comparison only (formulas in its header): one fixed (s,S) per stock point, simulated with the engine's own out-of-sample check on the same fresh scenarios; never changes the engine | **no** |
 | `engine/test_baseline.py` | its 9 tests (Seeker test double, no license) | **no** |
 | `MEIO_Results_stochastic.xlsx` | results of a real Seeker run (sheet layout = engine output); on the user's PC only, gitignored | no |
@@ -44,7 +44,7 @@ into CRLF on checkout and the engine fingerprint test would fail on the user's P
   - Show the feasibility line and the bound NOTE prominently.
   - Show the rules missed on fresh scenarios.
   - Compare costs only between plans that meet the same number of rules (there is no lost-sales cost, so a plan that misses rules looks cheaper).
-- **Checks stay green:** `python -m ruff check .` and `python -m pytest` from the repo root (159 engine tests,
+- **Checks stay green:** `python -m ruff check .` and `python -m pytest` from the repo root (169 engine tests,
   about 2.5 min, plus the app's own tests) on every change. CI runs both on Linux and Windows, plus a secret scan.
 
 ## 3. How to work (the user's method) and the user
@@ -189,6 +189,7 @@ start-policy cost and rules met on the same fresh seeds and the fresh-vs-fresh s
 | `START_REPAIR` | True | repair an infeasible start before the search (K21); runs only when needed |
 | `FILL_RATE_CONSTRAINT_FORM` | "mean" | "mean" = rule E (H05); "none" switches the rules off (diagnostic). Use only these two values |
 | `WASTE_WARNING_SHARE` | 0.05 | waste warning limit (L10) |
+| `PARALLEL_START_CHECK` | 4 | v18.4: start-check evaluations at the same time, in separate `spawn` processes (section 4d); 1 = one after another (v18.3). Off automatically with the test double or a fixed `START_Z` |
 | `HORIZON_MARGIN_WEEKS` | 8 | input warning X10 if horizon < echelon lead time + R + this (A02); the Excel Checks row X10 uses the same number |
 | `EXTRA_COVER_WEEKS` | | upper bounds of the reorder points; raise the one named in a bound NOTE |
 
@@ -308,6 +309,27 @@ reading, so the app can overwrite or delete its copies on Windows.
 - **Summary:** new row `Review period (A03)`, e.g. "R = 4 weeks: the model is run every 4 weeks; this run commits weeks 1–4
   (…); next run in week 5". Show it next to the commit table.
 - **Input warning X10** (see above). The start policy's safety stock counts the uncertainty since the last run (K07).
+
+**v18.4 (18.11., engine session; contract version 4 unchanged): parallel start check (section 4d, K07) — faster, same run.**
+- The start check's evaluations (maximum supply K17 = the feasibility check, z₀, the z grid) are independent Seeker models
+  on the same scenarios. Section 4d runs them at the same time in separate processes (`PARALLEL_START_CHECK = 4`), before
+  section 4b, and stops once the start check's answer is known; sections 4, 4b and 4c decide exactly as before from those
+  numbers (`evaluate_policy` takes them from `PRE_EVALUATED`). A process's numbers are used only if it rebuilt exactly the
+  same policy (same data, run overrides, section 0 settings — so the app's run settings such as `EXTRA_COVER_WEEKS` reach it).
+- Off automatically with the test double (so the app's tests never take this path), with a fixed `START_Z`, or if separate
+  processes fail (console `Parallel start check not possible (…) → one after another`). Processes start with `spawn`; the
+  worker's start code is under `if __name__ == "__main__":` (it re-imports `api/worker.py` as `__mp_main__`, harmless).
+- Log: one phase `4d. Start check in parallel: up to N evaluations, 4 at a time`; the 4b / 4 phases then print
+  `…: evaluated in parallel (section 4d)` as plain lines, not as phases. Measured 18.11.: 4 evaluations at once 33 s
+  instead of 4 × 25 s; expect 80–90 s less per run when z is raised. 169 tests (10 new), 6 new mutants caught.
+- Not done (engine session): Seeker's `initialize_solution` (crashes the next search) and Seeker's own parallel search
+  (fails on Windows); out-of-sample batches in parallel are possible but not built (user decision).
+- **App (20.11.):** the time estimate assumes one parallel round (`ETA_PARALLEL_FACTOR` 1.65 × one evaluation, which
+  includes the feasibility check's evaluation) until the log shows the run going one after another (z-step phases or the
+  fallback line); cancel, the watchdog and the exit wait stop the worker's **whole process tree** (`stop_worker`: Windows
+  `taskkill /F /T`, elsewhere the worker's own process group), so no Seeker process outlives a cancelled run (test with a
+  real child process). 169 engine + 9 baseline + 85 app tests. Not yet seen on real Seeker through the API: check that the
+  first real run's log shows the `4d.` phase and no "not possible" line.
 
 **v18.3 (17.11., engine session; contract version 4 unchanged): firm production orders within a review cycle (D06), from the
 app session's change request (issues 1a–1c).**

@@ -14,7 +14,8 @@ implementation, scenario by scenario.
                                lead times, no overtaking, tiers, waste, fill rates; edge cases
   3. MODEL FUNCTIONALITY ..... decision variables & bounds, start policy (target-aware z, lot cap, lot guard), fill-rate rule,
                                fill-rate target from Excel or section 0, priorities, feasibility check, start check
-                               and repair, search model unchanged by the report series, bands, arrival weeks,
+                               and repair, parallel start check (same run as one after another), search model
+                               unchanged by the report series, bands, arrival weeks,
                                KPIs, expected waste and warning, run overrides, start policy on fresh scenarios
   4. OUTPUT CONTROL .......... whole run vs reference, run() result, frozen output schema, errors, files
   5. STRESS-TEST CASES ....... the 26 data changes of meio_stress_tests.py do what they say
@@ -1602,6 +1603,141 @@ def test_start_repair_off_and_not_needed_cases(tmp_path, monkeypatch, capsys):
     assert not res.ins["repair"]["used"] and res.ins["start"]["met"] == len(res.ins["constrained"])
 
 
+# ---------------------------------------------------------------------------- parallel start check (section 4d)
+def _no_search(monkeypatch):
+    """The test double's search is time-based (random); a 0 s search makes two runs comparable."""
+    real = Env.minimize
+    monkeypatch.setattr(Env, "minimize", lambda self, obj, seconds, bound=-1e20: real(self, obj, 0, bound))
+
+
+def _inline_parallel(monkeypatch, calls, keys_ok=True):
+    """Section 4d as with real Seeker, but each 'process' runs here, in order, with the test double."""
+    def runner(jobs, workers, stop, worker=None):
+        out = {}
+        for i, job in enumerate(jobs):
+            calls.append(job[-2:])
+            key, fr, cost = ms._start_check_worker(job, skr=fake)
+            out[i] = (key if keys_ok else ("other",), fr, cost)
+            if stop(out):
+                break
+        return out
+    monkeypatch.setattr(ms, "_real_seeker", lambda skr: True)
+    monkeypatch.setattr(ms, "_run_start_jobs", runner)
+
+
+def _same_run(a, b):
+    assert a.x == b.x
+    for k in ("cost", "met", "fr_mean", "start", "repair", "start_z", "feasibility"):
+        assert a.ins[k] == b.ins[k], k
+    assert a.oos["cost"] == b.oos["cost"]
+    for name, sa in a.sheets.items():
+        if name not in ("Timings",):
+            sb = b.sheets[name]
+            if name == "Summary":
+                sa, sb = (s[~s.iloc[:, 0].astype(str).str.contains("time|Time|seconds|Seeker evaluations")] for s in (sa, sb))
+            pd.testing.assert_frame_equal(sa.reset_index(drop=True), sb.reset_index(drop=True), obj=name)
+
+
+@pytest.mark.parametrize("case", ["template", "fast", "repair", "settings", "z0 ok", "no 4b", "z0 ok, no 4b"])
+def test_parallel_start_check_gives_exactly_the_run_of_one_after_another(tmp_path, monkeypatch, capsys, case):
+    """Section 4d: the same evaluations at the same time give the same run (start, repair, plan, report) as v18.3's
+    one-after-another start check, and it stops once the start check's answer is known."""
+    _no_search(monkeypatch)
+    path, kw = DATA, {}
+    if case == "fast":
+        path = fast_copy(tmp_path)
+    if case == "repair":                                         # the grid ends at 1.5 → the start repair is needed
+        monkeypatch.setattr(ms, "START_Z_MAX", 1.5)
+    if case.startswith("z0 ok"):                                 # the z₀ start meets every rule: no z steps
+        monkeypatch.setattr(ms, "START_EXTRA_WEEKS_FG", 6)
+    if case.endswith("no 4b"):                                   # FEASIBILITY_CHECK = False
+        monkeypatch.setattr(ms, "FEASIBILITY_CHECK", False)
+    if case == "settings":                                       # section 0 settings and run overrides reach 4d
+        monkeypatch.setattr(ms, "OPTIMIZATION_FILL_RATE", 0.97)
+        monkeypatch.setattr(ms, "START_LOT_WEEKS", 3)
+        kw = dict(overrides={"NumScenarios": 80, "RandomSeed": 7})
+    seq = run_file(tmp_path, monkeypatch, path, **kw)
+    seq_out = capsys.readouterr().out
+    calls, optimized = [], []
+    _inline_parallel(monkeypatch, calls)
+    real = ms.optimize
+    monkeypatch.setattr(ms, "optimize", lambda *a, **k: optimized.append(k.get("start_check", True)) or real(*a, **k))
+    par = run_file(tmp_path, monkeypatch, path, **kw)
+    out = capsys.readouterr().out
+    _same_run(seq, par)
+    zr = par.ins["start_z"]
+    assert calls[:2] == [("max", None), ("z", zr["z0"])]
+    assert [z for _, z in calls[1:]] == [s["z"] for s in zr["steps"]] or not zr["steps"]   # stops at the chosen z
+    import re
+    evaluated_here = re.compile(r"(maximum-supply policy|the start with z = [\d.]+) \.\.\.")   # a phase = a Seeker model
+    n_steps = len(re.findall(r"the start with z = [\d.]+ \.\.\.", seq_out))
+    assert len(evaluated_here.findall(seq_out)) == (1 if ms.FEASIBILITY_CHECK or n_steps else 0) + n_steps
+    assert not evaluated_here.findall(out)                                                # none of them again
+    assert out.count("evaluated in parallel (section 4d)") == len(evaluated_here.findall(seq_out))
+    if case == "repair":
+        assert par.ins["repair"]["used"] and "4c. Start repair R1: Seeker evaluates ..." in out   # 4c unchanged
+    if zr["steps"]:
+        assert optimized == [False]                               # no search model for the failing z₀ start
+    else:
+        assert case.startswith("z0 ok") and calls == [("max", None), ("z", zr["z0"])] and optimized == [True]
+    assert ms.PRE_EVALUATED == {}
+
+
+def test_parallel_start_check_is_off_or_falls_back_one_after_another(tmp_path, monkeypatch, capsys):
+    _no_search(monkeypatch)
+    seq = headless_run(tmp_path, monkeypatch)
+    capsys.readouterr()
+    calls = []
+    _inline_parallel(monkeypatch, calls, keys_ok=False)          # a process with other numbers: never used
+    res = headless_run(tmp_path, monkeypatch)
+    assert calls and "(0 of" in capsys.readouterr().out
+    _same_run(seq, res)
+
+    def broken(*a, **k):
+        raise RuntimeError("no processes")
+    monkeypatch.setattr(ms, "_run_start_jobs", broken)
+    res = headless_run(tmp_path, monkeypatch)
+    assert "Parallel start check not possible (RuntimeError: no processes) → one after another" in capsys.readouterr().out
+    _same_run(seq, res)
+    for name, value in (("PARALLEL_START_CHECK", 1), ("START_Z", 3.0)):   # off, or no grid: nothing in parallel
+        calls.clear()
+        _inline_parallel(monkeypatch, calls)
+        monkeypatch.setattr(ms, name, value)
+        headless_run(tmp_path, monkeypatch)
+        assert calls == [] and "4d." not in capsys.readouterr().out
+        monkeypatch.undo()
+        _no_search(monkeypatch)
+    calls.clear()
+    headless_run(tmp_path, monkeypatch)                          # the test double is never sent to processes
+    assert "4d." not in capsys.readouterr().out
+
+
+def test_parallel_worker_uses_this_runs_settings_and_overrides(monkeypatch):
+    """A separate process starts with the file's section 0; the worker takes this run's settings and overrides."""
+    monkeypatch.setattr(ms, "START_EXTRA_WEEKS_FG", 2)
+    settings = dict(ms._settings(), START_EXTRA_WEEKS_FG=3)       # what the run (or the app) had set
+    d = ms.load_data(DATA)
+    ms.apply_overrides(d, {"RandomSeed": 7})
+    ms.validate(d)
+    lay = ms.PolicyLayout(d)
+    job = (DATA, {"RandomSeed": 7}, settings, list(lay.ub_var), "lic", "z", 2.0)
+    key, fr, cost = ms._start_check_worker(job, skr=fake)
+    assert ms.START_EXTRA_WEEKS_FG == 3 and key == ms.policy_key(ms.start_policy(d, z=2.0))
+    assert key != ms.policy_key(ms.start_policy(d, z=2.0, extra_fg=2))
+    assert (fr, cost) == ms.evaluate_policy(fake, d, lay, ms.start_policy(d, z=2.0), "lic", "check")   # seed 7 used
+
+
+def test_parallel_jobs_really_run_in_separate_processes_and_stop_early():
+    import pickle
+    assert pickle.loads(pickle.dumps(ms._settings()))["PARALLEL_START_CHECK"] == ms.PARALLEL_START_CHECK
+    out = ms._run_start_jobs([(i,) for i in range(8)], 2, lambda r: len(r) >= 3, worker=len)
+    assert 3 <= len(out) < 8 and set(out.values()) == {1}
+    with pytest.raises(TypeError):
+        ms._run_start_jobs([("a",)], 1, lambda r: False, worker=int)
+    assert ms.start_z_grid(1.216) == [1.5, 2.0, 2.5, 3.0, 3.5, 4.0] and ms.start_z_grid(4.0) == []
+    assert ms.start_z_grid(3.95) == [4.0]
+
+
 def test_repair_keeps_the_best_step_when_no_step_meets_the_target(monkeypatch):
     """If no step meets every target rule, Seeker starts from the step meeting the most (then the cheapest)."""
     d = copy.deepcopy(D0)
@@ -2061,8 +2197,8 @@ def test_noise_and_direction_logic():
 # ============================================================================
 
 
-ENGINE_SHA256 = {   # engine v18.3 — set by the engine session (python test_engine.py --fingerprint)
-    "meio_seeker_stochastic.py": "ea2e9ea306abab179ffe2c81f36acdf876cc15e2243d88dcfea5453cdb10c500",
+ENGINE_SHA256 = {   # engine v18.4 — set by the engine session (python test_engine.py --fingerprint)
+    "meio_seeker_stochastic.py": "5c808d145e464c8288c12b592e0dece643367be5b303ccb0408bc274554ff6f5",
     "reference_simulator.py": "4da487d30d35d6b3d9913c46de7f349ea018523bd53c3611c80674d64ab721fd",
     "meio_stress_tests.py": "f0fc2fe4fe372f045874de1d35846961eb1eb01d027a24b91810c17982af7a5c",
 }

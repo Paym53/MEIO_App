@@ -8,7 +8,7 @@ shows the results: what to commit now, the (s,S) policy, fill rates, stock, wast
 Browser → Lovable web app → ngrok tunnel → local API on your PC → engine + Seeker license
 ```
 
-**Status:** engine v18.3, local API v3, start script, the Lovable UI and what-if editing are in place.
+**Status:** engine v18.4, local API v3, start script, the Lovable UI and what-if editing are in place.
 
 ## What the app must do
 
@@ -60,7 +60,7 @@ These scenarios are the contract. Each one becomes an automated test.
    C:\Users\ruben\seeker_env\Scripts\python.exe -m pip install -r requirements.txt
    ```
 4. **License:** copy your `license.sio` into `C:\dev\MEIO_App\engine\` (it is gitignored).
-5. **Check:** run the tests. Every test must pass (`… passed`, no `failed`); the engine has 159 tests, the textbook baseline 9 (about 5 min in total).
+5. **Check:** run the tests. Every test must pass (`… passed`, no `failed`); the engine has 169 tests, the textbook baseline 9 (about 5 min in total).
    ```bat
    C:\Users\ruben\seeker_env\Scripts\python.exe -m pytest
    ```
@@ -98,6 +98,10 @@ are changed only here, not in the run dialog. The app's own rules for this (W01�
 **Data and runs:** the top bar first picks the **data** (an upload, or a what-if shown in blue with its changes on
 click), then a **run** on that data. *Run optimization → Same data* (or *Run again* in Run history) runs the selected
 data again, byte for byte, with other solver settings, e.g. a quick what-if again as a decision run.
+
+**Since engine v18.4 (18.11.):** the start check runs up to 4 Seeker evaluations at the same time, so a run is about
+1–1.5 min shorter. You'll see a few extra Python processes in the Task Manager during the first minutes of a run;
+cancelling a run stops them too.
 
 **Since engine v18.3 (17.11.):** with a review period of 2 weeks or more, each planned production order is a *firm*
 quantity sized to the raw material the plan counts on; the commit cards say in which week it starts and how often it has to

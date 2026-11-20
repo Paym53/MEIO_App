@@ -1,5 +1,19 @@
 # Engine v18.1: hand-over to the app session (everything since v17.1)
 
+> **Update v18.4 (18.11.): parallel start check — faster, same results. If you installed v18.3, this box is the only change.**
+> - Engine `2026-11-18 v18.4 (Seeker-only)`; **contract version 4 unchanged**; no model, rule or output change.
+> - **What:** the start check's evaluations (maximum supply, z₀, the z grid) run at the same time in separate Seeker processes
+>   (new section 4d; `PARALLEL_START_CHECK = 4` in section 0; 1 = exactly v18.3). Sections 4, 4b and 4c decide as before
+>   from those numbers; the run stops evaluating once the start check's answer is known.
+> - **For the app:** nothing to change. `run()` passes `data_file`, `overrides` and the current section 0 globals (e.g.
+>   `OPTIMIZATION_FILL_RATE`) to the processes. Processes start with `spawn`: keep the app's start code under
+>   `if __name__ == "__main__":`. If processes cannot start, the console shows `Parallel start check not possible (…) → one after
+>   another` and the run continues as in v18.3. New console/TIMINGS phase `4d. Start check in parallel: …`; the 4b/4 phases
+>   then print `…: evaluated in parallel (section 4d)`.
+> - **Acceptance:** 169 tests (10 new: the parallel and the one-after-another path give the same start, repair, plan and report
+>   on 7 cases; real separate processes; settings and overrides reach the processes; fallback); 6 new mutants, all caught.
+>   On the user's PC: expected −80 to −90 s per run when z is raised (4 evaluations at once 33 s instead of 4 × 25 s).
+>
 > **Update v18.3 (17.11.): your change request "firm production orders within a review cycle" (issues 1c, 1a, 1b).
 > If you installed v18.2, this box is the only change; from v18.1, read the v18.2 box below too.**
 > - Engine `2026-11-17 v18.3 (Seeker-only)`; **contract version 4 unchanged** (no sheet, column or `RunResult` field change).
