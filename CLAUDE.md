@@ -579,8 +579,12 @@ life. The map needs `input.tables.Sourcing` (supplier → material), added on 09
 run is made, so runs before 09.11. have no supplier arrows (start a new run).
 **Dashboard progress (09.11.):** Overview, map + panels, Orders and Master data reworked and merged (dashboard PRs #4–#10;
 Lovable prompts A, B, map rebuild, Orders, Master data; Claude's review fixes in the same PRs). One place per input:
-solver settings only in the Run dialog. Open idea (not requested yet): engine output of the order quantity **only over
-futures that order** (like arrival_week), so Orders can show "if ordered: …" instead of only the all-futures mean.
+solver settings only in the Run dialog. **Engine change request `order_qty_if_ordered` (sent 20.11., pending):** the order
+quantity **only over futures that order** (like arrival_week), so Orders can show "if ordered: …". Why: the user read a
+week-6 RM3 mean of 428 kg (R = 2 what-if) as an order size; verified 20.11. (engine = reference per future on the user's
+plan; committed weeks exact; week 6 planned at the future run in week 5, ordered in 23 % of futures, 1,690–2,070 kg).
+Until then the dashboard (PR #19, `quantityText`) leads with "ordered in X % of futures" and labels the mean "not an
+order size"; committed weeks "exact: the same in every future".
 **Engine v18.1 + API 3 (13.11.; handover `engine/ENGINE_v18_1_HANDOVER.md`):** result contract 4 = engine contract 4.
 - **User decisions 13.11.:** the run's own fill-rate target (`optimization_fill_rate`, any value in (0, 1], → engine
   `OPTIMIZATION_FILL_RATE`, set before `run()` and restored afterwards); run-dialog presets "Decision run" (500 scenarios,
